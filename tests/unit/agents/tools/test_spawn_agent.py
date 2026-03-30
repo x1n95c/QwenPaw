@@ -28,7 +28,9 @@ from copaw.security.tool_guard.guardians.rule_guardian import (
 from copaw.security.tool_guard.guardians.rule_guardian import (
     load_rules_from_directory,
 )
-from copaw.security.tool_guard.guardians import rule_guardian as rule_guardian_module
+from copaw.security.tool_guard.guardians import (
+    rule_guardian as rule_guardian_module,
+)
 from copaw.security.tool_guard.utils import resolve_guarded_tools
 
 spawn_agent_module = importlib.import_module(
