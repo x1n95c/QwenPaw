@@ -35,10 +35,11 @@ metadata: { "builtin_skill_version": "1.0", "copaw": { "emoji": "🛰️" } }
 
 ## 调用前检查
 
-在调用 `spawn_agent` 前，只检查两类前提：
+在调用 `spawn_agent` 前，先确认三件事：
 
 1. `spawn_agent` 工具已启用
 2. 目标 runner 在当前环境可用
+3. 这次 delegation 的实际工作目录已经明确
 
 优先查看当前 agent 的工具配置和 `agent.json`。runner 可能来自：
 
@@ -51,7 +52,7 @@ metadata: { "builtin_skill_version": "1.0", "copaw": { "emoji": "🛰️" } }
 {
   "spawn_agent": {
     "runners": {
-      "<agent_type>": {
+      "<runner>": {
         "enabled": true
       }
     }
@@ -59,10 +60,35 @@ metadata: { "builtin_skill_version": "1.0", "copaw": { "emoji": "🛰️" } }
 }
 ```
 
-如果你无法确认可用性：
+若 runner 可用性或实际工作目录无法确认，就不要调用。
 
-- 不要盲目调用 `spawn_agent`
-- 先告诉用户当前 runner 尚未就绪，或暂时无法确认可用性
+## 工作目录与 `cwd`
+
+`cwd` 是 delegation 的执行边界。
+用户不需要显式说 `cwd`。
+只要用户给了明确路径或目录语义，调用 `spawn_agent` 时就应映射到
+`cwd`，不能只写进 `task` 文本。
+
+处理规则：
+
+1. 用户给了明确路径或目录语义时，调用时要映射到 `cwd`
+2. 相对目录直接作为相对 `cwd` 传入
+3. 绝对路径直接作为绝对 `cwd` 传入
+4. `task` 中可以重复说明范围，但不能替代 `cwd`
+5. 不要因为已有默认 workspace，就省略用户明确指定的 `cwd`
+
+不要这样调用：
+
+```json
+{"task":"在 ~/repo/app 目录下创建 foo.txt","runner":"opencode"}
+```
+
+应改为把目录放进 `cwd`，把任务正文保留为真正要做的事。
+
+## 目录不明确时怎么做
+
+如果用户没有明确指定工作目录，就不要假设，先追问用户指定目录。
+不要默认使用当前 agent workspace，也不要猜测仓库根目录。
 
 ## 怎么写 delegation prompt
 
@@ -72,6 +98,9 @@ metadata: { "builtin_skill_version": "1.0", "copaw": { "emoji": "🛰️" } }
 - 范围：涉及哪些文件、目录、模块、接口或限制范围
 - 约束：哪些不能改、不能假设、不能忽略
 - 输出：希望它返回什么，格式是什么
+
+不要擅自补充用户没有要求的实现手段、命令或步骤。
+例如用户只说“创建文件”，就不要额外写成“使用 `touch` 命令或等效方式”。
 
 推荐顺序：
 
@@ -102,10 +131,11 @@ metadata: { "builtin_skill_version": "1.0", "copaw": { "emoji": "🛰️" } }
 
 1. 判断任务是否适合一次性委派
 2. 选择合适 runner
-3. 确认 `spawn_agent` 和 runner 可用
-4. 写完整 delegation prompt
-5. 调用 `spawn_agent`
-6. 把结果回收进当前会话并继续推进
+3. 确认实际工作目录；若未明确，先追问用户
+4. 确认 `spawn_agent` 和 runner 可用
+5. 写完整 delegation prompt
+6. 调用 `spawn_agent`，并在有明确目录时显式传 `cwd`
+7. 把结果回收进当前会话并继续推进
 
 ## 失败处理
 

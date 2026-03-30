@@ -116,6 +116,7 @@ async def test_spawn_agent_executes_runner_with_placeholder(
     response = await spawn_agent_module.spawn_agent(
         "review src/copaw",
         "codex",
+        cwd=str(spawn_agent_workspace),
     )
     text = _response_text(response)
 
@@ -143,18 +144,20 @@ async def test_spawn_agent_appends_task_when_placeholder_missing(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("summarize tests", "codex")
+    response = await spawn_agent_module.spawn_agent(
+        "summarize tests",
+        "codex",
+        cwd=str(spawn_agent_workspace),
+    )
     assert "[stdout]\nsummarize tests" in _response_text(response)
 
 
 @pytest.mark.anyio
-async def test_spawn_agent_uses_runner_cwd_and_call_override(
+async def test_spawn_agent_uses_explicit_cwd(
     spawn_agent_workspace,
 ):
-    runner_dir = spawn_agent_workspace / "runner"
-    override_dir = spawn_agent_workspace / "override"
-    runner_dir.mkdir()
-    override_dir.mkdir()
+    target_dir = spawn_agent_workspace / "target"
+    target_dir.mkdir()
 
     agent_config = AgentProfileConfig(
         id="test_agent",
@@ -169,19 +172,28 @@ async def test_spawn_agent_uses_runner_cwd_and_call_override(
             enabled=True,
             command=sys.executable,
             args=["-c", "import os; print(os.getcwd())"],
-            cwd="runner",
         ),
     )
-
-    response = await spawn_agent_module.spawn_agent("print cwd", "codex")
-    assert f"[stdout]\n{runner_dir.resolve()}" in _response_text(response)
 
     response = await spawn_agent_module.spawn_agent(
         "print cwd",
         "codex",
-        cwd="override",
+        cwd="target",
     )
-    assert f"[stdout]\n{override_dir.resolve()}" in _response_text(response)
+    assert f"[stdout]\n{target_dir.resolve()}" in _response_text(response)
+
+
+@pytest.mark.anyio
+async def test_spawn_agent_errors_for_missing_cwd(
+    _spawn_agent_workspace,
+):
+    response = await spawn_agent_module.spawn_agent(
+        "review src/copaw",
+        "codex",
+        cwd="",
+    )
+
+    assert "Error: cwd is empty." in _response_text(response)
 
 
 @pytest.mark.anyio
@@ -196,7 +208,11 @@ async def test_spawn_agent_errors_for_missing_runner(
     )
     save_agent_config("test_agent", agent_config)
 
-    response = await spawn_agent_module.spawn_agent("review", "missing")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "missing",
+        cwd=str(spawn_agent_workspace),
+    )
     assert "Unknown spawn_agent runner 'missing'" in _response_text(response)
 
 
@@ -218,7 +234,11 @@ async def test_spawn_agent_uses_builtin_runner_presets_by_default(
         AsyncMock(return_value=(0, "built-in runner ok", "")),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "qwen")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "qwen",
+        cwd=str(spawn_agent_workspace),
+    )
     text = _response_text(response)
 
     assert "spawn_agent completed successfully." in text
@@ -246,7 +266,11 @@ async def test_spawn_agent_reports_missing_builtin_command(
         _raise_missing_command,
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "qwen")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "qwen",
+        cwd=str(spawn_agent_workspace),
+    )
     text = _response_text(response)
 
     assert "qwen runner is not installed or not on PATH" in text
@@ -271,7 +295,11 @@ async def test_spawn_agent_errors_for_disabled_runner(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "codex")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "codex",
+        cwd=str(spawn_agent_workspace),
+    )
     assert "runner 'codex' is disabled" in _response_text(response)
 
 
@@ -294,7 +322,11 @@ async def test_spawn_agent_errors_for_missing_command(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "codex")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "codex",
+        cwd=str(spawn_agent_workspace),
+    )
     assert "runner 'codex' is missing command" in _response_text(response)
 
 
@@ -321,6 +353,7 @@ async def test_spawn_agent_reports_timeout(
     response = await spawn_agent_module.spawn_agent(
         "sleep",
         "codex",
+        cwd=str(spawn_agent_workspace),
         timeout=1,
     )
     text = _response_text(response)
@@ -356,7 +389,11 @@ async def test_spawn_agent_reports_nonzero_exit(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "codex")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "codex",
+        cwd=str(spawn_agent_workspace),
+    )
     text = _response_text(response)
 
     assert "spawn_agent failed with exit code 3." in text
@@ -394,7 +431,11 @@ async def test_spawn_agent_reports_qwen_auth_required(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "qwen")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "qwen",
+        cwd=str(spawn_agent_workspace),
+    )
     text = _response_text(response)
 
     assert "qwen runner is not authenticated" in text
@@ -439,7 +480,11 @@ async def test_spawn_agent_reports_qwen_anthropic_override_issue(
         ),
     )
 
-    response = await spawn_agent_module.spawn_agent("review", "qwen")
+    response = await spawn_agent_module.spawn_agent(
+        "review",
+        "qwen",
+        cwd=str(spawn_agent_workspace),
+    )
     text = _response_text(response)
 
     assert "qwen runner is using ANTHROPIC_* environment overrides" in text
@@ -465,7 +510,7 @@ def test_spawn_agent_is_guarded_by_default(monkeypatch):
     guardian = RuleBasedToolGuardian(extra_rules=builtin_rules)
     findings = guardian.guard(
         "spawn_agent",
-        {"task": "Review the repository.", "agent_type": "codex"},
+        {"task": "Review the repository.", "runner": "codex"},
     )
 
     assert findings

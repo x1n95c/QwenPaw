@@ -8,7 +8,6 @@ import signal
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
 
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
@@ -54,13 +53,16 @@ def _response_text(text: str) -> ToolResponse:
 def _validate_spawn_agent_inputs(
     task_text: str,
     runner_name: str,
+    cwd_text: str,
     timeout: int,
-) -> Optional[str]:
+) -> str | None:
     """Return a user-facing validation error for invalid tool inputs."""
     if not task_text:
         return "Error: task is empty."
     if not runner_name:
-        return "Error: agent_type is empty."
+        return "Error: runner is empty."
+    if not cwd_text:
+        return "Error: cwd is empty."
     if timeout <= 0:
         return "Error: timeout must be greater than 0."
     return None
@@ -93,26 +95,26 @@ def _resolve_current_agent_config() -> tuple[str, AgentProfileConfig, Path]:
 
 def _resolve_runner(
     agent_config: AgentProfileConfig,
-    agent_type: str,
+    runner_name: str,
 ) -> SpawnAgentRunnerConfig:
     available_runners = resolve_spawn_agent_runners(agent_config.spawn_agent)
-    runner = available_runners.get(agent_type)
+    runner = available_runners.get(runner_name)
     if runner is None:
         known = sorted(available_runners)
         known_text = ", ".join(known) if known else "none"
         raise ValueError(
-            f"Unknown spawn_agent runner '{agent_type}'. "
+            f"Unknown spawn_agent runner '{runner_name}'. "
             f"Configured runners: {known_text}.",
         )
 
     if not runner.enabled:
         raise ValueError(
-            f"spawn_agent runner '{agent_type}' is disabled.",
+            f"spawn_agent runner '{runner_name}' is disabled.",
         )
 
     if not runner.command.strip():
         raise ValueError(
-            f"spawn_agent runner '{agent_type}' is missing command.",
+            f"spawn_agent runner '{runner_name}' is missing command.",
         )
 
     return runner
@@ -136,15 +138,10 @@ def _resolve_runner_args(args: list[str], task: str) -> list[str]:
 
 
 def _resolve_execution_cwd(
-    cwd: Optional[str],
-    runner: SpawnAgentRunnerConfig,
+    cwd: str,
     workspace_dir: Path,
 ) -> Path:
-    raw_cwd = (cwd or "").strip() or runner.cwd.strip()
-    if not raw_cwd:
-        return workspace_dir
-
-    candidate = Path(raw_cwd).expanduser()
+    candidate = Path(cwd.strip()).expanduser()
     if not candidate.is_absolute():
         candidate = workspace_dir / candidate
     return candidate.resolve()
@@ -169,13 +166,13 @@ def _format_command(command: str, args: list[str]) -> str:
 
 
 def _detect_runner_guidance(
-    agent_type: str,
+    runner_name: str,
     command: str,
     stderr_text: str,
     env: dict[str, str],
-) -> Optional[str]:
+) -> str | None:
     """Translate known runner auth/config failures into actionable guidance."""
-    normalized_agent = agent_type.strip().lower()
+    normalized_agent = runner_name.strip().lower()
     normalized_command = command.strip().lower()
     normalized_stderr = stderr_text.lower()
 
@@ -217,15 +214,15 @@ def _detect_runner_guidance(
 
 
 def _detect_runner_launch_guidance(
-    agent_type: str,
+    runner_name: str,
     command: str,
     exc: Exception,
-) -> Optional[str]:
+) -> str | None:
     """Translate launch-time errors into install guidance."""
     if not isinstance(exc, FileNotFoundError):
         return None
 
-    normalized_agent = agent_type.strip().lower()
+    normalized_agent = runner_name.strip().lower()
     normalized_command = command.strip()
 
     if normalized_agent == "opencode" or normalized_command == "opencode":
@@ -253,7 +250,7 @@ def _detect_runner_launch_guidance(
 
 
 def _build_result_text(
-    agent_type: str,
+    runner_name: str,
     command: str,
     args: list[str],
     cwd: Path,
@@ -262,7 +259,7 @@ def _build_result_text(
     stderr_text: str,
 ) -> str:
     header = [
-        f"spawn_agent runner: {agent_type}",
+        f"spawn_agent runner: {runner_name}",
         f"working directory: {cwd}",
         f"command: {_format_command(command, args)}",
     ]
@@ -330,16 +327,18 @@ async def _run_process(
 
 async def spawn_agent(
     task: str,
-    agent_type: str,
-    cwd: Optional[str] = None,
+    runner: str,
+    cwd: str,
     timeout: int = 900,
 ) -> ToolResponse:
     """Delegate a one-shot task to a configured external agent runner."""
     task_text = (task or "").strip()
-    runner_name = (agent_type or "").strip()
+    runner_name = (runner or "").strip()
+    cwd_text = (cwd or "").strip()
     validation_error = _validate_spawn_agent_inputs(
         task_text,
         runner_name,
+        cwd_text,
         timeout,
     )
     if validation_error is not None:
@@ -347,13 +346,13 @@ async def spawn_agent(
 
     try:
         _, agent_config, workspace_dir = _resolve_current_agent_config()
-        runner = _resolve_runner(agent_config, runner_name)
-        args = _resolve_runner_args(runner.args, task_text)
-        execution_cwd = _resolve_execution_cwd(cwd, runner, workspace_dir)
-        env = _resolve_execution_env(runner)
+        runner_config = _resolve_runner(agent_config, runner_name)
+        args = _resolve_runner_args(runner_config.args, task_text)
+        execution_cwd = _resolve_execution_cwd(cwd_text, workspace_dir)
+        env = _resolve_execution_env(runner_config)
         try:
             returncode, stdout_text, stderr_text = await _run_process(
-                runner.command,
+                runner_config.command,
                 args,
                 execution_cwd,
                 env,
@@ -362,7 +361,7 @@ async def spawn_agent(
         except Exception as exc:
             guidance = _detect_runner_launch_guidance(
                 runner_name,
-                runner.command,
+                runner_config.command,
                 exc,
             )
             if guidance is not None:
@@ -370,7 +369,7 @@ async def spawn_agent(
             raise
         guidance = _detect_runner_guidance(
             runner_name,
-            runner.command,
+            runner_config.command,
             stderr_text,
             env,
         )
@@ -379,7 +378,7 @@ async def spawn_agent(
         return _response_text(
             _build_result_text(
                 runner_name,
-                runner.command,
+                runner_config.command,
                 args,
                 execution_cwd,
                 returncode,
