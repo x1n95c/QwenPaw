@@ -240,9 +240,18 @@ class AgentRunner(Runner):
         )
 
         # Set agent context for model creation
-        from ..agent_context import set_current_agent_id
+        from ..agent_context import set_current_agent_id, set_request_context
 
         set_current_agent_id(self.agent_id)
+
+        # Build request context for tool functions
+        request_context_dict = {
+            "session_id": session_id,
+            "user_id": getattr(request, "user_id", "") or "",
+            "channel": getattr(request, "channel", DEFAULT_CHANNEL),
+            "agent_id": self.agent_id,
+        }
+        set_request_context(request_context_dict)
 
         agent = None
         chat = None

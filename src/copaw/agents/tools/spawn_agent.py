@@ -1,52 +1,31 @@
 # -*- coding: utf-8 -*-
-"""Built-in tool for delegating one-shot tasks to external runners."""
+"""Built-in tool for delegating tasks to external agent runners via ACP protocol.
 
-import asyncio
-import locale
-import os
-import signal
-import subprocess
-import sys
+This module provides the spawn_agent tool which uses ACP protocol with
+session persistence and permission handling.
+"""
+
+import logging
 from pathlib import Path
+from typing import Any, List, Literal, Optional
 
 from agentscope.message import TextBlock
 from agentscope.tool import ToolResponse
 
 from ...config import load_config
-from ...config.config import (
-    AgentProfileConfig,
-    SpawnAgentRunnerConfig,
-    load_agent_config,
-    resolve_spawn_agent_runners,
-)
 from ...config.context import get_current_workspace_dir
 from ...constant import WORKING_DIR
 
-
-def _smart_decode(data: bytes) -> str:
-    """Decode subprocess output using UTF-8 with locale fallback."""
-    try:
-        decoded = data.decode("utf-8")
-    except UnicodeDecodeError:
-        encoding = locale.getpreferredencoding(False) or "utf-8"
-        decoded = data.decode(encoding, errors="replace")
-    return decoded.strip("\n")
+logger = logging.getLogger(__name__)
 
 
-def _kill_process_tree_win32(pid: int) -> None:
-    """Kill a process tree on Windows."""
-    try:
-        subprocess.call(
-            ["taskkill", "/F", "/T", "/PID", str(pid)],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=10,
-        )
-    except Exception:
-        pass
+# ---------------------------------------------------------------------------
+# Utility Functions
+# ---------------------------------------------------------------------------
 
 
 def _response_text(text: str) -> ToolResponse:
+    """Create a text ToolResponse."""
     return ToolResponse(content=[TextBlock(type="text", text=text)])
 
 
@@ -72,269 +51,294 @@ def _current_workspace_dir() -> Path:
     return (get_current_workspace_dir() or Path(WORKING_DIR)).expanduser()
 
 
-def _find_current_agent_id(workspace_dir: Path) -> str:
-    """Resolve the active agent ID from the current workspace path."""
-    config = load_config()
-    target = workspace_dir.expanduser().resolve()
-
-    for agent_id, profile in config.agents.profiles.items():
-        candidate = Path(profile.workspace_dir).expanduser().resolve()
-        if candidate == target:
-            return agent_id
-
-    raise ValueError(
-        "Unable to resolve the current agent from the workspace directory.",
-    )
-
-
-def _resolve_current_agent_config() -> tuple[str, AgentProfileConfig, Path]:
-    workspace_dir = _current_workspace_dir()
-    agent_id = _find_current_agent_id(workspace_dir)
-    return agent_id, load_agent_config(agent_id), workspace_dir
-
-
-def _resolve_runner(
-    agent_config: AgentProfileConfig,
-    runner_name: str,
-) -> SpawnAgentRunnerConfig:
-    available_runners = resolve_spawn_agent_runners(agent_config.spawn_agent)
-    runner = available_runners.get(runner_name)
-    if runner is None:
-        known = sorted(available_runners)
-        known_text = ", ".join(known) if known else "none"
-        raise ValueError(
-            f"Unknown spawn_agent runner '{runner_name}'. "
-            f"Configured runners: {known_text}.",
-        )
-
-    if not runner.enabled:
-        raise ValueError(
-            f"spawn_agent runner '{runner_name}' is disabled.",
-        )
-
-    if not runner.command.strip():
-        raise ValueError(
-            f"spawn_agent runner '{runner_name}' is missing command.",
-        )
-
-    return runner
-
-
-def _resolve_runner_args(args: list[str], task: str) -> list[str]:
-    resolved_args: list[str] = []
-    saw_placeholder = False
-
-    for arg in args:
-        if "{task}" in arg:
-            resolved_args.append(arg.replace("{task}", task))
-            saw_placeholder = True
-        else:
-            resolved_args.append(arg)
-
-    if not saw_placeholder:
-        resolved_args.append(task)
-
-    return resolved_args
-
-
 def _resolve_execution_cwd(
     cwd: str,
     workspace_dir: Path,
 ) -> Path:
+    """Resolve the execution working directory."""
     candidate = Path(cwd.strip()).expanduser()
     if not candidate.is_absolute():
         candidate = workspace_dir / candidate
     return candidate.resolve()
 
 
-def _resolve_execution_env(runner: SpawnAgentRunnerConfig) -> dict[str, str]:
-    env = os.environ.copy()
-    env.update(runner.env)
+def _get_acp_service_and_config() -> tuple[Any, Any]:
+    """Get or initialize ACP service and config.
 
-    python_bin_dir = str(Path(sys.executable).parent)
-    current_path = env.get("PATH", "")
-    env["PATH"] = (
-        python_bin_dir + os.pathsep + current_path
-        if current_path
-        else python_bin_dir
-    )
-    return env
+    Returns:
+        Tuple of (service, acp_config).
+    """
+    from ..acp import get_acp_service, init_acp_service
+    from ..acp.config import ACPConfig
 
+    config = load_config()
+    acp_config = getattr(config, "acp", None)
+    if acp_config is None:
+        acp_config = ACPConfig(enabled=True)
 
-def _format_command(command: str, args: list[str]) -> str:
-    return " ".join([command, *args]).strip()
+    service = get_acp_service()
+    if service is None:
+        service = init_acp_service(acp_config)
 
-
-def _detect_runner_guidance(
-    runner_name: str,
-    command: str,
-    stderr_text: str,
-    env: dict[str, str],
-) -> str | None:
-    """Translate known runner auth/config failures into actionable guidance."""
-    normalized_agent = runner_name.strip().lower()
-    normalized_command = command.strip().lower()
-    normalized_stderr = stderr_text.lower()
-
-    is_qwen_runner = normalized_agent == "qwen" or (
-        normalized_command == "qwen"
-    )
-    if not is_qwen_runner:
-        return None
-
-    if (
-        "no auth type is selected" in normalized_stderr
-        or "please configure an auth type" in normalized_stderr
-    ):
-        return (
-            "qwen runner is not authenticated. "
-            "Please run `qwen auth` locally and complete login first."
-        )
-
-    anthropic_override = any(
-        env.get(key, "").strip()
-        for key in (
-            "ANTHROPIC_API_KEY",
-            "ANTHROPIC_BASE_URL",
-            "ANTHROPIC_MODEL",
-        )
-    )
-    if (
-        "request body format invalid" in normalized_stderr
-        and anthropic_override
-    ):
-        return (
-            "qwen runner is using ANTHROPIC_* environment overrides that are "
-            "not compatible with tool-based delegation. Please configure "
-            "`qwen auth` officially, or clear ANTHROPIC_API_KEY / "
-            "ANTHROPIC_BASE_URL / ANTHROPIC_MODEL before using qwen."
-        )
-
-    return None
+    return service, acp_config
 
 
-def _detect_runner_launch_guidance(
-    runner_name: str,
-    command: str,
-    exc: Exception,
-) -> str | None:
-    """Translate launch-time errors into install guidance."""
-    if not isinstance(exc, FileNotFoundError):
-        return None
-
-    normalized_agent = runner_name.strip().lower()
-    normalized_command = command.strip()
-
-    if normalized_agent == "opencode" or normalized_command == "opencode":
-        return (
-            "opencode runner is not installed or not on PATH. "
-            "Please install OpenCode CLI and ensure `opencode` is available "
-            "in your shell."
-        )
-
-    if normalized_agent == "qwen" or normalized_command == "qwen":
-        return (
-            "qwen runner is not installed or not on PATH. "
-            "Please install Qwen CLI and ensure `qwen` is available "
-            "in your shell."
-        )
-
-    if normalized_agent == "gemini":
-        return (
-            "gemini runner could not be launched. "
-            "Please ensure `npx` is available and can download "
-            "`@google/gemini-cli`."
-        )
-
-    return None
+# ---------------------------------------------------------------------------
+# ACP Session Management Helpers
+# ---------------------------------------------------------------------------
 
 
-def _build_result_text(
-    runner_name: str,
-    command: str,
-    args: list[str],
-    cwd: Path,
-    returncode: int,
-    stdout_text: str,
-    stderr_text: str,
-) -> str:
-    header = [
-        f"spawn_agent runner: {runner_name}",
-        f"working directory: {cwd}",
-        f"command: {_format_command(command, args)}",
-    ]
-
-    if returncode == 0:
-        result = ["spawn_agent completed successfully."]
-        if stdout_text:
-            result.append(f"[stdout]\n{stdout_text}")
-        else:
-            result.append("[stdout]\n(no output)")
-        if stderr_text:
-            result.append(f"[stderr]\n{stderr_text}")
-    else:
-        result = [f"spawn_agent failed with exit code {returncode}."]
-        if stdout_text:
-            result.append(f"[stdout]\n{stdout_text}")
-        if stderr_text:
-            result.append(f"[stderr]\n{stderr_text}")
-
-    return "\n".join([*header, "", *result])
-
-
-async def _run_process(
-    command: str,
-    args: list[str],
-    cwd: Path,
-    env: dict[str, str],
-    timeout: int,
-) -> tuple[int, str, str]:
-    proc = await asyncio.create_subprocess_exec(
-        command,
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=str(cwd),
-        env=env,
-        start_new_session=(sys.platform != "win32"),
-    )
-
+async def _handle_list_sessions(runner: str) -> ToolResponse:
+    """Handle the list_sessions action."""
     try:
-        stdout, stderr = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
-        if sys.platform == "win32":
-            _kill_process_tree_win32(proc.pid)
-        else:
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError, AttributeError):
-                proc.kill()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2)
-        except asyncio.TimeoutError:
-            try:
-                proc.kill()
-                await asyncio.wait_for(proc.wait(), timeout=2)
-            except (ProcessLookupError, OSError, asyncio.TimeoutError):
-                pass
-        return -1, "", f"spawn_agent timed out after {timeout} seconds."
+        service, acp_config = _get_acp_service_and_config()
 
-    return proc.returncode or 0, _smart_decode(stdout), _smart_decode(stderr)
+        if not acp_config.enabled:
+            return _response_text(
+                "ACP is disabled in config. Set 'acp.enabled: true' to enable."
+            )
+
+        sessions = await service.list_sessions(harness=runner)
+
+        if not sessions:
+            return _response_text(f"No active ACP sessions for runner '{runner}'.")
+
+        lines = [f"Active ACP sessions for '{runner}':", ""]
+        for i, session in enumerate(sessions, 1):
+            status = "🟢 active" if session.get("has_active_runtime") else "⚪ inactive"
+            lines.append(
+                f"{i}. Session ID: {session.get('acp_session_id', 'unknown')}\n"
+                f"   Chat: {session.get('chat_id', 'unknown')}\n"
+                f"   CWD: {session.get('cwd', 'unknown')}\n"
+                f"   Status: {status}\n"
+                f"   Updated: {session.get('updated_at', 'unknown')}"
+            )
+
+        return _response_text("\n".join(lines))
+
+    except Exception as e:
+        logger.exception("Failed to list ACP sessions")
+        return _response_text(f"Error listing ACP sessions: {e}")
+
+
+async def _handle_session_info(session_id: str) -> ToolResponse:
+    """Handle the session_info action."""
+    try:
+        service, _ = _get_acp_service_and_config()
+
+        session = await service.load_session_by_acp_id(session_id)
+
+        if session is None:
+            return _response_text(f"Session '{session_id}' not found.")
+
+        runtime_status = "active" if (
+            session.runtime is not None
+            and session.runtime.transport.is_running()
+        ) else "inactive"
+
+        info = [
+            f"ACP Session: {session.acp_session_id}",
+            f"Harness: {session.harness}",
+            f"Chat ID: {session.chat_id}",
+            f"Working Directory: {session.cwd}",
+            f"Keep Session: {session.keep_session}",
+            f"Runtime Status: {runtime_status}",
+            f"Updated: {session.updated_at.isoformat()}",
+        ]
+
+        if session.capabilities:
+            info.append(f"Capabilities: {session.capabilities}")
+
+        return _response_text("\n".join(info))
+
+    except Exception as e:
+        logger.exception("Failed to get ACP session info")
+        return _response_text(f"Error getting session info: {e}")
+
+
+async def _handle_close_session(
+    session_id: str,
+    runner: str,
+    chat_id: str,
+) -> ToolResponse:
+    """Handle the close_session action."""
+    try:
+        service, _ = _get_acp_service_and_config()
+
+        # Resolve the real (chat_id, harness) from the acp_session_id
+        resolved_chat_id = chat_id
+        resolved_runner = runner
+        if session_id:
+            existing = await service.load_session_by_acp_id(session_id)
+            if existing is not None:
+                resolved_chat_id = existing.chat_id
+                resolved_runner = existing.harness
+
+        await service.close_chat_session(
+            chat_id=resolved_chat_id,
+            harness=resolved_runner,
+            reason="user requested close",
+        )
+
+        return _response_text(f"Session '{session_id}' closed successfully.")
+
+    except Exception as e:
+        logger.exception("Failed to close ACP session")
+        return _response_text(f"Error closing session: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Main Tool Function
+# ---------------------------------------------------------------------------
 
 
 async def spawn_agent(
-    task: str,
-    runner: str,
-    cwd: str,
+    action: Literal["run", "list_sessions", "session_info", "close_session"] = "run",
+    task: str = "",
+    runner: str = "",
+    cwd: str = "",
     timeout: int = 900,
+    session_id: Optional[str] = None,
+    keep_session: bool = True,
+    require_approval: bool = True,
+    permission_decision: Optional[str] = None,
+    chat_id: str = "tool_call",
 ) -> ToolResponse:
-    """Delegate a one-shot task to a configured external agent runner."""
+    """Delegate tasks to external agent runners via ACP protocol.
+
+    This tool supports multiple actions through the `action` parameter:
+
+    - **"run"** (default): Execute a task with an external agent runner
+    - **"list_sessions"**: List active ACP sessions for a runner
+    - **"session_info"**: Get detailed info about a specific session
+    - **"close_session"**: Close and cleanup a session
+
+    **Session Management:**
+    - Use `keep_session=True` to keep sessions alive for later use
+    - Use `session_id` to resume previous sessions
+    - Use `action="list_sessions"` to find available sessions
+    - Use `action="close_session"` to cleanup when done
+
+    Args:
+        action (`str`, defaults to `"run"`):
+            The action to perform. Options:
+            - `"run"`: Execute a task (default)
+            - `"list_sessions"`: List active sessions for a runner
+            - `"session_info"`: Get info about a specific session
+            - `"close_session"`: Close a session
+
+        task (`str`, defaults to `""`):
+            The task description to send to the external agent.
+            Required when `action="run"`.
+            Example: "Analyze the code in src/main.py and suggest improvements"
+
+        runner (`str`, defaults to `""`):
+            The external agent runner to use.
+            Required for `action="run"` and `action="list_sessions"`.
+            Common runners: "opencode", "qwen", "gemini", "claude".
+            Example: "qwen"
+
+        cwd (`str`, defaults to `""`):
+            The working directory for task execution.
+            Required when `action="run"`.
+            Can be absolute or relative to the current workspace.
+            Example: "/home/user/project" or "./src"
+
+        timeout (`int`, defaults to `900`):
+            Maximum execution time in seconds for `action="run"`.
+            Default is 15 minutes (900 seconds).
+
+        session_id (`Optional[str]`, defaults to `None`):
+            ACP session ID. Used for:
+            - `action="run"`: Resume a previous session
+            - `action="session_info"`: Query this session
+            - `action="close_session"`: Close this session
+
+        keep_session (`bool`, defaults to `True`):
+            Whether to keep the session alive after execution.
+            Only used when `action="run"`.
+
+        require_approval (`bool`, defaults to `True`):
+            Whether to require user approval for dangerous operations.
+            Only used when `action="run"`.
+
+        permission_decision (`Optional[str]`, defaults to `None`):
+            Resume a suspended session after a permission request.
+            Only used when `action="run"` with a suspended `session_id`.
+
+            Accepted values:
+            - Exact `optionId` from the permission message (preferred)
+            - Shorthand: "allow"/"approve"/"yes" → allow; "deny"/"reject"/"no" → reject
+
+        chat_id (`str`, defaults to `"tool_call"`):
+            The chat ID associated with the session.
+            Only used when `action="close_session"` as a fallback.
+
+    Returns:
+        `ToolResponse`: The result of the operation.
+
+    Examples:
+        ```python
+        # Execute a task (default action)
+        result = await spawn_agent(
+            task="Implement the new feature",
+            runner="qwen",
+            cwd="./project",
+        )
+
+        # List active sessions
+        await spawn_agent(action="list_sessions", runner="qwen")
+
+        # Get session info
+        await spawn_agent(action="session_info", session_id="sess_abc123")
+
+        # Close a session
+        await spawn_agent(
+            action="close_session",
+            session_id="sess_abc123",
+            runner="qwen",
+        )
+
+        # Resume a previous session
+        await spawn_agent(
+            task="Continue with tests",
+            runner="qwen",
+            cwd="./project",
+            session_id="sess_abc123",
+        )
+        ```
+    """
+    # --- Dispatch to action handlers ---
+    action_normalized = (action or "run").strip().lower()
+
+    if action_normalized == "list_sessions":
+        runner_name = (runner or "").strip()
+        if not runner_name:
+            return _response_text("Error: runner is required for list_sessions action.")
+        return await _handle_list_sessions(runner_name)
+
+    if action_normalized == "session_info":
+        session_id_text = (session_id or "").strip()
+        if not session_id_text:
+            return _response_text("Error: session_id is required for session_info action.")
+        return await _handle_session_info(session_id_text)
+
+    if action_normalized == "close_session":
+        session_id_text = (session_id or "").strip()
+        if not session_id_text:
+            return _response_text("Error: session_id is required for close_session action.")
+        return await _handle_close_session(
+            session_id=session_id_text,
+            runner=(runner or "").strip(),
+            chat_id=(chat_id or "tool_call").strip(),
+        )
+
+    # --- Default: action="run" ---
     task_text = (task or "").strip()
     runner_name = (runner or "").strip()
     cwd_text = (cwd or "").strip()
+
+    # Validate inputs for run action
     validation_error = _validate_spawn_agent_inputs(
         task_text,
         runner_name,
@@ -344,47 +348,110 @@ async def spawn_agent(
     if validation_error is not None:
         return _response_text(validation_error)
 
+    # Resolve execution cwd
+    workspace_dir = _current_workspace_dir()
+    execution_cwd = _resolve_execution_cwd(cwd_text, workspace_dir)
+
     try:
-        _, agent_config, workspace_dir = _resolve_current_agent_config()
-        runner_config = _resolve_runner(agent_config, runner_name)
-        args = _resolve_runner_args(runner_config.args, task_text)
-        execution_cwd = _resolve_execution_cwd(cwd_text, workspace_dir)
-        env = _resolve_execution_env(runner_config)
-        try:
-            returncode, stdout_text, stderr_text = await _run_process(
-                runner_config.command,
-                args,
-                execution_cwd,
-                env,
-                timeout,
+        service, acp_config = _get_acp_service_and_config()
+
+        if not acp_config.enabled:
+            return _response_text(
+                "ACP mode is disabled in config. Set 'acp.enabled: true' to enable."
             )
-        except Exception as exc:
-            guidance = _detect_runner_launch_guidance(
-                runner_name,
-                runner_config.command,
-                exc,
+
+        # Get real session context from contextvar
+        from ...app.agent_context import get_request_context
+        request_ctx = get_request_context() or {}
+        real_session_id = request_ctx.get("session_id", "")
+        real_user_id = request_ctx.get("user_id", "")
+        real_channel = request_ctx.get("channel", "")
+
+        chat_id_for_run = real_session_id if real_session_id else "tool_call"
+
+        # Collect results
+        result_parts: List[str] = []
+
+        async def on_message(message: Any, is_last: bool) -> None:
+            """Handle streaming messages from ACP."""
+            if isinstance(message, dict):
+                if message.get("type") == "text":
+                    text = message.get("text", "")
+                    if text:
+                        result_parts.append(text)
+
+        # --- Permission resume path ---
+        if permission_decision is not None:
+            if not session_id:
+                return _response_text(
+                    "Error: session_id is required when using permission_decision."
+                )
+            run_result = await service.resume_permission(
+                acp_session_id=session_id,
+                option_id=permission_decision,
+                on_message=on_message,
             )
-            if guidance is not None:
-                return _response_text(guidance)
-            raise
-        guidance = _detect_runner_guidance(
-            runner_name,
-            runner_config.command,
-            stderr_text,
-            env,
-        )
-        if guidance is not None:
-            return _response_text(guidance)
-        return _response_text(
-            _build_result_text(
-                runner_name,
-                runner_config.command,
-                args,
-                execution_cwd,
-                returncode,
-                stdout_text,
-                stderr_text,
-            ),
-        )
-    except Exception as exc:
-        return _response_text(f"Error: {exc}")
+        else:
+            # --- Normal execution path ---
+            prompt_blocks = [{"type": "text", "text": task_text}]
+            run_result = await service.run_turn(
+                chat_id=chat_id_for_run,
+                session_id=real_session_id if real_session_id else "spawn_agent_tool",
+                user_id=real_user_id if real_user_id else "system",
+                channel=real_channel if real_channel else "tool",
+                harness=runner_name,
+                prompt_blocks=prompt_blocks,
+                cwd=str(execution_cwd),
+                keep_session=keep_session,
+                preapproved=not require_approval,
+                existing_session_id=session_id,
+                on_message=on_message,
+            )
+
+        session_id_result = run_result.session_id
+
+        # --- Permission suspended: present options to user ---
+        if run_result.suspended_permission is not None:
+            sp = run_result.suspended_permission
+            header = [
+                f"spawn_agent runner: {runner_name}",
+                f"working directory: {execution_cwd}",
+                f"session_id: {session_id_result}",
+                "",
+            ]
+            perm_message = sp.format_chat_message()
+            option_ids = [
+                opt.get("optionId") or opt.get("id", "?")
+                for opt in sp.options
+                if isinstance(opt, dict)
+            ]
+            resume_hint = (
+                f"\nTo resume, call spawn_agent again with:\n"
+                f"  session_id='{session_id_result}', "
+                f"permission_decision='<optionId>'\n"
+                f"  Available optionIds: {option_ids}"
+            )
+            return _response_text(
+                "\n".join(header) + perm_message + resume_hint
+            )
+
+        # --- Normal completion ---
+        header = [
+            f"spawn_agent runner: {runner_name}",
+            f"working directory: {execution_cwd}",
+            f"session_id: {session_id_result}",
+            f"keep_session: {keep_session}",
+            "",
+        ]
+
+        output = "\n".join(result_parts).strip()
+        if output:
+            return _response_text("\n".join(header + ["Output:", output]))
+        else:
+            return _response_text("\n".join(header + ["(No output)"]))
+
+    except ImportError as e:
+        return _response_text(f"ACP mode not available: {e}.")
+    except Exception as e:
+        logger.exception("ACP execution failed")
+        return _response_text(f"ACP execution error: {e}")

@@ -22,6 +22,7 @@ from ..constant import (
     WORKING_DIR,
 )
 from ..providers.models import ModelSlotConfig
+from ..agents.acp.config import ACPConfig
 
 
 def generate_short_agent_id() -> str:
@@ -1158,6 +1159,11 @@ class Config(BaseModel):
         default_factory=detect_system_timezone,
         description="User IANA timezone (e.g. Asia/Shanghai). "
         "Defaults to the system timezone.",
+    )
+    # ACP configuration for external agent runners
+    acp: Optional["ACPConfig"] = Field(
+        default=None,
+        description="ACP (Agent Client Protocol) configuration for external agents",
     )
 
 

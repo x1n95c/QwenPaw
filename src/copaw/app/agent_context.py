@@ -4,7 +4,7 @@
 Provides utilities to get the correct agent instance for each request.
 """
 from contextvars import ContextVar
-from typing import Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, TYPE_CHECKING
 from fastapi import Request
 from .multi_agent_manager import MultiAgentManager
 from ..config.utils import load_config
@@ -15,6 +15,13 @@ if TYPE_CHECKING:
 # Context variable to store current agent ID across async calls
 _current_agent_id: ContextVar[Optional[str]] = ContextVar(
     "current_agent_id",
+    default=None,
+)
+
+# Context variable to store full request context (session_id, user_id, channel, agent_id)
+# This is used by tool functions that need access to session metadata
+_current_request_context: ContextVar[Optional[Dict[str, Any]]] = ContextVar(
+    "current_request_context",
     default=None,
 )
 
@@ -138,3 +145,26 @@ def get_current_agent_id() -> str:
     if agent_id:
         return agent_id
     return get_active_agent_id()
+
+
+def set_request_context(context: Dict[str, Any]) -> None:
+    """Set the full request context in contextvar.
+
+    This should be called by the runner before invoking the agent,
+    so that tool functions can access session metadata.
+
+    Args:
+        context: Request context dict with session_id, user_id, channel, agent_id
+    """
+    _current_request_context.set(context)
+
+
+def get_request_context() -> Optional[Dict[str, Any]]:
+    """Get the current request context from contextvar.
+
+    This is used by tool functions that need access to session metadata.
+
+    Returns:
+        Request context dict with session_id, user_id, channel, agent_id, or None
+    """
+    return _current_request_context.get()
