@@ -145,7 +145,8 @@ async def run_daemon_restart(context: DaemonContext) -> str:
     return (
         "**Restart**\n\n"
         "- Not running inside app. "
-        f"Run the app (e.g. `{PROJECT_NAME.lower()} app`) and use /daemon restart in chat, "
+        f"Run the app (e.g. `{PROJECT_NAME.lower()} app`) "
+        "and use /daemon restart in chat, "
         "or restart the process with systemd/supervisor/docker."
     )
 

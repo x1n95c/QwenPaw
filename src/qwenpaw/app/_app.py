@@ -18,7 +18,13 @@ from agentscope_runtime.engine.schemas.exception import (
 
 from ..config import load_config  # pylint: disable=no-name-in-module
 from ..config.utils import get_config_path
-from ..constant import DOCS_ENABLED, LOG_LEVEL_ENV, CORS_ORIGINS, WORKING_DIR, PROJECT_NAME
+from ..constant import (
+    DOCS_ENABLED,
+    LOG_LEVEL_ENV,
+    CORS_ORIGINS,
+    WORKING_DIR,
+    PROJECT_NAME,
+)
 from ..__version__ import __version__
 from ..utils.logging import setup_logger, add_project_file_handler
 from .auth import AuthMiddleware

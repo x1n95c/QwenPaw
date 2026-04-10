@@ -139,7 +139,8 @@ def setup_logger(level: int | str = logging.INFO):
         else:
             handler.setLevel(logging.WARNING)
 
-    # Only attach handler to the project namespace so only app logs are printed.
+    # Only attach handler to the project namespace
+    # so only app logs are printed.
     logger = logging.getLogger(LOG_NAMESPACE)
     logger.setLevel(level)
     logger.propagate = False
