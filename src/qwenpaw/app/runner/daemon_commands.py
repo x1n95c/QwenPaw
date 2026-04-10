@@ -45,7 +45,8 @@ DAEMON_SHORT_ALIASES = {
 }
 
 LOG_NAMESPACE = PROJECT_NAME.lower()
-LOG_PATH =  WORKING_DIR / f"{LOG_NAMESPACE}.log"
+LOG_PATH = WORKING_DIR / f"{LOG_NAMESPACE}.log"
+
 
 @dataclass
 class DaemonContext:
