@@ -395,7 +395,7 @@ export function RemoteModelManageModal({
           </div>
         </div>
       }
-      width={560}
+      width={800}
       destroyOnHidden
     >
       {/* Model list */}
