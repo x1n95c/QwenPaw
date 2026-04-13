@@ -731,10 +731,17 @@ async def _ensure_browser(
             state["browser_process"] = None
             state["launch_mode"] = "playwright"
         else:
-            await _start_managed_cdp_browser(
-                state,
-                ensure_pages=True,
-            )
+            if _use_webkit_fallback():
+                await _action_start(
+                    state,
+                    headed=not state["headless"],
+                    private_mode=True,
+                )
+            else:
+                await _start_managed_cdp_browser(
+                    state,
+                    ensure_pages=True,
+                )
         state["_last_browser_error"] = None
         _touch_activity(state)
         _start_idle_watchdog(state)
