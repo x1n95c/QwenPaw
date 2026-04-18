@@ -12,17 +12,11 @@ from acp.schema import (
     AgentPlanUpdate,
     AgentThoughtChunk,
     AvailableCommandsUpdate,
-    CreateTerminalResponse,
     CurrentModeUpdate,
-    ReadTextFileResponse,
-    ReleaseTerminalResponse,
     RequestPermissionResponse,
-    TerminalOutputResponse,
     ToolCallProgress,
     ToolCallStart,
     UserMessageChunk,
-    WaitForTerminalExitResponse,
-    WriteTextFileResponse,
 )
 
 from .core import ACPAgentConfig, SuspendedPermission
@@ -32,7 +26,7 @@ MessageHandler = Callable[[dict[str, Any], bool], Awaitable[None]]
 
 
 class ACPHostedClient:
-    """Official ACP client callback implementation for delegated agents."""
+    """ACP client callback implementation for delegated agents."""
 
     def __init__(
         self,
@@ -133,53 +127,6 @@ class ACPHostedClient:
             self._permission_future = None
             self._permission_requested.clear()
 
-    async def write_text_file(
-        self,
-        content: str,
-        path: str,
-        session_id: str,
-        **_: Any,
-    ) -> WriteTextFileResponse | None:
-        _ = content, path, session_id
-        raise RequestError.method_not_found("fs/write_text_file")
-
-    async def read_text_file(
-        self,
-        path: str,
-        session_id: str,
-        limit: int | None = None,
-        line: int | None = None,
-        **_: Any,
-    ) -> ReadTextFileResponse:
-        _ = path, session_id, limit, line
-        raise RequestError.method_not_found("fs/read_text_file")
-
-    async def create_terminal(self, **params: Any) -> CreateTerminalResponse:
-        _ = params
-        raise RequestError.method_not_found("terminal/create")
-
-    async def terminal_output(self, **params: Any) -> TerminalOutputResponse:
-        _ = params
-        raise RequestError.method_not_found("terminal/output")
-
-    async def release_terminal(
-        self,
-        **params: Any,
-    ) -> ReleaseTerminalResponse | None:
-        _ = params
-        raise RequestError.method_not_found("terminal/release")
-
-    async def wait_for_terminal_exit(
-        self,
-        **params: Any,
-    ) -> WaitForTerminalExitResponse:
-        _ = params
-        raise RequestError.method_not_found("terminal/wait_for_exit")
-
-    async def kill_terminal(self, **params: Any) -> None:
-        _ = params
-        raise RequestError.method_not_found("terminal/kill")
-
     async def session_update(
         self,
         session_id: str,
@@ -231,7 +178,7 @@ class ACPHostedClient:
 
     async def ext_method(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         _ = params
-        raise RequestError.method_not_found(method)
+        self._unsupported_method(method)
 
     async def ext_notification(
         self,
@@ -239,7 +186,7 @@ class ACPHostedClient:
         params: dict[str, Any],
     ) -> None:
         _ = params
-        raise RequestError.method_not_found(method)
+        self._unsupported_method(method)
 
     async def emit_permission_resolved(self) -> None:
         await self._emit_message(
