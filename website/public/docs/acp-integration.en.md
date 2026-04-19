@@ -141,12 +141,12 @@ You can pass task prompts such as “analyze the current working directory struc
 
 The built-in delegation flow supports these action types:
 
-| Action    | Purpose |
-| --------- | ------- |
-| `start`   | Start a new delegated ACP session |
-| `message` | Send a follow-up message to an existing delegated session |
+| Action    | Purpose                                                            |
+| --------- | ------------------------------------------------------------------ |
+| `start`   | Start a new delegated ACP session                                  |
+| `message` | Send a follow-up message to an existing delegated session          |
 | `respond` | Reply to a pending permission request using the selected option id |
-| `close`   | Close the delegated ACP session |
+| `close`   | Close the delegated ACP session                                    |
 
 ### Permission handling
 
@@ -182,13 +182,13 @@ If you need agent-to-agent collaboration, use **ACP as Tool**.
 
 ## ACP Server vs ACP Tool
 
-| Aspect | QwenPaw as ACP Server | QwenPaw using ACP as Tool |
-| ------ | --------------------- | ------------------------- |
-| QwenPaw's role | Server / target agent | Client / orchestrator |
-| Connection direction | External client connects to QwenPaw | QwenPaw connects to external runner |
-| Main purpose | Let editors or external clients drive QwenPaw | Let QwenPaw delegate work to another agent |
-| Typical entry point | `qwenpaw acp` | Delegation tool + ACP runner config |
-| Best for | Editor integration, programmatic control | Multi-agent collaboration, external specialist runners |
+| Aspect               | QwenPaw as ACP Server                         | QwenPaw using ACP as Tool                              |
+| -------------------- | --------------------------------------------- | ------------------------------------------------------ |
+| QwenPaw's role       | Server / target agent                         | Client / orchestrator                                  |
+| Connection direction | External client connects to QwenPaw           | QwenPaw connects to external runner                    |
+| Main purpose         | Let editors or external clients drive QwenPaw | Let QwenPaw delegate work to another agent             |
+| Typical entry point  | `qwenpaw acp`                                 | Delegation tool + ACP runner config                    |
+| Best for             | Editor integration, programmatic control      | Multi-agent collaboration, external specialist runners |
 
 ---
 

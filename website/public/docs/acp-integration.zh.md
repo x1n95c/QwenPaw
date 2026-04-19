@@ -141,12 +141,12 @@ QwenPaw 也可以反过来使用 ACP：不是自己作为 server 被外部客户
 
 当前委托流程支持以下动作类型：
 
-| 动作 | 用途 |
-| ---- | ---- |
-| `start` | 启动新的委托 ACP 会话 |
-| `message` | 向已有委托会话发送后续消息 |
+| 动作      | 用途                                      |
+| --------- | ----------------------------------------- |
+| `start`   | 启动新的委托 ACP 会话                     |
+| `message` | 向已有委托会话发送后续消息                |
 | `respond` | 使用选定的 option id 响应待处理的权限请求 |
-| `close` | 关闭委托 ACP 会话 |
+| `close`   | 关闭委托 ACP 会话                         |
 
 ### 权限处理
 
@@ -182,13 +182,13 @@ ACP as Tool 和 MCP 解决的问题并不相同：
 
 ## ACP Server vs ACP Tool
 
-| 维度 | QwenPaw as ACP Server | QwenPaw using ACP as Tool |
-| ---- | --------------------- | ------------------------- |
-| QwenPaw 的角色 | Server / 被连接的智能体 | Client / 编排者 |
-| 连接方向 | 外部客户端连接 QwenPaw | QwenPaw 连接外部 runner |
-| 主要目的 | 让编辑器或外部客户端驱动 QwenPaw | 让 QwenPaw 把工作委托给另一个 agent |
-| 典型入口 | `qwenpaw acp` | delegation tool + ACP runner 配置 |
-| 适用场景 | 编辑器集成、程序化控制 | 多智能体协作、外部专用 runner |
+| 维度           | QwenPaw as ACP Server            | QwenPaw using ACP as Tool           |
+| -------------- | -------------------------------- | ----------------------------------- |
+| QwenPaw 的角色 | Server / 被连接的智能体          | Client / 编排者                     |
+| 连接方向       | 外部客户端连接 QwenPaw           | QwenPaw 连接外部 runner             |
+| 主要目的       | 让编辑器或外部客户端驱动 QwenPaw | 让 QwenPaw 把工作委托给另一个 agent |
+| 典型入口       | `qwenpaw acp`                    | delegation tool + ACP runner 配置   |
+| 适用场景       | 编辑器集成、程序化控制           | 多智能体协作、外部专用 runner       |
 
 ---
 

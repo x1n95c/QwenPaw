@@ -69,7 +69,12 @@ export const ACPCard = React.memo(function ACPCard({
       <div className={styles.cardTopSection}>
         <div className={styles.channelIcon}>
           {iconSpec.imageUrl ? (
-            <img src={iconSpec.imageUrl} alt={agentKey} width={40} height={40} />
+            <img
+              src={iconSpec.imageUrl}
+              alt={agentKey}
+              width={40}
+              height={40}
+            />
           ) : (
             iconSpec.icon
           )}

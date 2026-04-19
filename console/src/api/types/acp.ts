@@ -1,7 +1,4 @@
-export type ACPToolParseMode =
-  | "call_title"
-  | "update_detail"
-  | "call_detail";
+export type ACPToolParseMode = "call_title" | "update_detail" | "call_detail";
 
 export const ACP_DEFAULT_STDIO_BUFFER_LIMIT_BYTES = 50 * 1024 * 1024;
 

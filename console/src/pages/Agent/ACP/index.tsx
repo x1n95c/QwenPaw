@@ -103,7 +103,8 @@ function ACPPage() {
       argsText: stringifyArgs(config?.args),
       envText: stringifyEnv(config?.env),
       stdio_buffer_limit_bytes:
-        config?.stdio_buffer_limit_bytes ?? ACP_DEFAULT_STDIO_BUFFER_LIMIT_BYTES,
+        config?.stdio_buffer_limit_bytes ??
+        ACP_DEFAULT_STDIO_BUFFER_LIMIT_BYTES,
     });
   };
 
