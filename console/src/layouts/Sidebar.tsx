@@ -195,6 +195,12 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
       label: t("nav.mcp"),
     },
     {
+      key: "acp",
+      icon: <SparkOtherLine size={18} />,
+      path: "/acp",
+      label: t("nav.acp"),
+    },
+    {
       key: "agent-config",
       icon: <SparkModifyLine size={18} />,
       path: "/agent-config",
@@ -308,6 +314,11 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
           key: "mcp",
           label: collapsed ? null : t("nav.mcp"),
           icon: <SparkMcpMcpLine size={16} />,
+        },
+        {
+          key: "acp",
+          label: collapsed ? null : t("nav.acp"),
+          icon: <SparkOtherLine size={16} />,
         },
         {
           key: "agent-config",
