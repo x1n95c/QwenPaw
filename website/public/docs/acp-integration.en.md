@@ -109,6 +109,12 @@ Conceptually, this allows QwenPaw to treat an external agent as a cooperative to
 
 ### How to configure external runners
 
+Before using an external runner, make sure you have installed an ACP-compatible external agent and completed any required login or API key setup so it can be started and used normally from the command line. You can refer to the official ACP agent list here: <https://agentclientprotocol.com/get-started/agents>.
+
+![qwen](https://gw.alicdn.com/imgextra/i1/O1CN017f6aVo1tWpstPL4GK_!!6000000005910-2-tps-1226-408.png)
+
+Once the command-line side is ready, you can either configure a custom agent in QwenPaw or use one of the built-in agents for collaboration.
+
 External runners must be configured and enabled on the **Workspace → ACP** page before they can be used by `delegate_external_agent`.
 
 The current ACP configuration UI supports these fields for each runner:
@@ -121,9 +127,23 @@ The current ACP configuration UI supports these fields for each runner:
 - `tool_parse_mode`
 - `stdio_buffer_limit_bytes`
 
-Among them, `command` and `args` define how the external runner process is launched; `env` passes environment variables; and `tool_parse_mode` plus `stdio_buffer_limit_bytes` control ACP output parsing and stdio buffering behavior.
+Specifically:
+
+- `command` and `args` define how the external runner process is launched;
+- `env` passes environment variables;
+- `tool_parse_mode` and `stdio_buffer_limit_bytes` control ACP output parsing and stdio buffering behavior.
 
 The source code ships with these built-in runner examples: `opencode`, `qwen_code`, `claude_code`, and `codex`. You can also add custom runners on the ACP page as long as they can run via ACP and are configured correctly.
+
+![config](https://gw.alicdn.com/imgextra/i3/O1CN01QQjKIv1jAibICuR7Q_!!6000000004508-2-tps-1224-480.png)
+
+After that, enable the `delegate_external_agent` tool in the toolbar.
+
+![config](https://gw.alicdn.com/imgextra/i4/O1CN01XS6D6W1Yzap02Jnjk_!!6000000003130-2-tps-1224-700.png)
+
+You can then specify in the conversation which external agent you want to collaborate with.
+
+![comm](https://gw.alicdn.com/imgextra/i3/O1CN01LpUJWZ1QOTniYDnrP_!!6000000001966-2-tps-1986-946.png)
 
 ### Typical workflow
 

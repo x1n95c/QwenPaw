@@ -109,9 +109,15 @@ QwenPaw 也可以反过来使用 ACP：不是自己作为 server 被外部客户
 
 ### 如何配置外部 runner
 
-外部 runner 需要先在 **Workspace → ACP** 页面中配置并启用，随后才能被 `delegate_external_agent` 调用。
+在使用外部 runner 之前，请先安装一个支持 ACP 协议的外部 agent，并完成登录或 API Key 等必要配置，确保它可以在命令行中正常启动和使用。可参考 ACP 官方提供的 agent 列表：<https://agentclientprotocol.com/get-started/agents>。
 
-当前 ACP 配置页支持为每个 runner 设置这些字段：
+![qwen](https://gw.alicdn.com/imgextra/i1/O1CN01XtTTNP1IuyyyKi5ZS_!!6000000000954-2-tps-1196-664.png)
+
+完成命令行侧准备后，你可以在 QwenPaw 中配置自定义 agent，或直接使用内置 agent 与其协作。
+
+外部 runner 需要先在 **Workspace → ACP** 页面中完成配置并启用，之后才能被 `delegate_external_agent` 调用。
+
+当前 ACP 配置页支持为每个 runner 设置以下字段：
 
 - `enabled`
 - `command`
@@ -121,9 +127,23 @@ QwenPaw 也可以反过来使用 ACP：不是自己作为 server 被外部客户
 - `tool_parse_mode`
 - `stdio_buffer_limit_bytes`
 
-其中，`command` 和 `args` 用于定义如何启动外部 runner；`env` 用于传递环境变量；`tool_parse_mode` 和 `stdio_buffer_limit_bytes` 用于控制 ACP 输出解析和 stdio 缓冲行为。
+其中：
 
-源码里默认内置了这些 runner 示例：`opencode`、`qwen_code`、`claude_code`、`codex`。你也可以在 ACP 页面中添加自定义 runner，只要它能够以 ACP 方式运行并被正确配置。
+- `command` 与 `args` 用于定义外部 runner 的启动方式；
+- `env` 用于传递环境变量；
+- `tool_parse_mode` 与 `stdio_buffer_limit_bytes` 用于控制 ACP 输出解析方式以及 stdio 缓冲行为。
+
+源码中默认内置了这些 runner 示例：`opencode`、`qwen_code`、`claude_code`、`codex`。你也可以在 ACP 页面中添加自定义 runner，只要它能够以 ACP 方式运行并被正确配置即可。
+
+![config](https://gw.alicdn.com/imgextra/i3/O1CN01pskmLt29VwyFGhO1r_!!6000000008074-2-tps-1224-472.png)
+
+配置完成后，在工具栏中启用 `delegate_external_agent` 工具。
+
+![config](https://gw.alicdn.com/imgextra/i1/O1CN01xNZfYc1OM4UFIR79S_!!6000000001690-2-tps-1224-696.png)
+
+随后，你就可以在对话中明确指定要与哪个外部 agent 进行协作。
+
+![comm](https://gw.alicdn.com/imgextra/i4/O1CN01lk5XhU2988NFcFtR0_!!6000000008022-2-tps-2022-1166.png)
 
 ### 典型工作流
 
