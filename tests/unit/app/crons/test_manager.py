@@ -350,3 +350,85 @@ async def test_run_job_creates_background_task_for_known_job(
 
     mock_exec.assert_called_once()
     await manager.stop()
+
+
+# ---------------------------------------------------------------------------
+# Inbox archiving reads what was delivered.
+#
+# The body used to come from `job.text`, which is identical to `final_text`
+# for a plain text job — so the bug was invisible. Once a preprocess starts
+# contributing to the delivered message, reading `job.text` would archive
+# only the lead-in and silently drop the collected data.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def inbox_events(monkeypatch) -> list[dict]:
+    captured: list[dict] = []
+
+    async def _capture(**kwargs):
+        captured.append(kwargs)
+
+    monkeypatch.setattr(
+        "qwenpaw.app.crons.manager.append_inbox_event",
+        _capture,
+    )
+    return captured
+
+
+async def run_once_with_result(
+    manager: CronManager,
+    job,
+    execution_result: dict,
+) -> None:
+    manager._executor = AsyncMock()
+    manager._executor.execute.return_value = execution_result
+    await manager._execute_once(job)
+
+
+@pytest.mark.asyncio
+async def test_inbox_body_prefers_the_delivered_text(
+    manager: CronManager,
+    inbox_events: list[dict],
+):
+    job = make_cron_job_spec(task_type="text", text="Lead-in")
+    job.save_result_to_inbox = True
+    await run_once_with_result(
+        manager,
+        job,
+        {
+            "task_type": "text",
+            "final_text": "Lead-in\n\ndisk 42% full",
+            "delivery_status": "success",
+            "delivery_error": None,
+        },
+    )
+
+    bodies = [
+        e["body"] for e in inbox_events if e["event_type"] == "cron_result"
+    ]
+    assert bodies == ["Lead-in\n\ndisk 42% full"]
+
+
+@pytest.mark.asyncio
+async def test_inbox_body_falls_back_to_job_text(
+    manager: CronManager,
+    inbox_events: list[dict],
+):
+    """Older results carry no final_text; archiving must still work."""
+    job = make_cron_job_spec(task_type="text", text="Just this")
+    job.save_result_to_inbox = True
+    await run_once_with_result(
+        manager,
+        job,
+        {
+            "task_type": "text",
+            "delivery_status": "success",
+            "delivery_error": None,
+        },
+    )
+
+    bodies = [
+        e["body"] for e in inbox_events if e["event_type"] == "cron_result"
+    ]
+    assert bodies == ["Just this"]

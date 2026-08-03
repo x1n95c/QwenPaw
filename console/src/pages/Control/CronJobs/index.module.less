@@ -338,15 +338,45 @@
   gap: 8px;
 }
 
+.templateTitleRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  // The title yields space; the content tags keep their natural width so
+  // "1 个附带 skill" never gets clipped to "1 个附带 sk…".
+  min-width: 0;
+
+  .templateTags {
+    flex: 0 0 auto;
+    // Stay on the title's line instead of stacking and growing the row.
+    flex-wrap: nowrap;
+  }
+
+  .templateTag {
+    white-space: nowrap;
+  }
+}
+
 .templateTitle {
   font-size: 14px;
   font-weight: 600;
   color: rgba(20, 20, 19, 0.88);
+  // An imported package can carry a long title; keep it on one line.
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .templateDesc {
   font-size: 12px;
   color: rgba(20, 20, 19, 0.65);
+  // One line only, so a long description cannot make one card taller than
+  // its neighbours and break the grid alignment. The full text is on the
+  // hover tooltip.
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
 }
 
 .templateMeta {
@@ -379,6 +409,21 @@
 
 .templateActions {
   margin-top: 4px;
+}
+
+.templateFilePreview {
+  max-height: 420px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  background: #f7f8fa;
+  border: 1px solid #eaeaea;
+  border-radius: 8px;
+  font-size: 12px;
+  line-height: 1.6;
+  // Batch JSON and shell commands are long; wrap rather than scroll sideways.
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .historyList {

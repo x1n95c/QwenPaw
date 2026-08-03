@@ -26,6 +26,7 @@ import yaml
 from ...exceptions import SkillsError
 from ...security.skill_scanner import scan_skill_directory
 from ..utils.file_handling import read_text_file_with_encoding_fallback
+from ...utils.io_utils import extract_zip_safely
 from .models import SkillInfo, SkillRequirements
 
 try:
@@ -480,26 +481,20 @@ def is_ignored_skill_entry(name: str) -> bool:
 
 
 def _extract_and_validate_zip(data: bytes, tmp_dir: Path) -> None:
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        total = sum(info.file_size for info in zf.infolist())
-        if total > _MAX_ZIP_BYTES:
-            raise SkillsError(
-                message="Uncompressed zip exceeds 200MB limit",
-            )
+    """Extract an uploaded skill zip with the shared archive defenses.
 
-        root_path = tmp_dir.resolve()
-        for info in zf.infolist():
-            target = (tmp_dir / info.filename).resolve()
-            if not target.is_relative_to(root_path):
-                raise SkillsError(
-                    message=f"Unsafe path in zip: {info.filename}",
-                )
-            if info.external_attr >> 16 & 0o120000 == 0o120000:
-                raise SkillsError(
-                    message=f"Symlink not allowed in zip: {info.filename}",
-                )
-
-        zf.extractall(tmp_dir)
+    The traversal / symlink / bomb checks live in ``utils.io_utils`` so
+    that skill packages and cron template packages cannot drift apart —
+    a fix there reaches both. Only the limits and the error type are
+    skill-specific; no entry-count cap is imposed, preserving the
+    behaviour this function had before the helper was extracted.
+    """
+    extract_zip_safely(
+        data,
+        tmp_dir,
+        max_bytes=_MAX_ZIP_BYTES,
+        error_factory=lambda message: SkillsError(message=message),
+    )
 
 
 def _safe_child_path(base_dir: Path, relative_name: str) -> Path:

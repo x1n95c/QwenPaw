@@ -1,0 +1,57 @@
+{
+  "form": {
+    "cronCustom": "0 20 15 * *",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "text",
+    "text": "小提醒：今天记得给毛孩子安排驱虫/疫苗检查喔～"
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "宠物驱虫/疫苗提醒",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "cron": "0 20 15 * *",
+      "type": "cron"
+    },
+    "task_type": "text",
+    "text": "小提醒：今天记得给毛孩子安排驱虫/疫苗检查喔～"
+  },
+  "schema_version": "cron-template.v1"
+}

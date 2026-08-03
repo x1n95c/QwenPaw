@@ -27,13 +27,18 @@ not used. Revisit that decision only if multi-process writers are supported.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import secrets
+import shutil
 import stat
+import tempfile
 import threading
 import weakref
-from collections.abc import Callable
+import zipfile
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, ParamSpec, TextIO, TypeVar
 
@@ -485,8 +490,88 @@ async def write_yaml_atomic_async(
     )
 
 
+def extract_zip_safely(
+    data: bytes,
+    dest_dir: Path,
+    *,
+    max_bytes: int,
+    max_entries: int | None = None,
+    error_factory: Callable[[str], Exception],
+) -> None:
+    """Extract a zip archive into *dest_dir*, refusing hostile inputs.
+
+    Shared by every "user uploads an archive" path (skill packages, cron
+    template packages) so the defenses cannot drift apart: a fix here
+    reaches all of them. Callers supply their own limits and exception
+    type, which is the only thing that legitimately differs between them.
+
+    Rejected before a single byte is written:
+
+    * uncompressed total over *max_bytes* (decompression bomb)
+    * more than *max_entries* members, when a cap is given
+    * any member resolving outside *dest_dir* (``../`` traversal)
+    * any member flagged as a symlink
+
+    Args:
+        data: Raw zip bytes.
+        dest_dir: Existing directory to extract into.
+        max_bytes: Ceiling on the summed uncompressed size.
+        max_entries: Optional ceiling on member count. ``None`` disables
+            the check.
+        error_factory: Builds the exception to raise, given a message.
+            Lets each caller surface its own domain error type.
+
+    Raises:
+        Whatever ``error_factory`` returns, on any rejected input.
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as zf:
+        infos = zf.infolist()
+        if max_entries is not None and len(infos) > max_entries:
+            raise error_factory(
+                f"Zip has too many entries (limit {max_entries})",
+            )
+        total = sum(info.file_size for info in infos)
+        if total > max_bytes:
+            raise error_factory(
+                f"Uncompressed zip exceeds "
+                f"{max_bytes // (1024 * 1024)}MB limit",
+            )
+
+        root_path = dest_dir.resolve()
+        for info in infos:
+            target = (dest_dir / info.filename).resolve()
+            if not target.is_relative_to(root_path):
+                raise error_factory(f"Unsafe path in zip: {info.filename}")
+            # The high bits of external_attr carry the Unix mode; 0o120000
+            # marks a symlink, which could otherwise point anywhere.
+            if info.external_attr >> 16 & 0o120000 == 0o120000:
+                raise error_factory(
+                    f"Symlink not allowed in zip: {info.filename}",
+                )
+
+        zf.extractall(dest_dir)
+
+
+@contextmanager
+def staged_dir(name: str, *, prefix: str) -> Iterator[Path]:
+    """Yield ``<tmp>/<name>`` for staged writes, always cleaning up.
+
+    The staging pattern behind every "validate before it lands" flow:
+    build the artifact in a temp directory, check it there, and only then
+    move it into place — so a rejected artifact never leaves a partial
+    directory behind. *prefix* names the temp root, which is what you see
+    when debugging leftovers.
+    """
+    temp_root = Path(tempfile.mkdtemp(prefix=f"{prefix}{name}_"))
+    try:
+        yield temp_root / name
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+
 __all__ = [
     "append_text_async",
+    "extract_zip_safely",
     "get_path_lock",
     "get_sync_path_lock",
     "make_dirs_async",
@@ -496,6 +581,7 @@ __all__ = [
     "read_json_async",
     "read_text_async",
     "run_sync_io",
+    "staged_dir",
     "unlink_async",
     "write_bytes_async",
     "write_json_atomic",

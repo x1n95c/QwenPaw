@@ -1,0 +1,65 @@
+{
+  "form": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "onceRepeatCount": 2,
+    "onceRepeatEnabled": true,
+    "onceRepeatEndType": "until",
+    "onceRepeatEveryDays": 7,
+    "onceRepeatUntil": "2026-03-01T23:59:00",
+    "onceRunAt": "2026-01-02T08:45:00",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "once"
+    },
+    "scheduleType": "once",
+    "task_type": "text",
+    "text": "15分钟后周会开始。"
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "两个月周会提醒",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "repeat_end_type": "until",
+      "repeat_every_days": 7,
+      "repeat_until": "2026-03-01T23:59:00",
+      "run_at": "2026-01-02T08:45:00",
+      "type": "once"
+    },
+    "task_type": "text",
+    "text": "15分钟后周会开始。"
+  },
+  "schema_version": "cron-template.v1"
+}

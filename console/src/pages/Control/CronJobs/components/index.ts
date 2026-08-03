@@ -1,5 +1,9 @@
 export { createColumns } from "./columns";
 export { JobDrawer } from "./JobDrawer";
 export { TemplatePickerModal } from "./TemplatePickerModal";
+export { TemplateDetailDrawer } from "./TemplateDetailDrawer";
+export { EditTemplateModal } from "./EditTemplateModal";
+export { SaveAsTemplateModal } from "./SaveAsTemplateModal";
 export { useCronJobs } from "../useCronJobs";
+export { useCronTemplates } from "./useCronTemplates";
 export { DEFAULT_FORM_VALUES } from "./constants";

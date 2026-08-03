@@ -71,35 +71,21 @@ class ContextVarsSetupHook(LifecycleHook):
             }
         set_current_approval_route(approval_route)
 
-        coding_project_dir = None
-        try:
-            from ...config.config import load_agent_config
+        # Shared with the non-request callers (cron preprocess) so the two
+        # paths cannot disagree about shell timeouts or pruning limits.
+        # config_derived_tool_values never raises; it logs and returns
+        # defaults, which is what this block used to do inline.
+        from ...runtime.tool_context import config_derived_tool_values
 
-            cfg = load_agent_config(ctx.agent_id)
-            running = cfg.running
-            pruning_cfg = (
-                running.light_context_config.tool_result_pruning_config
-            )
-            set_current_recent_max_bytes(
-                pruning_cfg.pruning_recent_msg_max_bytes,
-            )
-            set_current_shell_command_timeout(running.shell_command_timeout)
-            set_current_shell_command_executable(
-                running.shell_command_executable or None,
-            )
-            _cm = getattr(cfg, "coding_mode", None)
-            if (
-                _cm
-                and getattr(_cm, "enabled", False)
-                and getattr(_cm, "project_dir", None)
-            ):
-                coding_project_dir = _cm.project_dir
-        except Exception:
-            logger.warning(
-                "contextvars_setup: config-derived vars failed; "
-                "tools may see defaults",
-                exc_info=True,
-            )
+        config_values = config_derived_tool_values(ctx.agent_id)
+        set_current_recent_max_bytes(config_values.recent_max_bytes)
+        set_current_shell_command_timeout(
+            config_values.shell_command_timeout,
+        )
+        set_current_shell_command_executable(
+            config_values.shell_command_executable,
+        )
+        coding_project_dir = config_values.coding_project_dir
 
         # Forked subagents must resolve relative file/shell paths against
         # the worktree, not the parent workspace.

@@ -1,0 +1,48 @@
+{
+  "batch_entry": "batch/weather.json",
+  "form": {
+    "cronCustom": "30 7 * * *",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"调用 run_tool_batch(file_path=\\\"{{batch_entry}}\\\", args={\\\"city\\\": \\\"\\\"}) 取当地天气（city 留空表示按 IP 自动定位，想固定城市就填城市名），然后按 weather-report skill 的格式播报：天气、温度区间、降水时段、风力，以及最多两条穿衣/带伞建议。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 180
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "enabled": true,
+    "name": "每日天气播报",
+    "save_result_to_inbox": true,
+    "schedule": {
+      "cron": "30 7 * * *",
+      "type": "cron"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

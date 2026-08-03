@@ -7,9 +7,10 @@ correctly in a multi-agent environment.
 """
 from __future__ import annotations
 
+from contextlib import contextmanager
 from contextvars import ContextVar
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, Iterator, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from agentscope.state import AgentState
@@ -190,3 +191,50 @@ def set_current_agent_state(state: AgentState | None) -> None:
         state: AgentState instance to store in context.
     """
     current_agent_state.set(state)
+
+
+#: The vars this module owns, keyed by the name a caller uses. A tuple so
+#: that seeding "all of them" cannot silently miss one when a var is added.
+_SCOPED_VARS: tuple[tuple[str, ContextVar], ...] = (
+    ("workspace_dir", current_workspace_dir),
+    ("session_id", current_session_id),
+    ("recent_max_bytes", current_recent_max_bytes),
+    ("shell_command_timeout", current_shell_command_timeout),
+    ("shell_command_executable", current_shell_command_executable),
+    ("toolkit", current_toolkit),
+    ("agent_state", current_agent_state),
+)
+
+
+@contextmanager
+def scoped_runtime_context(**values: Any) -> Iterator[None]:
+    """Temporarily set this module's vars, then restore them.
+
+    The ``set_current_*`` helpers above discard the reset token, which is
+    fine for a request that owns the whole context. It is not fine for a
+    caller running tools *inside* a larger request: a leftover
+    ``current_toolkit`` from finished work would be read as live by
+    anything that runs before the owning request seeds its own.
+
+    Only keys present in *values* are touched; pass ``None`` explicitly to
+    scope a var to ``None``.
+
+    Raises:
+        TypeError: on an unknown key, so a typo fails loudly.
+    """
+    known = dict(_SCOPED_VARS)
+    unknown = set(values) - set(known)
+    if unknown:
+        raise TypeError(
+            f"scoped_runtime_context got unexpected keys: "
+            f"{', '.join(sorted(unknown))}",
+        )
+
+    tokens = [
+        (known[key], known[key].set(value)) for key, value in values.items()
+    ]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)

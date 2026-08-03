@@ -1,0 +1,10 @@
+{
+  "actions": [
+    {
+      "tool_name": "execute_shell_command",
+      "arguments": {
+        "command": "curl -s 'https://wttr.in/${args.city}?format=j1'"
+      }
+    }
+  ]
+}

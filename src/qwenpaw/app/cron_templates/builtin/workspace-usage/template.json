@@ -1,0 +1,47 @@
+{
+  "form": {
+    "cronCustom": "0 8 * * *",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"巡检磁盘余量与 agent workspace 占用。模板目录：{{template_dir}}。请按 disk-usage-advisor skill 的说明操作：先根据系统提示里的 Platform 选择 batch/scan-unix.json 或 batch/scan-windows.json，用 run_tool_batch 执行（args.path 传你自己的 workspace 目录），再按 skill 的阈值口径判读——低于 85% 只回一句『磁盘正常』，超过则按 skill 的汇报格式列出占用最大的目录并给出清理建议。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 300
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "enabled": true,
+    "name": "workspace 占用巡检",
+    "save_result_to_inbox": true,
+    "schedule": {
+      "cron": "0 8 * * *",
+      "type": "cron"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

@@ -16,6 +16,7 @@ from .mcp import router as mcp_router
 from .mcp_oauth import router as mcp_oauth_router
 from .tools import router as tools_router
 from ..crons.api import router as cron_router
+from ..cron_templates.api import router as cron_template_router
 from ..chats.api import router as runner_router
 from .console import router as console_router
 from .fork import router as fork_router
@@ -43,6 +44,7 @@ router.include_router(config_router)
 router.include_router(console_router)
 router.include_router(fork_router)
 router.include_router(cron_router)
+router.include_router(cron_template_router)
 router.include_router(local_models_router)
 router.include_router(mcp_oauth_router)
 router.include_router(mcp_router)

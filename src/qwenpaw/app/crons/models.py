@@ -180,6 +180,78 @@ class JobRuntimeSpec(BaseModel):
     )
 
 
+#: Mirrors ``run_tool_batch``'s own caps. Re-declared rather than imported
+#: because importing that module pulls in the whole ``agents.tools``
+#: package (psutil, html2text, browser control) and this module is loaded
+#: every time ``jobs.json`` is read. ``test_models.py`` asserts the two stay
+#: equal, so a drift fails loudly instead of silently accepting a batch the
+#: executor will reject.
+MAX_PREPROCESS_STEPS = 50
+DEFAULT_PREPROCESS_MAX_EXECUTION_STEPS = 500
+
+
+class PreprocessSpec(BaseModel):
+    """A ``run_tool_batch`` script run deterministically before each fire.
+
+    Not a tool the model may choose: the batch runs first, every time,
+    unconditionally. That is the point — collecting data needs no reasoning,
+    so making the LLM decide to collect it wastes a whole turn.
+
+    Applies to both task types, with different destinations for the result:
+
+    * ``agent`` — the call and its result are appended to the user prompt,
+      so the model starts with the data already in hand.
+    * ``text`` — the result is delivered to the user directly; no LLM is
+      involved at any point.
+    """
+
+    enabled: bool = True
+    #: Script name in the shared batch pool, with or without ``.json``.
+    #: Mutually exclusive with ``actions``.
+    script: Optional[str] = None
+    #: Inline actions, for a one-off not worth pooling.
+    actions: Optional[list[dict[str, Any]]] = None
+    #: Values for the script's ``${args.<name>}`` placeholders.
+    args: Dict[str, Any] = Field(default_factory=dict)
+    #: Default True, unlike ``run_tool_batch``'s own False: this output goes
+    #: into a prompt on a schedule, so full per-step results for a 20-step
+    #: batch would compound in token cost every single run.
+    last_only: bool = True
+    stop_on_error: bool = True
+    maxstep: int = Field(
+        default=DEFAULT_PREPROCESS_MAX_EXECUTION_STEPS,
+        ge=1,
+    )
+    #: Wall-clock bound. ``run_tool_batch`` caps step *count*, not time, and
+    #: a step may carry an arbitrary ``wait`` — so without this a hung
+    #: command would hold the job's concurrency slot forever.
+    timeout_seconds: int = Field(default=120, ge=1)
+    #: ``continue`` reports the failure to the agent / user and carries on;
+    #: ``abort`` skips delivery entirely.
+    on_failure: Literal["continue", "abort"] = "continue"
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "PreprocessSpec":
+        # `is None` rather than truthiness: `actions=[]` means "provided but
+        # empty", which deserves its own message instead of being reported
+        # as "you gave me neither source".
+        has_script = bool(self.script and self.script.strip())
+        has_actions = self.actions is not None
+        if has_script == has_actions:
+            raise ValueError(
+                "preprocess requires exactly one of 'script' or 'actions'",
+            )
+        if self.actions is not None:
+            if not self.actions:
+                raise ValueError("preprocess.actions must be non-empty")
+            if len(self.actions) > MAX_PREPROCESS_STEPS:
+                raise ValueError(
+                    f"preprocess.actions has {len(self.actions)} steps; "
+                    f"maximum is {MAX_PREPROCESS_STEPS}",
+                )
+        return self
+
+
 class CronJobRequest(BaseModel):
     """Passthrough payload to workspace.stream_query(request=...).
 
@@ -209,13 +281,29 @@ class CronJobSpec(BaseModel):
     save_result_to_inbox: Optional[bool] = None
 
     runtime: JobRuntimeSpec = Field(default_factory=JobRuntimeSpec)
+    #: Optional batch script run before every fire. Applies to both task
+    #: types; part of the task definition rather than a runtime knob, hence
+    #: top-level and not inside ``runtime``.
+    preprocess: Optional[PreprocessSpec] = None
     meta: Dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def has_preprocess(self) -> bool:
+        """Whether a preprocess batch will actually run."""
+        return self.preprocess is not None and self.preprocess.enabled
 
     @model_validator(mode="after")
     def _validate_task_type_fields(self) -> "CronJobSpec":
         if self.task_type == "text":
-            if not (self.text and self.text.strip()):
-                raise ValueError("task_type is text but text is empty")
+            # A preprocess makes the *result* the payload, so fixed text
+            # becomes an optional lead-in rather than the whole message.
+            if (
+                not (self.text and self.text.strip())
+                and not self.has_preprocess
+            ):
+                raise ValueError(
+                    "task_type is text but both text and preprocess are empty",
+                )
             if self.dispatch.silent:
                 raise ValueError(
                     "silent delivery is only supported for agent tasks",
@@ -234,10 +322,15 @@ class CronJobSpec(BaseModel):
             )
         if self.save_result_to_inbox is None:
             # Product rule:
-            # - text + recurring(cron) => default OFF
+            # - text + recurring(cron) => default OFF, because a fixed
+            #   reminder repeats verbatim and is not worth archiving...
+            # - ...unless a preprocess is attached, in which case every run
+            #   produces fresh collected data that is worth keeping
             # - all other combinations => default ON
             self.save_result_to_inbox = not (
-                self.task_type == "text" and self.schedule.type == "cron"
+                self.task_type == "text"
+                and self.schedule.type == "cron"
+                and not self.has_preprocess
             )
         return self
 

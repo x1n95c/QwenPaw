@@ -1,0 +1,57 @@
+{
+  "form": {
+    "cronCustom": "*/25 9-17 * * 1-5",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "text",
+    "text": "持续工作25分钟啦，起来活动一下，喝口水，顺便看看远处放松眼睛～"
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "休息提醒",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "cron": "*/25 9-17 * * 1-5",
+      "type": "cron"
+    },
+    "task_type": "text",
+    "text": "持续工作25分钟啦，起来活动一下，喝口水，顺便看看远处放松眼睛～"
+  },
+  "schema_version": "cron-template.v1"
+}

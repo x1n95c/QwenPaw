@@ -805,7 +805,15 @@ class CronManager(ManagerBase):
                             )
                     elif job.save_result_to_inbox:
                         if job.task_type == "text":
-                            body = (job.text or "").strip()
+                            # Prefer what was actually delivered. These are
+                            # the same string for a plain text job, but a
+                            # job with a preprocess sends text + collected
+                            # result — reading job.text would archive the
+                            # lead-in and silently drop the data.
+                            body = (
+                                execution_result.get("final_text")
+                                or (job.text or "").strip()
+                            )
                         else:
                             body = "Agent cron task finished successfully."
                         try:

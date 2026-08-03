@@ -1,0 +1,18 @@
+{
+  "actions": [
+    {
+      "tool_name": "execute_shell_command",
+      "arguments": {
+        "command": "df -h | awk 'NR>1 && /^\\/dev/ { pct=\"\"; for (i=5;i<=NF;i++) if ($i ~ /%$/) { pct=$i; break } printf \"%s  used %s, avail %s, %s full\\n\", $NF, $3, $4, pct }'"
+      },
+      "stop_on_error": false
+    },
+    {
+      "tool_name": "execute_shell_command",
+      "arguments": {
+        "command": "du -sh \"${args.path}\"/* 2>/dev/null | sort -rh | head -10"
+      },
+      "stop_on_error": false
+    }
+  ]
+}

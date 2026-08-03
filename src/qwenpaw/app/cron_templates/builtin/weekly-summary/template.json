@@ -1,0 +1,84 @@
+{
+  "form": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "onceRepeatCount": 2,
+    "onceRepeatEnabled": true,
+    "onceRepeatEndType": "until",
+    "onceRepeatEveryDays": 7,
+    "onceRepeatUntil": "2026-03-01T23:59:00",
+    "onceRunAt": "2026-01-02T08:30:00",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"请基于最近一周的 memory，生成本周工作总结，供周会前快速回顾。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "once"
+    },
+    "scheduleType": "once",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "周会前工作总结",
+    "request": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "请基于最近一周的 memory，生成本周工作总结，供周会前快速回顾。",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "repeat_end_type": "until",
+      "repeat_every_days": 7,
+      "repeat_until": "2026-03-01T23:59:00",
+      "run_at": "2026-01-02T08:30:00",
+      "type": "once"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

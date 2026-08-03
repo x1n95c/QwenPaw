@@ -1,0 +1,64 @@
+{
+  "form": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "onceRepeatCount": 14,
+    "onceRepeatEnabled": true,
+    "onceRepeatEndType": "count",
+    "onceRepeatEveryDays": 1,
+    "onceRunAt": "2026-01-01T09:00:00",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "once"
+    },
+    "scheduleType": "once",
+    "task_type": "text",
+    "text": "注意身体，别忘记吃药哦。"
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "吃药提醒（14次）",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "repeat_count": 14,
+      "repeat_end_type": "count",
+      "repeat_every_days": 1,
+      "run_at": "2026-01-01T09:00:00",
+      "type": "once"
+    },
+    "task_type": "text",
+    "text": "注意身体，别忘记吃药哦。"
+  },
+  "schema_version": "cron-template.v1"
+}

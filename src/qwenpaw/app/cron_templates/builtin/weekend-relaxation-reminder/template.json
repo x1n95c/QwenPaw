@@ -1,0 +1,76 @@
+{
+  "form": {
+    "cronCustom": "0 10 * * 6,0",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"推荐最近热度高、口碑好的电影，给出 5 部。每部包含：类型、一句话看点、适合人群；如果有公开信息，请补充上映/平台情况。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "周末电影推荐",
+    "request": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "推荐最近热度高、口碑好的电影，给出 5 部。每部包含：类型、一句话看点、适合人群；如果有公开信息，请补充上映/平台情况。",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "cron": "0 10 * * 6,0",
+      "type": "cron"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

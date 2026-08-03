@@ -42,6 +42,19 @@ class QwenPawLocalWorkspace(AgentScopeLocalWorkspace):
         """
         self._governor = governor
 
+    @property
+    def governor(self) -> Any:
+        """The injected ResourceGovernor, or ``None`` if none is set.
+
+        Exposed so a non-request caller (a cron preprocess building its own
+        Toolkit) can reuse the governor an agent request already started
+        instead of creating a second one. Starting one is not cheap — it
+        takes a cross-process lock, writes ``policy.yaml`` and probes
+        sandbox support — and nothing ever stops it, so a per-tick rebuild
+        would leak that work every cron interval.
+        """
+        return self._governor
+
     async def list_tools(  # type: ignore[override]
         self,
         *,

@@ -13,6 +13,10 @@ from ..inbox_trace_store import (
     read_session_messages,
 )
 from .models import CronJobSpec
+from .preprocess import (
+    inject_preprocess_block,
+    run_preprocess,
+)
 from ...security.tool_guard.execution_level import ToolExecutionLevel
 from ...schemas import RunStatus
 
@@ -25,6 +29,24 @@ class CronExecutor:
         self._channel_manager = channel_manager
 
     # pylint: disable=too-many-statements,too-many-branches
+    @staticmethod
+    def _resolve_session_id(job: CronJobSpec) -> str:
+        """The session this run belongs to.
+
+        Shared by the preprocess and the agent phase. ``share_session=False``
+        derives a dedicated session keyed on ``job.id`` — not on a per-run
+        id — so every run of the job accumulates in one place and the user
+        gets a complete history.
+        """
+        target_session_id = job.dispatch.target.session_id
+        if job.runtime.share_session:
+            return target_session_id or f"cron:{job.id}"
+        return (
+            f"{target_session_id}:cron:{job.id}"
+            if target_session_id
+            else f"cron:{job.id}"
+        )
+
     async def execute(self, job: CronJobSpec) -> dict[str, Any]:
         """Execute one job once.
 
@@ -55,21 +77,104 @@ class CronExecutor:
             target_session_id[:40] if target_session_id else "",
         )
 
-        if job.task_type == "text" and job.text:
+        # Resolved once, up here: the agent branch used to compute this
+        # inline further down, but the preprocess runs before either branch
+        # and must see the same session — otherwise a share_session=False
+        # job would collect against a different session than it reports to.
+        session_id = self._resolve_session_id(job)
+
+        preprocess = await run_preprocess(
+            workspace=self._workspace,
+            job=job,
+            session_id=session_id,
+            user_id=target_user_id or "cron",
+            channel=target_channel,
+        )
+        if preprocess is not None:
+            logger.info(
+                "cron preprocess: job_id=%s script=%s status=%s took=%sms",
+                job.id,
+                preprocess.script_label,
+                preprocess.status,
+                preprocess.duration_ms,
+            )
+            if (
+                preprocess.failed
+                and job.preprocess is not None
+                and job.preprocess.on_failure == "abort"
+            ):
+                return {
+                    "task_type": job.task_type,
+                    "run_id": None,
+                    "final_text": "",
+                    "delivery_status": "skipped",
+                    "delivery_error": preprocess.error,
+                    "preprocess_status": preprocess.status,
+                }
+
+        if job.task_type == "text":
+            # Fixed text is the lead-in; a preprocess result is the payload.
+            # Either may be absent, so compose rather than assume.
+            body_parts = [
+                part
+                for part in (
+                    (job.text or "").strip(),
+                    preprocess.user_text.strip() if preprocess else "",
+                )
+                if part
+            ]
+            message = "\n\n".join(body_parts)
+            if not message:
+                logger.warning(
+                    "cron text: job_id=%s produced nothing to send",
+                    job.id,
+                )
+                return {
+                    "task_type": "text",
+                    "run_id": None,
+                    "final_text": "",
+                    "delivery_status": "no_content",
+                    "delivery_error": None,
+                    "preprocess_status": (
+                        preprocess.status if preprocess else None
+                    ),
+                }
+
             logger.info(
                 "cron send_text: job_id=%s channel=%s len=%s",
                 job.id,
                 target_channel,
-                len(job.text or ""),
+                len(message),
             )
             text_delivery_error: str | None = None
             try:
-                await self._channel_manager.send_text(
-                    channel=target_channel,
-                    user_id=target_user_id,
-                    session_id=target_session_id,
-                    text=job.text.strip(),
-                    meta=dispatch_meta,
+                # Bounded on purpose. This branch is the only path that
+                # never went through a timeout: a channel send that hangs
+                # would leave `execute` awaiting forever, so the per-job
+                # semaphore in `_execute_once` is never released and the
+                # job (max_concurrency=1 by default) never fires again,
+                # sitting in `running` with nothing in the log.
+                await asyncio.wait_for(
+                    self._channel_manager.send_text(
+                        channel=target_channel,
+                        user_id=target_user_id,
+                        session_id=target_session_id,
+                        text=message,
+                        meta=dispatch_meta,
+                    ),
+                    timeout=job.runtime.timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                text_delivery_error = (
+                    f"channel send timed out after "
+                    f"{job.runtime.timeout_seconds}s"
+                )
+                logger.warning(
+                    "cron text delivery timed out: job_id=%s channel=%s "
+                    "timeout=%ss",
+                    job.id,
+                    job.dispatch.channel,
+                    job.runtime.timeout_seconds,
                 )
             except Exception as e:  # pylint: disable=broad-except
                 text_delivery_error = repr(e)
@@ -82,11 +187,16 @@ class CronExecutor:
             return {
                 "task_type": "text",
                 "run_id": None,
-                "final_text": job.text.strip(),
+                # What was actually sent, so the Inbox archives the same
+                # thing the user received rather than just the lead-in.
+                "final_text": message,
                 "delivery_status": (
                     "failed" if text_delivery_error else "success"
                 ),
                 "delivery_error": text_delivery_error,
+                "preprocess_status": (
+                    preprocess.status if preprocess else None
+                ),
             }
         # agent: run request as the dispatch target user so context matches
         logger.info(
@@ -96,6 +206,15 @@ class CronExecutor:
         )
         assert job.request is not None
         req: Dict[str, Any] = job.request.model_dump(mode="json")
+
+        if preprocess is not None:
+            # Into the user prompt, not the agent's context: this is the
+            # data the task was created to act on, and it has to survive
+            # into session history and the trace like any other user input.
+            req["input"] = inject_preprocess_block(
+                req.get("input"),
+                preprocess,
+            )
 
         req["channel"] = target_channel
         req["user_id"] = target_user_id or "cron"
@@ -112,18 +231,9 @@ class CronExecutor:
         )
         req["request_context"] = request_context
 
-        # Determine session_id based on share_session
-        share_session = job.runtime.share_session
-        if share_session:
-            req["session_id"] = target_session_id or f"cron:{job.id}"
-        else:
-            # Use job.id (not run_id) so all runs of this job accumulate in the
-            # same dedicated session, giving users a complete history.
-            req["session_id"] = (
-                f"{target_session_id}:cron:{job.id}"
-                if target_session_id
-                else f"cron:{job.id}"
-            )
+        # Resolved above so the preprocess and the agent share one session.
+        req["session_id"] = session_id
+        if not job.runtime.share_session:
             req["session_source"] = "cron"
 
         # Register a ChatSpec so the session appears in the frontend list.
@@ -165,6 +275,17 @@ class CronExecutor:
                 "target_user_id": target_user_id,
                 "target_session_id": target_session_id,
                 "silent": job.dispatch.silent,
+                # Without this, a task whose output looks wrong gives no
+                # signal about whether collection even succeeded.
+                "preprocess": (
+                    {
+                        "status": preprocess.status,
+                        "duration_ms": preprocess.duration_ms,
+                        "script": preprocess.script_label,
+                    }
+                    if preprocess
+                    else None
+                ),
             },
         )
 
@@ -245,6 +366,9 @@ class CronExecutor:
                 "run_id": run_id,
                 "delivery_status": delivery_status,
                 "delivery_error": delivery_error,
+                "preprocess_status": (
+                    preprocess.status if preprocess else None
+                ),
             }
         except asyncio.TimeoutError:
             logger.warning(

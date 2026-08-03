@@ -6,7 +6,7 @@ Provides utilities to get the correct agent instance for each request.
 from contextvars import ContextVar
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 from typing import Optional, TYPE_CHECKING
 from fastapi import Request
 from .multi_agent_manager import MultiAgentManager
@@ -255,3 +255,52 @@ def set_current_approval_route(route: Optional[dict]) -> None:
 def get_current_approval_route() -> Optional[dict]:
     """Return routing metadata used only for spawned-child approvals."""
     return _current_approval_route.get()
+
+
+#: The request-scoped vars this module owns, in the order a caller would
+#: naturally think of them. Kept as a tuple so callers that seed "all of
+#: them" cannot silently miss one when a var is added here.
+_SCOPED_VARS: tuple[tuple[str, ContextVar], ...] = (
+    ("agent_id", _current_agent_id),
+    ("session_id", _current_session_id),
+    ("root_session_id", _current_root_session_id),
+    ("user_id", _current_user_id),
+    ("channel", _current_channel),
+    ("approval_route", _current_approval_route),
+)
+
+
+@contextmanager
+def scoped_agent_context(**values: Any) -> Iterator[None]:
+    """Temporarily set this module's request vars, then restore them.
+
+    The ``set_current_*`` helpers discard the reset token, which is fine
+    for a request that owns the whole context but not for a caller that
+    runs tools *inside* a larger request — a non-agent cron preprocess,
+    say. Leaving these set would let later code read a value belonging to
+    work that already finished. Sibling of :func:`scoped_session_id`,
+    covering every var here instead of just one.
+
+    Only keys present in *values* are touched; pass ``None`` explicitly to
+    scope a var to ``None``.
+
+    Raises:
+        TypeError: on an unknown key, so a typo fails loudly rather than
+            silently seeding nothing.
+    """
+    known = dict(_SCOPED_VARS)
+    unknown = set(values) - set(known)
+    if unknown:
+        raise TypeError(
+            f"scoped_agent_context got unexpected keys: "
+            f"{', '.join(sorted(unknown))}",
+        )
+
+    tokens = [
+        (known[key], known[key].set(value)) for key, value in values.items()
+    ]
+    try:
+        yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)

@@ -17,6 +17,7 @@ interface ColumnHandlers {
   onViewHistory: (job: CronJob) => void;
   onEdit: (job: CronJob) => void;
   onDelete: (jobId: string) => void;
+  onSaveAsTemplate: (job: CronJob) => void;
   t: TFunction;
 }
 
@@ -310,6 +311,11 @@ export const createColumns = (
             key: "edit",
             label: handlers.t("cronJobs.edit"),
             onClick: () => handlers.onEdit(record),
+          },
+          {
+            key: "saveAsTemplate",
+            label: handlers.t("cronJobs.saveAsTemplate"),
+            onClick: () => handlers.onSaveAsTemplate(record),
           },
           {
             key: "delete",

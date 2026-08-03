@@ -277,6 +277,18 @@ class Workspace:
         """Inject the cross-workspace AppServiceManager reference."""
         self._app_services = app_services
 
+    @property
+    def app_services(self) -> Any:
+        """The AppServiceManager, or ``None`` before injection.
+
+        Exposed for callers that build an :class:`AgentBuilder` outside the
+        request pipeline (a cron preprocess). The builder threads the
+        approval and tool coordinators from here into ``request_context``,
+        which is what gives a guarded tool somewhere to send an approval
+        prompt — without it there is no way to ask.
+        """
+        return self._app_services
+
     async def stream_query(
         self,
         request: Any,

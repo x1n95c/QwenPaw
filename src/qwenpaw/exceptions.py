@@ -319,6 +319,28 @@ class SkillsError(AgentRuntimeErrorException):
         super().__init__("SKILLS_ERROR", message, details)
 
 
+class CronTemplateError(AgentRuntimeErrorException):
+    """Exception raised for cron job template package errors."""
+
+    def __init__(
+        self,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__("CRON_TEMPLATE_ERROR", message, details)
+
+
+class CronTemplateConflictError(CronTemplateError):
+    """Raised when an import would overwrite an existing template."""
+
+    def __init__(self, detail: Dict[str, Any]) -> None:
+        super().__init__(
+            message=str(detail.get("message") or "Cron template conflict"),
+            details=detail,
+        )
+        self.detail = detail
+
+
 class HookCycleError(AgentRuntimeErrorException):
     """Raised when ``before``/``after`` constraints contain a cycle."""
 

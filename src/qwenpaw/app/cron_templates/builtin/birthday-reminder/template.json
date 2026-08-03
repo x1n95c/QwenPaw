@@ -1,0 +1,61 @@
+{
+  "form": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "onceRepeatCount": 2,
+    "onceRepeatEnabled": false,
+    "onceRepeatEndType": "never",
+    "onceRepeatEveryDays": 1,
+    "onceRunAt": "2026-01-01T09:00:00",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "once"
+    },
+    "scheduleType": "once",
+    "task_type": "text",
+    "text": "xx在1月1日过生日，别忘了送上祝福～"
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "生日提醒",
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "run_at": "2026-01-01T09:00:00",
+      "type": "once"
+    },
+    "task_type": "text",
+    "text": "xx在1月1日过生日，别忘了送上祝福～"
+  },
+  "schema_version": "cron-template.v1"
+}

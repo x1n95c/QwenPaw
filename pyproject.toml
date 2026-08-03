@@ -101,6 +101,7 @@ include-package-data = true
     "security/skill_scanner/data/**",
     "docs/*.md",
     "app/channels/yuanbao/proto/**",
+    "app/cron_templates/builtin/**",
 ]
 
 [build-system]

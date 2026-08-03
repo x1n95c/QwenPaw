@@ -1,84 +1,101 @@
-import { describe, it, expect } from "vitest";
-import { CRON_TEMPLATES } from "./templates";
+import { describe, expect, it } from "vitest";
+import {
+  templateDescription,
+  templateFrequency,
+  templateTitle,
+} from "./templates";
 
-describe("CRON_TEMPLATES", () => {
-  it("is an array with 10 items", () => {
-    expect(Array.isArray(CRON_TEMPLATES)).toBe(true);
-    expect(CRON_TEMPLATES).toHaveLength(10);
+/**
+ * i18n stub: knows two keys, echoes anything else back the way i18next
+ * does for a missing translation. That echo behaviour is the whole reason
+ * the resolvers fall through to the literal.
+ */
+const DICT: Record<string, string> = {
+  "cronJobs.templates.x.title": "科技早报",
+  "cronJobs.templates.x.description": "每天汇总科技新闻",
+};
+const t = (key: string) => DICT[key] ?? key;
+
+describe("templateTitle", () => {
+  it("prefers the i18n key when it resolves", () => {
+    expect(
+      templateTitle(
+        {
+          titleKey: "cronJobs.templates.x.title",
+          title: "literal fallback",
+          packageName: "pkg",
+        },
+        t,
+      ),
+    ).toBe("科技早报");
   });
 
-  it("every template has all required fields", () => {
-    const requiredFields = [
-      "id",
-      "category",
-      "titleKey",
-      "descriptionKey",
-      "frequencyKey",
-      "source",
-      "tags",
-      "showInCalendarRecommended",
-      "toFormValues",
-    ] as const;
-
-    for (const template of CRON_TEMPLATES) {
-      for (const field of requiredFields) {
-        expect(
-          template,
-          `template "${template.id}" missing field "${field}"`,
-        ).toHaveProperty(field);
-      }
-    }
+  it("falls back to the literal when the key has no translation", () => {
+    expect(
+      templateTitle(
+        {
+          titleKey: "cronJobs.templates.missing.title",
+          title: "literal fallback",
+          packageName: "pkg",
+        },
+        t,
+      ),
+    ).toBe("literal fallback");
   });
 
-  it('every template\'s source is "builtin"', () => {
-    for (const template of CRON_TEMPLATES) {
-      expect(template.source, `template "${template.id}" source`).toBe(
-        "builtin",
-      );
-    }
+  it("uses the literal when no key is set (user-authored package)", () => {
+    expect(
+      templateTitle({ titleKey: "", title: "我的模板", packageName: "pkg" }, t),
+    ).toBe("我的模板");
   });
 
-  it("toFormValues('UTC') on a cron template returns scheduleType 'cron' and schedule.timezone 'UTC'", () => {
-    // CRON_TEMPLATES[0] = daily_tech_news_brief, category: "cron"
-    const cronTemplate = CRON_TEMPLATES[0];
-    expect(cronTemplate.category).toBe("cron");
+  it("falls back to the package name when nothing else is available", () => {
+    expect(
+      templateTitle({ titleKey: "", title: "", packageName: "my-pkg" }, t),
+    ).toBe("my-pkg");
+  });
+});
 
-    const values = cronTemplate.toFormValues("UTC") as Record<string, unknown>;
-    expect(values.scheduleType).toBe("cron");
-    expect((values.schedule as Record<string, unknown>).timezone).toBe("UTC");
+describe("templateDescription", () => {
+  it("prefers the i18n key", () => {
+    expect(
+      templateDescription(
+        {
+          descriptionKey: "cronJobs.templates.x.description",
+          description: "en fallback",
+        },
+        t,
+      ),
+    ).toBe("每天汇总科技新闻");
   });
 
-  it("toFormValues('America/New_York') on an once template returns scheduleType 'once' and schedule.timezone 'America/New_York'", () => {
-    // CRON_TEMPLATES[4] = once_text_birthday_reminder, category: "once"
-    const onceTemplate = CRON_TEMPLATES[4];
-    expect(onceTemplate.category).toBe("once");
-
-    const values = onceTemplate.toFormValues("America/New_York") as Record<
-      string,
-      unknown
-    >;
-    expect(values.scheduleType).toBe("once");
-    expect((values.schedule as Record<string, unknown>).timezone).toBe(
-      "America/New_York",
-    );
+  it("falls back to the literal on a missing translation", () => {
+    expect(
+      templateDescription(
+        {
+          descriptionKey: "cronJobs.templates.gone.description",
+          description: "en fallback",
+        },
+        t,
+      ),
+    ).toBe("en fallback");
   });
 
-  it("agent-type template has task_type 'agent' and a request object; text-type has a different task_type and a text string", () => {
-    // CRON_TEMPLATES[0] = daily_tech_news_brief, agent type
-    const agentValues = CRON_TEMPLATES[0].toFormValues("UTC") as Record<
-      string,
-      unknown
-    >;
-    expect(agentValues.task_type).toBe("agent");
-    expect(agentValues.request).toBeDefined();
-    expect(typeof agentValues.request).toBe("object");
+  it("returns empty string when neither is set", () => {
+    expect(
+      templateDescription({ descriptionKey: "", description: "" }, t),
+    ).toBe("");
+  });
+});
 
-    // CRON_TEMPLATES[2] = pomodoro_break_reminder, text type
-    const textValues = CRON_TEMPLATES[2].toFormValues("UTC") as Record<
-      string,
-      unknown
-    >;
-    expect(textValues.task_type).not.toBe("agent");
-    expect(typeof textValues.text).toBe("string");
+describe("templateFrequency", () => {
+  it("falls back to the literal", () => {
+    expect(
+      templateFrequency({ frequencyKey: "nope", frequency: "每天 09:00" }, t),
+    ).toBe("每天 09:00");
+  });
+
+  it("returns empty string when neither is set", () => {
+    expect(templateFrequency({ frequencyKey: "", frequency: "" }, t)).toBe("");
   });
 });

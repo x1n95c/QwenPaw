@@ -107,6 +107,74 @@ class AgentBuilder:
 
         return Toolkit(tools=tools, skills_or_loaders=skill_dirs)
 
+    async def build_standalone_toolkit(
+        self,
+        *,
+        workspace: Any,
+        request_context: dict[str, Any],
+        agent_id: str = "default",
+        enabled_features: Iterable[str] | None = None,
+    ) -> Any:
+        """Build a Toolkit for a caller that runs tools without an LLM.
+
+        ``build()`` cannot be reused for this: it hard-requires an active
+        model and constructs a whole agent. But ``build_toolkit()`` alone is
+        not enough either, because a Toolkit without a governor is useless —
+        :class:`PolicyGuardedTool` is fail-closed and DENIES every call when
+        its governor is ``None``, with the sole exception of
+        ``approval_level=off``. So the "happy path" would appear to work
+        (cron jobs default to ``tool_safety=False`` → OFF) and then deny
+        every tool the moment someone enables tool safety. This method owns
+        the same governor wiring ``build()`` does, so both paths behave
+        alike.
+
+        Args:
+            workspace: The agent ``Workspace``; supplies the local
+                workspace (tool source) and the governor.
+            request_context: Threaded into every guarded tool. Must carry
+                ``approval_level``; see the cron preprocess for the shape.
+            agent_id: Whose config to load.
+            enabled_features: Feature gates for ``list_tools``.
+        """
+        from types import SimpleNamespace
+
+        from ..config.config import load_agent_config
+
+        agent_config = load_agent_config(agent_id)
+        workspace_dir = getattr(workspace, "workspace_dir", None)
+        coding_mode = getattr(agent_config, "coding_mode", None)
+        coding_project_dir = (
+            coding_mode.project_dir
+            if coding_mode and getattr(coding_mode, "project_dir", None)
+            else None
+        )
+
+        local_ws = getattr(workspace, "local_workspace", None)
+        governor = getattr(local_ws, "governor", None)
+        if governor is None:
+            governor = await run_sync_io(
+                self._init_governor,
+                workspace_dir,
+                coding_project_dir,
+            )
+            if governor is not None and local_ws is not None:
+                local_ws.set_governor(governor)
+
+        # No skills: skills_or_loaders exists so an LLM can read SKILL.md,
+        # and there is no LLM here — registering a skill-viewer tool would
+        # be dead weight.
+        return await self.build_toolkit(
+            agent_config,
+            agent_id=agent_id,
+            request_context=request_context,
+            active_modes=(),
+            effective_skills=(),
+            enabled_features=enabled_features or (),
+            governor=governor,
+            ctx=SimpleNamespace(workspace=workspace),
+            workspace_dir=str(workspace_dir) if workspace_dir else None,
+        )
+
     @staticmethod
     def _tool_name(tool: Any) -> str:
         """Best-effort tool name for whitelist filtering."""

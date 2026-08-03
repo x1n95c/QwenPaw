@@ -1,0 +1,76 @@
+{
+  "form": {
+    "cronCustom": "30 9 * * 1-5",
+    "cronType": "custom",
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"整理今天最值得关注的科技新闻，输出 5-8 条。每条包含：新闻标题、核心进展、为什么值得关注。最后补充一句今日科技趋势判断。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "type": "cron"
+    },
+    "scheduleType": "cron",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "工作日科技新闻早报",
+    "request": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "整理今天最值得关注的科技新闻，输出 5-8 条。每条包含：新闻标题、核心进展、为什么值得关注。最后补充一句今日科技趋势判断。",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "cron": "30 9 * * 1-5",
+      "type": "cron"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

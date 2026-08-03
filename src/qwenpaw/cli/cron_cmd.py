@@ -1068,3 +1068,553 @@ def run_job(
             raise click.ClickException("Job not found.")
         r.raise_for_status()
         print_json(r.json())
+
+
+# ---------------------------------------------------------------------------
+# Template packages
+# ---------------------------------------------------------------------------
+
+
+def _template_error(response: Any) -> str:
+    """Render an API error body as a single human-readable line."""
+    try:
+        detail = response.json().get("detail", response.text)
+    except ValueError:
+        return response.text
+    if isinstance(detail, dict):
+        if detail.get("conflicts"):
+            parts = [
+                f"{c.get('name')} (try --rename-to {c.get('suggested_name')})"
+                for c in detail["conflicts"]
+            ]
+            return "Name already taken: " + "; ".join(parts)
+        if detail.get("suggested_name"):
+            return (
+                f"{detail.get('message') or 'conflict'} "
+                f"(try --name {detail['suggested_name']})"
+            )
+        return json.dumps(detail, ensure_ascii=False)
+    if isinstance(detail, list):
+        return json.dumps(detail, ensure_ascii=False)
+    return str(detail)
+
+
+@cron_group.group("template")
+def template_group() -> None:
+    """Manage cron job template packages (folder-based, importable).
+
+    A template package is a directory holding TEMPLATE.md (docs +
+    metadata), template.json (the job payload), optional batch/*.json
+    run_tool_batch scripts, and optional skills/ shipped with it.
+    Use export/import to move packages between machines.
+    """
+
+
+@template_group.command("list")
+@click.option(
+    "--no-builtin",
+    is_flag=True,
+    default=False,
+    help="Only list user templates, hiding packaged builtins.",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_list(
+    ctx: click.Context,
+    no_builtin: bool,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """List template packages. Output is JSON from GET /cron-templates."""
+    base_url = _base_url(ctx, base_url)
+    with client(base_url) as c:
+        r = c.get(
+            "/cron-templates",
+            params={"include_builtin": "false" if no_builtin else "true"},
+            headers={"X-Agent-Id": agent_id},
+        )
+        r.raise_for_status()
+        print_json(r.json())
+
+
+@template_group.command("get")
+@click.argument("name", metavar="NAME")
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_get(
+    ctx: click.Context,
+    name: str,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Show one template package, including its docs and file list."""
+    base_url = _base_url(ctx, base_url)
+    with client(base_url) as c:
+        r = c.get(
+            f"/cron-templates/{name}",
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Template not found.")
+        r.raise_for_status()
+        print_json(r.json())
+
+
+@template_group.command("export")
+@click.argument("name", metavar="NAME")
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(dir_okay=False, path_type=Path),
+    default=None,
+    help=(
+        "Where to write the zip. Defaults to ./<name>.zip in the "
+        "current directory."
+    ),
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Overwrite the output file if it already exists.",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_export(
+    ctx: click.Context,
+    name: str,
+    output: Optional[Path],
+    force: bool,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Export a template package as a zip.
+
+    The archive is rooted at <name>/ so it can be imported as-is with
+    'qwenpaw cron template import'.
+    """
+    base_url = _base_url(ctx, base_url)
+    target = output or Path(f"{name}.zip")
+    if target.exists() and not force:
+        raise click.ClickException(
+            f"{target} already exists; pass --force to overwrite.",
+        )
+    with client(base_url) as c:
+        r = c.get(
+            f"/cron-templates/{name}/export",
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Template not found.")
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(r.content)
+    click.echo(f"Exported {name} -> {target} ({len(r.content)} bytes)")
+
+
+@template_group.command("import")
+@click.argument(
+    "zip_path",
+    metavar="ZIP_PATH",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+)
+@click.option(
+    "--name",
+    "target_name",
+    default=None,
+    help=(
+        "Import a single-template zip under this name instead of the "
+        "name recorded in the package."
+    ),
+)
+@click.option(
+    "--rename-to",
+    "rename_pairs",
+    multiple=True,
+    metavar="OLD=NEW",
+    help=(
+        "Rename one template while importing; repeatable. Use this to "
+        "resolve the conflicts reported by a failed import."
+    ),
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    default=False,
+    help="Replace existing templates with the same name.",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_import(
+    ctx: click.Context,
+    zip_path: Path,
+    target_name: Optional[str],
+    rename_pairs: tuple[str, ...],
+    overwrite: bool,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Import template packages from a zip file."""
+    base_url = _base_url(ctx, base_url)
+    rename_map: Dict[str, str] = {}
+    for pair in rename_pairs:
+        if "=" not in pair:
+            raise click.UsageError(
+                f"--rename-to expects OLD=NEW, got: {pair}",
+            )
+        old, new = pair.split("=", 1)
+        if not old.strip() or not new.strip():
+            raise click.UsageError(
+                f"--rename-to expects OLD=NEW, got: {pair}",
+            )
+        rename_map[old.strip()] = new.strip()
+
+    params: Dict[str, Any] = {"overwrite": str(overwrite).lower()}
+    if target_name:
+        params["target_name"] = target_name
+    if rename_map:
+        params["rename_map"] = json.dumps(rename_map)
+
+    with client(base_url) as c:
+        with zip_path.open("rb") as handle:
+            r = c.post(
+                "/cron-templates/upload",
+                params=params,
+                files={
+                    "file": (
+                        zip_path.name,
+                        handle,
+                        "application/zip",
+                    ),
+                },
+                headers={"X-Agent-Id": agent_id},
+            )
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        print_json(r.json())
+
+
+@template_group.command("update")
+@click.argument("name", metavar="NAME")
+@click.option("--title", default=None, help="New display title.")
+@click.option("--description", default=None, help="New description.")
+@click.option(
+    "--category",
+    type=click.Choice(["cron", "once"], case_sensitive=False),
+    default=None,
+    help="Schedule category the template represents.",
+)
+@click.option(
+    "--frequency",
+    default=None,
+    help="Display-only frequency label (e.g. 'Weekdays at 09:30').",
+)
+@click.option("--emoji", default=None, help="Display emoji.")
+@click.option(
+    "--tag",
+    "tags",
+    multiple=True,
+    help=("Replace the tag list; repeatable. Pass --clear-tags to empty it."),
+)
+@click.option(
+    "--clear-tags",
+    is_flag=True,
+    default=False,
+    help="Remove all tags.",
+)
+@click.option(
+    "--version-text",
+    default=None,
+    help="Version string recorded in the package metadata.",
+)
+@click.option(
+    "--batch-entry",
+    default=None,
+    help=(
+        "Package-relative path of the run_tool_batch entry file. "
+        "Pass an empty string to clear it."
+    ),
+)
+@click.option(
+    "--add-batch",
+    "add_batch",
+    multiple=True,
+    metavar="NAME=PATH",
+    help=(
+        "Add or replace a batch file from a local JSON file; repeatable. "
+        "Example: --add-batch collect=./collect.json"
+    ),
+)
+@click.option(
+    "--remove-batch",
+    "remove_batch",
+    multiple=True,
+    metavar="NAME",
+    help="Delete a batch file by name; repeatable.",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+# pylint: disable-next=too-many-locals
+def template_update(
+    ctx: click.Context,
+    name: str,
+    title: Optional[str],
+    description: Optional[str],
+    category: Optional[str],
+    frequency: Optional[str],
+    emoji: Optional[str],
+    tags: tuple[str, ...],
+    clear_tags: bool,
+    version_text: Optional[str],
+    batch_entry: Optional[str],
+    add_batch: tuple[str, ...],
+    remove_batch: tuple[str, ...],
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Update an existing template package.
+
+    Only the options you pass are changed; batch scripts and bundled
+    skills you do not mention are left in place. Builtin packages are
+    read-only — run 'fork' first.
+    """
+    base_url = _base_url(ctx, base_url)
+    payload: Dict[str, Any] = {}
+    for key, value in (
+        ("title", title),
+        ("description", description),
+        ("category", category),
+        ("frequency", frequency),
+        ("emoji", emoji),
+        ("version_text", version_text),
+        ("batch_entry", batch_entry),
+    ):
+        if value is not None:
+            payload[key] = value
+    if clear_tags:
+        payload["tags"] = []
+    elif tags:
+        payload["tags"] = list(tags)
+
+    if add_batch:
+        batch_files: Dict[str, str] = {}
+        for pair in add_batch:
+            if "=" not in pair:
+                raise click.UsageError(
+                    f"--add-batch expects NAME=PATH, got: {pair}",
+                )
+            batch_name, file_path = pair.split("=", 1)
+            batch_name = batch_name.strip()
+            source = Path(file_path.strip()).expanduser()
+            if not batch_name or not source.is_file():
+                raise click.UsageError(
+                    f"--add-batch expects NAME=PATH with an existing file, "
+                    f"got: {pair}",
+                )
+            batch_files[batch_name] = source.read_text(encoding="utf-8")
+        payload["batch_files"] = batch_files
+    if remove_batch:
+        payload["remove_batch_files"] = list(remove_batch)
+
+    if not payload:
+        raise click.UsageError(
+            "Nothing to update; pass at least one field option.",
+        )
+
+    with client(base_url) as c:
+        r = c.put(
+            f"/cron-templates/{name}",
+            json=payload,
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Template not found.")
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        print_json(r.json())
+
+
+@template_group.command("delete")
+@click.argument("name", metavar="NAME")
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_delete(
+    ctx: click.Context,
+    name: str,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Delete a user template package. Builtins cannot be deleted."""
+    base_url = _base_url(ctx, base_url)
+    with client(base_url) as c:
+        r = c.delete(
+            f"/cron-templates/{name}",
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Template not found.")
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        print_json(r.json())
+
+
+@template_group.command("fork")
+@click.argument("name", metavar="NAME")
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_fork(
+    ctx: click.Context,
+    name: str,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Copy a packaged builtin into the user pool so it becomes editable."""
+    base_url = _base_url(ctx, base_url)
+    with client(base_url) as c:
+        r = c.post(
+            f"/cron-templates/{name}/fork",
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Builtin template not found.")
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        print_json(r.json())
+
+
+@template_group.command("install-skills")
+@click.argument("name", metavar="NAME")
+@click.option(
+    "--skill",
+    "skills",
+    multiple=True,
+    help=(
+        "Install only these bundled skills; repeatable. "
+        "Defaults to all skills in the package."
+    ),
+)
+@click.option(
+    "--target",
+    type=click.Choice(["pool", "workspace"], case_sensitive=False),
+    default="pool",
+    show_default=True,
+    help=(
+        "'pool' installs into the shared skill pool; 'workspace' "
+        "installs into the agent's own skills directory."
+    ),
+)
+@click.option(
+    "--enable/--no-enable",
+    default=False,
+    help="Enable the skills after a workspace install.",
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    default=False,
+    help="Replace skills that already exist at the target.",
+)
+@click.option(
+    "--base-url",
+    default=None,
+    help="Override the API base URL. Defaults to global --host/--port.",
+)
+@click.option(
+    "--agent-id",
+    default="default",
+    help="Agent ID (defaults to 'default')",
+)
+@click.pass_context
+def template_install_skills(
+    ctx: click.Context,
+    name: str,
+    skills: tuple[str, ...],
+    target: str,
+    enable: bool,
+    overwrite: bool,
+    base_url: Optional[str],
+    agent_id: str,
+) -> None:
+    """Install the skills bundled inside a template package."""
+    base_url = _base_url(ctx, base_url)
+    payload = {
+        "skills": list(skills),
+        "target": target,
+        "enable": enable,
+        "overwrite": overwrite,
+    }
+    with client(base_url) as c:
+        r = c.post(
+            f"/cron-templates/{name}/install-skills",
+            json=payload,
+            headers={"X-Agent-Id": agent_id},
+        )
+        if r.status_code == 404:
+            raise click.ClickException("Template not found.")
+        if r.status_code >= 400:
+            raise click.ClickException(_template_error(r))
+        print_json(r.json())

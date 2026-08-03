@@ -29,11 +29,13 @@ import api from "../../../api";
 import {
   createColumns,
   JobDrawer,
+  SaveAsTemplateModal,
   TemplatePickerModal,
   useCronJobs,
   DEFAULT_FORM_VALUES,
 } from "./components";
 import { parseCron, serializeCron } from "./components/parseCron";
+import { jobToFormValues } from "./components/jobToTemplate";
 import { PageHeader } from "@/components/PageHeader";
 import styles from "./index.module.less";
 
@@ -74,6 +76,10 @@ function CronJobsPage() {
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
   const [saving, setSaving] = useState(false);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
+  const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
+  const [templateSourceJob, setTemplateSourceJob] = useState<CronJob | null>(
+    null,
+  );
   const [viewMode, setViewMode] = useState<CronViewMode>("list");
   const [isMobile, setIsMobile] = useState(false);
   useEffect(() => {
@@ -212,54 +218,21 @@ function CronJobsPage() {
 
   const handleEdit = (job: CronJob) => {
     setEditingJob(job);
-
-    const formValues: any = {
-      ...job,
-      request: {
-        ...job.request,
-        input: job.request?.input
-          ? JSON.stringify(job.request.input, null, 2)
-          : "",
-      },
-      scheduleType: job.schedule?.type || "cron",
-    };
-
-    if (job.schedule?.type === "once") {
-      formValues.onceRunAt = job.schedule.run_at
-        ? dayjs(job.schedule.run_at)
-        : null;
-      formValues.onceRepeatEnabled = Boolean(job.schedule.repeat_every_days);
-      formValues.onceRepeatEveryDays = job.schedule.repeat_every_days || 1;
-      formValues.onceRepeatEndType = job.schedule.repeat_end_type || "never";
-      formValues.onceRepeatUntil = job.schedule.repeat_until
-        ? dayjs(job.schedule.repeat_until)
-        : null;
-      formValues.onceRepeatCount = job.schedule.repeat_count || 2;
-    } else {
-      // Parse cron expression to form fields
-      const cronParts = parseCron(job.schedule?.cron || "0 9 * * *");
-      formValues.cronType = cronParts.type;
-
-      // Set time picker value
-      if (cronParts.type === "daily" || cronParts.type === "weekly") {
-        const h = cronParts.hour ?? 9;
-        const m = cronParts.minute ?? 0;
-        formValues.cronTime = dayjs().hour(h).minute(m);
-      }
-
-      // Set days of week
-      if (cronParts.type === "weekly" && cronParts.daysOfWeek) {
-        formValues.cronDaysOfWeek = cronParts.daysOfWeek;
-      }
-
-      // Set custom cron
-      if (cronParts.type === "custom" && cronParts.rawCron) {
-        formValues.cronCustom = cronParts.rawCron;
-      }
-    }
-
-    form.setFieldsValue(formValues);
+    // Shared with the "save as template" flow so a template built from a job
+    // reproduces exactly what editing that job shows. The cast is needed
+    // because the drawer carries UI-only fields (scheduleType, cronType,
+    // cronTime, …) that are not part of CronJob.
+    form.setFieldsValue(
+      jobToFormValues(job) as unknown as Parameters<
+        typeof form.setFieldsValue
+      >[0],
+    );
     setDrawerOpen(true);
+  };
+
+  const handleSaveAsTemplate = (job: CronJob) => {
+    setTemplateSourceJob(job);
+    setSaveTemplateOpen(true);
   };
 
   const handleDelete = (jobId: string) => {
@@ -428,6 +401,7 @@ function CronJobsPage() {
     onViewHistory: handleViewHistory,
     onEdit: handleEdit,
     onDelete: handleDelete,
+    onSaveAsTemplate: handleSaveAsTemplate,
     t,
   });
 
@@ -877,6 +851,15 @@ function CronJobsPage() {
         timezone={userTimezoneRef.current}
         onCancel={() => setTemplateModalOpen(false)}
         onUseTemplate={handleUseTemplate}
+      />
+
+      <SaveAsTemplateModal
+        open={saveTemplateOpen}
+        job={templateSourceJob}
+        onCancel={() => {
+          setSaveTemplateOpen(false);
+          setTemplateSourceJob(null);
+        }}
       />
 
       <Modal

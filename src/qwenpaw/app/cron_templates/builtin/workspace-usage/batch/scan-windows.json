@@ -1,0 +1,18 @@
+{
+  "actions": [
+    {
+      "tool_name": "execute_shell_command",
+      "arguments": {
+        "command": "powershell -NoProfile -Command \"Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null -and ($_.Used + $_.Free) -gt 0 } | ForEach-Object { '{0}: used {1}GB, free {2}GB, {3}% full' -f $_.Name, [math]::Round($_.Used/1GB,1), [math]::Round($_.Free/1GB,1), [math]::Round(100*$_.Used/($_.Used+$_.Free),0) }\""
+      },
+      "stop_on_error": false
+    },
+    {
+      "tool_name": "execute_shell_command",
+      "arguments": {
+        "command": "powershell -NoProfile -Command \"Get-ChildItem -LiteralPath '${args.path}' -Directory -ErrorAction SilentlyContinue | ForEach-Object { [PSCustomObject]@{ Name = $_.Name; MB = [math]::Round((Get-ChildItem -LiteralPath $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum/1MB, 1) } } | Sort-Object MB -Descending | Select-Object -First 10 | Format-Table -AutoSize | Out-String -Width 200\""
+      },
+      "stop_on_error": false
+    }
+  ]
+}

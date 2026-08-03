@@ -1,0 +1,83 @@
+{
+  "form": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "",
+    "onceRepeatCount": 14,
+    "onceRepeatEnabled": true,
+    "onceRepeatEndType": "count",
+    "onceRepeatEveryDays": 1,
+    "onceRunAt": "2026-01-01T08:00:00",
+    "request": {
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"我最近在增肌，请为我生成今天的饮食建议。\"\n      }\n    ]\n  }\n]",
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "save_result_to_inbox": true,
+    "schedule": {
+      "type": "once"
+    },
+    "scheduleType": "once",
+    "task_type": "agent",
+    "text": ""
+  },
+  "job": {
+    "dispatch": {
+      "channel": "console",
+      "mode": "stream",
+      "silent": false,
+      "target": {
+        "session_id": "",
+        "user_id": ""
+      },
+      "type": "channel"
+    },
+    "enabled": true,
+    "name": "14天饮食计划",
+    "request": {
+      "input": [
+        {
+          "content": [
+            {
+              "text": "我最近在增肌，请为我生成今天的饮食建议。",
+              "type": "text"
+            }
+          ],
+          "role": "user"
+        }
+      ],
+      "session_id": "",
+      "user_id": ""
+    },
+    "runtime": {
+      "max_concurrency": 1,
+      "misfire_grace_seconds": 600,
+      "share_session": true,
+      "timeout_seconds": 120
+    },
+    "schedule": {
+      "repeat_count": 14,
+      "repeat_end_type": "count",
+      "repeat_every_days": 1,
+      "run_at": "2026-01-01T08:00:00",
+      "type": "once"
+    },
+    "task_type": "agent"
+  },
+  "schema_version": "cron-template.v1"
+}

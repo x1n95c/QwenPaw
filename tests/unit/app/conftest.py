@@ -128,6 +128,7 @@ def make_cron_job_spec(
     task_type: str = "agent",
     text: Optional[str] = None,
     enabled: bool = True,
+    preprocess: Optional[dict] = None,
 ) -> CronJobSpec:
     target = make_dispatch_target(user_id=user_id, session_id=session_id)
     dispatch = DispatchSpec(target=target)
@@ -143,9 +144,16 @@ def make_cron_job_spec(
     if job_id is not None:
         kwargs["id"] = job_id
     if task_type == "text":
-        kwargs["text"] = text or "Hello"
+        # `text` may legitimately be blank when a preprocess supplies the
+        # payload, so only default it when there is nothing else to send.
+        if text is not None:
+            kwargs["text"] = text
+        elif preprocess is None:
+            kwargs["text"] = "Hello"
     else:
         kwargs["request"] = CronJobRequest(input="ping")
+    if preprocess is not None:
+        kwargs["preprocess"] = preprocess
 
     return CronJobSpec(**kwargs)
 
