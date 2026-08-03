@@ -2523,5 +2523,29 @@
         "description": "Jalankan tugas multi-langkah yang terstruktur dan berkelanjutan."
       }
     }
+  },
+  "projectDir": {
+    "title": "Direktori proyek",
+    "hint": "Path relatif dan perintah shell untuk pesan berikutnya diselesaikan dari direktori ini. Perubahan berlaku pada giliran berikutnya.",
+    "sourceSession": "Ditimpa di obrolan ini",
+    "sourceAgent": "Diwarisi dari agen",
+    "tagSession": "Sesi",
+    "tagInherited": "Warisan",
+    "unavailable": "Direktori ini tidak ada. Perbaiki sebelum mengirim — tidak ada fallback otomatis.",
+    "placeholder": "Path absolut, mis. /Users/me/repos/demo",
+    "inputAria": "Path direktori proyek",
+    "apply": "Terapkan ke obrolan ini",
+    "inherit": "Warisi default agen",
+    "agentDefault": "Default agen: {{path}}",
+    "triggerAria": "Direktori proyek: {{path}}. Klik untuk mengubah.",
+    "browse": "Jelajahi folder",
+    "browseHome": "Beranda",
+    "browseRefresh": "Muat ulang",
+    "browseHidden": "Tampilkan folder tersembunyi",
+    "browseLoading": "Memuat…",
+    "browseEmpty": "Tidak ada subfolder",
+    "tagPending": "Menunggu",
+    "sourcePending": "Berlaku pada pesan pertama",
+    "noSessionYet": "Belum ada sesi untuk dikaitkan."
   }
 }

@@ -26,8 +26,14 @@ from typing import Any, List, Optional
 import yaml
 
 from .tool_registry import ToolRegistry, DEFAULT_REGISTRY
+from ..config.project_dir import same_dir
 from ..sandbox import SandboxConfig
 from ..utils.io_utils import write_yaml_atomic
+
+# Placeholders for the effective project directory, longest name first.
+# "CODING_PROJECT_DIR" contains "PROJECT_DIR", so substituting in this
+# order is required to avoid mangling the longer name.
+_PROJECT_DIR_PLACEHOLDERS = ("CODING_PROJECT_DIR", "PROJECT_DIR")
 
 logger = logging.getLogger(__name__)
 
@@ -446,11 +452,11 @@ _PATH_LEVEL_USER_RULES: List[GovernanceRule] = [
         action=GovernanceAction.ALLOW,
         reason="Scratch directory access for tmp",
     ),
-    # Coding Mode, project dir
+    # Effective project dir (all modes, not just Coding Mode)
     GovernanceRule(
-        match="*(CODING_PROJECT_DIR/**)",
+        match="*(PROJECT_DIR/**)",
         action=GovernanceAction.ALLOW,
-        reason="Coding project dir",
+        reason="Project dir",
     ),
     # ALLOW all other gh operations
     GovernanceRule(
@@ -1162,7 +1168,8 @@ def load_governance_policy(
     Args:
         policy_dir: directory containing policy.yaml
         workspace_dir: used to replace WORKSPACE_DIR placeholders in rules
-        coding_project_dir: used to replace CODING_PROJECT_DIR placeholders
+        coding_project_dir: effective project dir; replaces PROJECT_DIR
+            (and its legacy CODING_PROJECT_DIR alias) placeholders
             in rules; defaults to ``workspace_dir`` when empty
 
     Supports both v1.0 and v2.0 YAML formats.
@@ -1209,6 +1216,23 @@ def load_governance_policy(
     # ── Applied default-rule migrations (absent in pre-migration files) ──
     applied_migrations = _parse_applied_migrations(data)
 
+    # Rename the legacy CODING_PROJECT_DIR placeholder to PROJECT_DIR in
+    # both the rules and the migration markers. Renaming the markers too
+    # is what keeps a user's earlier deletion of this rule deleted — drop
+    # that and the rule silently comes back for everyone who removed it.
+    for rule in user_rules:
+        if "CODING_PROJECT_DIR" in rule.match:
+            rule.match = rule.match.replace(
+                "CODING_PROJECT_DIR",
+                "PROJECT_DIR",
+            )
+        if rule.reason == "Coding project dir":
+            rule.reason = "Project dir"
+    applied_migrations = [
+        marker.replace("CODING_PROJECT_DIR", "PROJECT_DIR")
+        for marker in applied_migrations
+    ]
+
     # ── Cold start / migration: fill in missing default rules ──
     if not user_rules:
         user_rules = copy.deepcopy(get_default_user_rules())
@@ -1252,7 +1276,7 @@ def load_governance_policy(
     # policy.yaml.  User rules override defaults when they share an ID.
     detection_rules = _merge_default_detection_rules(detection_rules)
 
-    # ── Replace WORKSPACE_DIR / CODING_PROJECT_DIR with actual paths ──
+    # ── Replace WORKSPACE_DIR / PROJECT_DIR with actual paths ──
     cpd = coding_project_dir or workspace_dir
     if workspace_dir:
         _resolve_placeholders(builtin_rules, workspace_dir, cpd)
@@ -1286,12 +1310,12 @@ def save_governance_policy(
         workspace_dir: workspace path, used to restore actual paths back to
                        WORKSPACE_DIR placeholders (keeps yaml portable)
         coding_project_dir: coding project path, used to restore actual
-                       paths back to CODING_PROJECT_DIR placeholders
+                       paths back to PROJECT_DIR placeholders
     """
     builtin_rules = copy.deepcopy(policy.builtin_rules)
     user_rules = copy.deepcopy(policy.user_rules)
 
-    # ── Restore actual paths to WORKSPACE_DIR / CODING_PROJECT_DIR ──
+    # ── Restore actual paths to WORKSPACE_DIR / PROJECT_DIR ──
     if workspace_dir:
         cpd = coding_project_dir or workspace_dir
         _unresolve_placeholders(builtin_rules, workspace_dir, cpd)
@@ -1452,16 +1476,26 @@ def _resolve_placeholders(
     workspace_dir: str,
     coding_project_dir: str = "",
 ):
-    """Replace WORKSPACE_DIR / CODING_PROJECT_DIR placeholders in rules
-    with the actual paths (in-place)."""
+    """Replace directory placeholders in rules with actual paths (in-place).
+
+    ``PROJECT_DIR`` is the canonical placeholder for the effective project
+    directory; ``CODING_PROJECT_DIR`` is its deprecated alias, still
+    honoured so policy files written before the rename keep working.
+
+    Order matters: ``CODING_PROJECT_DIR`` *contains* ``PROJECT_DIR``, so
+    substituting the short name first would corrupt the long one into
+    ``CODING_/actual/path``. Always substitute longest-name-first.
+    """
     for rule in rules:
         if workspace_dir and "WORKSPACE_DIR" in rule.match:
             rule.match = rule.match.replace("WORKSPACE_DIR", workspace_dir)
-        if coding_project_dir and "CODING_PROJECT_DIR" in rule.match:
-            rule.match = rule.match.replace(
-                "CODING_PROJECT_DIR",
-                coding_project_dir,
-            )
+        if coding_project_dir:
+            for placeholder in _PROJECT_DIR_PLACEHOLDERS:
+                if placeholder in rule.match:
+                    rule.match = rule.match.replace(
+                        placeholder,
+                        coding_project_dir,
+                    )
 
 
 def _unresolve_placeholders(
@@ -1469,19 +1503,21 @@ def _unresolve_placeholders(
     workspace_dir: str,
     coding_project_dir: str = "",
 ):
-    """Restore actual paths in rules back to WORKSPACE_DIR /
-    CODING_PROJECT_DIR placeholders (in-place).
+    """Restore actual paths in rules back to placeholders (in-place).
+
+    Writes the canonical ``PROJECT_DIR`` name, so persisted policies
+    converge on one spelling instead of carrying both indefinitely.
 
     When ``coding_project_dir`` coincides with ``workspace_dir`` the two
     cannot be distinguished in an already-resolved pattern, so the shared
-    path is restored as ``WORKSPACE_DIR`` (the coding dir is still covered
-    by the workspace rules in that case).
+    path is restored as ``WORKSPACE_DIR`` (the project dir is still
+    covered by the workspace rules in that case).
     """
-    # Build (actual_path, placeholder) pairs, longest path first.
-    # avoiding CODING_PROJECT_DIR is substring of WORKSPACE_DIR
+    # Build (actual_path, placeholder) pairs, longest path first, so a
+    # project dir nested inside the workspace is not partially rewritten.
     pairs: list[tuple[str, str]] = []
-    if coding_project_dir and coding_project_dir != workspace_dir:
-        pairs.append((coding_project_dir, "CODING_PROJECT_DIR"))
+    if coding_project_dir and not same_dir(coding_project_dir, workspace_dir):
+        pairs.append((coding_project_dir, "PROJECT_DIR"))
     if workspace_dir:
         pairs.append((workspace_dir, "WORKSPACE_DIR"))
     pairs.sort(key=lambda pair: len(pair[0]), reverse=True)

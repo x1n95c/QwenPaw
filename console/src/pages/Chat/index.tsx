@@ -35,6 +35,11 @@ import {
   useLoopStore,
 } from "../../stores/loopStore";
 import { LoopModeSelector } from "../../components/LoopInput";
+import { ProjectDirSelector } from "../../components/ProjectDirSelector";
+import {
+  clearPendingProjectDir,
+  getPendingProjectDir,
+} from "../../stores/pendingProjectDirStore";
 import { useChatAnywhereInput } from "@agentscope-ai/chat";
 import styles from "./index.module.less";
 import { IconButton } from "@agentscope-ai/design";
@@ -2323,6 +2328,25 @@ export default function ChatPage() {
         }
       }
 
+      // A new chat has no server-side id yet, so a directory the user
+      // picked before sending cannot have been persisted. Carry it here so
+      // the *first* turn already runs there; the console router validates
+      // and persists it onto the chat it is about to create.
+      const pendingDir = getPendingProjectDir(
+        String(requestBody.session_id || ""),
+      );
+      if (pendingDir) {
+        const ctx =
+          requestBody.request_context &&
+          typeof requestBody.request_context === "object"
+            ? (requestBody.request_context as Record<string, unknown>)
+            : {};
+        requestBody.request_context = {
+          ...ctx,
+          pending_project_dir: pendingDir,
+        };
+      }
+
       if (usesQwenPawBackend) {
         applyApprovalLevelToRequestBody(
           requestBody,
@@ -2379,6 +2403,13 @@ export default function ChatPage() {
       const localIdToResolve = sessionApi.lastActiveChatId ?? chatIdRef.current;
       if (response.ok && localIdToResolve) {
         sessionApi.triggerResolve(localIdToResolve);
+      }
+
+      // The server has taken ownership of the pending directory (it wrote it
+      // onto the chat it just created). Dropping it here lets the pill go
+      // back to reading the persisted value instead of masking it forever.
+      if (response.ok && pendingDir) {
+        clearPendingProjectDir(String(requestBody.session_id || ""));
       }
 
       return wrapChatResponseUsageStream(response, chatRef);
@@ -2834,6 +2865,12 @@ export default function ChatPage() {
               />
             ) : null}
             {usesQwenPawBackend && <LoopModeSelector />}
+            {usesQwenPawBackend && (
+              <ProjectDirSelector
+                chatId={chatId}
+                localSessionId={queueSessionId}
+              />
+            )}
             {pluginSenderPrefix}
           </>
         ),
@@ -3106,6 +3143,9 @@ export default function ChatPage() {
     supportsAttachments,
     runningConfigApprovalLevel,
     queueSessionId,
+    // ProjectDirSelector binds to the *viewed* chat, not queueSessionId
+    // (which falls back to lastActiveChatId and could point elsewhere).
+    chatId,
     onFileCardClick,
     whisperChecked,
     whisperEnabled,

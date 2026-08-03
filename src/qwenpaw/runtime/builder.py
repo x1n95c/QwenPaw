@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..agents.acp.meta import ACP_CODING_PROJECT_META_KEY
+from ..config.project_dir import agent_project_dir_from_config
 from ..utils.io_utils import run_sync_io
 
 _logger = logging.getLogger(__name__)
@@ -241,12 +242,16 @@ class AgentBuilder:
             if plugins is not None:
                 active_modes = plugins.active_mode_names(ctx)
 
-        # Governor (governance policy layer).
-        _cm = getattr(agent_config, "coding_mode", None)
+        # Governor (governance policy layer). Built per request against the
+        # dir the tools will actually use, so a session-level project switch
+        # is reflected in the policy instead of the agent's startup dir.
+        from ..config.context import get_current_project_dir
+
+        _resolved_project = get_current_project_dir()
         _project_dir = (
-            _cm.project_dir
-            if _cm and getattr(_cm, "project_dir", None)
-            else None
+            str(_resolved_project)
+            if _resolved_project is not None
+            else agent_project_dir_from_config(agent_config)
         )
         governor = await run_sync_io(
             self._init_governor,
@@ -547,7 +552,14 @@ class AgentBuilder:
         agent_config: Any,
         request_context: dict[str, Any],
     ) -> Any:
-        """Enable Coding Mode when ACP or fork worktree supplies a project."""
+        """Apply an ACP / fork worktree project dir to a request-scoped copy.
+
+        Writes the **top-level** ``project_dir`` (the mode-independent
+        field) and additionally turns Coding Mode on, since an ACP client
+        or a forked coding sub-agent wants the IDE tooling too. The write
+        lands on a deep copy: a per-request override must never be
+        persisted back to the agent's saved default.
+        """
         from ..agents.fork_project import resolve_allowed_fork_project_dir
 
         raw_project_dir = request_context.get(ACP_CODING_PROJECT_META_KEY)
@@ -561,12 +573,7 @@ class AgentBuilder:
         # When fork_project_dir is present, the final coding project MUST be
         # the validated worktree — never fall through to an unchecked ACP path.
         if isinstance(fork_raw, str) and fork_raw.strip():
-            existing_cm = getattr(agent_config, "coding_mode", None)
-            existing_pd = (
-                getattr(existing_cm, "project_dir", None)
-                if existing_cm and getattr(existing_cm, "enabled", False)
-                else None
-            )
+            existing_pd = agent_project_dir_from_config(agent_config)
             workspace_hint = request_context.get("workspace_dir") or getattr(
                 agent_config,
                 "workspace_dir",
@@ -589,20 +596,21 @@ class AgentBuilder:
         project_dir = Path(raw_project_dir).expanduser().resolve()
         if not project_dir.is_dir():
             _logger.warning(
-                "Ignoring non-directory Coding Mode project: %s",
+                "Ignoring non-directory request project dir: %s",
                 raw_project_dir,
             )
             return agent_config
 
         if not hasattr(agent_config, "model_copy"):
             _logger.warning(
-                "Ignoring request Coding Mode project for unsupported config "
+                "Ignoring request project dir for unsupported config "
                 "type: %s",
                 type(agent_config).__name__,
             )
             return agent_config
 
         agent_config = agent_config.model_copy(deep=True)
+        agent_config.project_dir = str(project_dir)
         cm = getattr(agent_config, "coding_mode", None)
         if cm is None:
             from ..config.config import CodingModeConfig
@@ -610,7 +618,6 @@ class AgentBuilder:
             cm = CodingModeConfig()
             agent_config.coding_mode = cm
         cm.enabled = True
-        cm.project_dir = str(project_dir)
         return agent_config
 
     @staticmethod
@@ -620,33 +627,22 @@ class AgentBuilder:
         from ..app.chats.utils import build_env_context
         from ..constant import WORKING_DIR
 
+        from ..config.context import get_current_project_dir
+
         workspace_dir = getattr(ctx, "workspace_dir", None)
         ws = str(workspace_dir) if workspace_dir else str(WORKING_DIR)
 
-        _cm = getattr(agent_config, "coding_mode", None)
-        _project_dir = (
-            _cm.project_dir
-            if _cm
-            and getattr(_cm, "enabled", False)
-            and getattr(_cm, "project_dir", None)
-            else None
-        )
-        # Prefer validated fork worktree as the shell/file working_dir.
-        request = getattr(ctx, "request", None)
-        _payload = (
-            getattr(request, "request_context", None) if request else None
-        )
-        if isinstance(_payload, dict):
-            from ..agents.fork_project import resolve_allowed_fork_project_dir
+        # The effective project dir was resolved once in PRE_DISPATCH
+        # (session > agent > fork > …); re-deriving it here would risk the
+        # prompt disagreeing with where the tools actually operate.
+        _resolved = get_current_project_dir()
+        _project_dir = str(_resolved) if _resolved else None
+        if _project_dir is not None and _project_dir == ws:
+            # No project configured — keep the single "Working directory"
+            # line rather than printing the same path under two labels.
+            _project_dir = None
 
-            _fork = resolve_allowed_fork_project_dir(
-                _payload.get("fork_project_dir"),
-                workspace_dir=workspace_dir,
-                coding_project_dir=_project_dir,
-            )
-            if _fork is not None:
-                ws = str(_fork)
-                _project_dir = str(_fork)
+        request = getattr(ctx, "request", None)
         _configured_shell = getattr(
             getattr(agent_config, "running", None),
             "shell_command_executable",

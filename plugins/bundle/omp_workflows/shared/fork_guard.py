@@ -45,7 +45,13 @@ def forks_integrated(
         # explicit boolean flag is enough for the no-fork protocol path.
         return True
     scope_id = get_active_fork_scope(workspace_dir) or None
-    return forks_merged_into_head(project_dir, scope_id=scope_id)
+    # Two directories: the workspace holds the fork records, the project is
+    # the repository their branches must land in.
+    return forks_merged_into_head(
+        project_dir,
+        scope_id=scope_id,
+        workspace_dir=workspace_dir,
+    )
 
 
 FORKS_INTEGRATED_REMINDER = """\

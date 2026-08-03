@@ -1630,7 +1630,13 @@ class PlanConfig(BaseModel):
 
 
 class CodingModeConfig(BaseModel):
-    """Configuration for the Coding Mode feature."""
+    """Configuration for the Coding Mode feature.
+
+    Coding Mode owns **no directory of its own**. The project directory is
+    a mode-independent concept stored at ``AgentProfileConfig.project_dir``.
+    Coding Mode only adds: the IDE layout, code-understanding tools
+    (LSP / AST), a coding-specific system prompt, and the Git watchdog.
+    """
 
     enabled: bool = Field(
         default=False,
@@ -1638,11 +1644,13 @@ class CodingModeConfig(BaseModel):
     )
     project_dir: Optional[str] = Field(
         default=None,
+        deprecated=True,
         description=(
-            "Active coding project directory (absolute path). "
-            "When set, Coding Mode file / git operations use this path "
-            "instead of the agent workspace_dir. "
-            "None means use the default workspace_dir."
+            "DEPRECATED — moved to the top-level ``project_dir``. Retained "
+            "only so existing agent.json files still parse; a one-time "
+            "startup migration lifts the value up and clears this field. "
+            "Do not read this in new code: use "
+            "``config.project_dir`` or ``resolve_effective_project_dir()``."
         ),
     )
 
@@ -1659,6 +1667,17 @@ class AgentProfileConfig(BaseModel):
     workspace_dir: str = Field(
         default="",
         description="Path to agent's workspace (optional, for reference)",
+    )
+    project_dir: Optional[str] = Field(
+        default=None,
+        description=(
+            "Agent-level default project directory (absolute path). "
+            "This is where the agent does its work: the base for relative "
+            "paths in file tools, the default cwd for shell commands, and "
+            "the root for code/Git tooling. Shared by ALL modes — it is "
+            "not a Coding Mode concept. A Chat session may override it. "
+            "None means fall back to workspace_dir."
+        ),
     )
     backend: str = Field(
         default="qwenpaw",
@@ -2636,15 +2655,29 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
             display_migrated = False
             access_control_migrated = False
 
-        if weixin_migrated or display_migrated or access_control_migrated:
+        # Lift legacy coding_mode.project_dir to the top level so every
+        # mode reads the project directory from one place.
+        from .project_dir import migrate_project_dir_in_place
+
+        project_dir_migrated = migrate_project_dir_in_place(data)
+
+        if (
+            weixin_migrated
+            or display_migrated
+            or access_control_migrated
+            or project_dir_migrated
+        ):
             try:
-                if weixin_migrated or display_migrated:
+                if weixin_migrated or display_migrated or project_dir_migrated:
                     import uuid as _uuid
                     import shutil as _shutil
 
-                    migration_name = (
-                        "channel-display" if display_migrated else "weixin"
-                    )
+                    if display_migrated:
+                        migration_name = "channel-display"
+                    elif weixin_migrated:
+                        migration_name = "weixin"
+                    else:
+                        migration_name = "project-dir"
                     backup_path = agent_config_path.with_suffix(
                         f".{_uuid.uuid4().hex[:8]}."
                         f"{migration_name}-migrate.bak",

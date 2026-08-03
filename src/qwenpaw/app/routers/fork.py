@@ -55,12 +55,19 @@ def _get_project_dir(agent_id: str) -> Optional[Path]:
     """Resolve the project directory for fork operations.
 
     Priority:
-    1. coding_mode.project_dir (if coding mode is enabled)
-    2. workspace_dir (fallback)
+    1. the agent's ``project_dir``
+    2. ``workspace_dir`` (fallback)
+
+    Note this no longer requires Coding Mode to be enabled: the project
+    directory is mode-independent, so forking a normal-mode agent that has
+    a project configured now correctly targets that project's repository
+    instead of the agent's internal workspace.
 
     Returns the directory as a Path if it is a git repository,
     or None if no valid git repo is found (in-place fork).
     """
+    from ...config.project_dir import agent_project_dir_from_config
+
     try:
         config = load_agent_config(agent_id)
     except Exception as exc:
@@ -69,9 +76,9 @@ def _get_project_dir(agent_id: str) -> Optional[Path]:
             detail=f"Agent '{agent_id}' not found: {exc}",
         ) from exc
 
-    cm = config.coding_mode
-    if cm and cm.enabled and cm.project_dir:
-        candidate = Path(cm.project_dir).expanduser().resolve()
+    project_dir = agent_project_dir_from_config(config)
+    if project_dir:
+        candidate = Path(project_dir).expanduser().resolve()
     else:
         candidate = Path(config.workspace_dir).expanduser().resolve()
 
@@ -82,17 +89,21 @@ def _get_project_dir(agent_id: str) -> Optional[Path]:
     return candidate
 
 
-def _get_sessions_dir(agent_id: str) -> Path:
-    """Resolve the sessions directory for the agent."""
+def _get_workspace_dir(agent_id: str) -> Path:
+    """Resolve the agent's own storage root."""
     try:
         config = load_agent_config(agent_id)
-        workspace = Path(config.workspace_dir).expanduser().resolve()
+        return Path(config.workspace_dir).expanduser().resolve()
     except Exception as exc:
         raise HTTPException(
             status_code=404,
             detail=f"Cannot resolve workspace: {exc}",
         ) from exc
-    return workspace / "sessions"
+
+
+def _get_sessions_dir(agent_id: str) -> Path:
+    """Resolve the sessions directory for the agent."""
+    return _get_workspace_dir(agent_id) / "sessions"
 
 
 def _session_path(
@@ -177,14 +188,21 @@ def _write_fork_session(
 
 async def _create_worktree(
     project_dir: Path,
+    workspace_dir: Path,
     worktree_id: str,
 ) -> tuple[Path, str]:
-    """Create git worktree at <project_dir>/.qwenpaw/worktrees/<id>.
+    """Create a git worktree of *project_dir* inside the agent workspace.
+
+    The checkout goes to ``<workspace_dir>/.qwenpaw/worktrees/<id>`` so a
+    fork does not leave a full copy of the repository inside the user's
+    working tree. ``git worktree add`` still runs with *project_dir* as cwd,
+    because the branch and the worktree admin data necessarily belong to
+    that repository.
 
     Returns (worktree_path, branch_name).
     """
     branch = f"fork/{worktree_id}"
-    worktree_path = project_dir / _WORKTREE_BASE / worktree_id
+    worktree_path = workspace_dir / _WORKTREE_BASE / worktree_id
     worktree_path.parent.mkdir(parents=True, exist_ok=True)
 
     proc = await asyncio.create_subprocess_exec(
@@ -284,15 +302,17 @@ async def fork_agent(
     ``spawn_subagent(fork=True)`` in the tool layer.
 
     Steps:
-    1. Resolve project dir (coding_mode.project_dir or workspace).
+    1. Resolve the project dir (the agent's ``project_dir``, else workspace).
     2. Read parent session state.
     3. Write fork session file with inherited state.
-    4. If project_dir is a git repo, create worktree.
+    4. If the project is a git repo, create a worktree of it **inside the
+       agent workspace**.
     5. If worktree created, copy ``.worktreeinclude`` files.
     """
     _enforce_localhost(request)
 
     project_dir = _get_project_dir(req.agent_id)
+    workspace_dir = _get_workspace_dir(req.agent_id)
     sessions_dir = _get_sessions_dir(req.agent_id)
 
     parent_file = _session_path(
@@ -320,6 +340,7 @@ async def fork_agent(
     if project_dir is not None:
         wt_path, wt_branch = await _create_worktree(
             project_dir,
+            workspace_dir,
             fork_id,
         )
         worktree_path = str(wt_path)

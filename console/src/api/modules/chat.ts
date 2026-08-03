@@ -5,6 +5,7 @@ import type {
   ChatSpec,
   ChatHistory,
   ChatDeleteResponse,
+  ChatProjectDir,
   ChatUpdateRequest,
   BatchArchiveResult,
   Session,
@@ -126,6 +127,35 @@ export const chatApi = {
     request<void>(`/console/chat/stop?chat_id=${encodeURIComponent(chatId)}`, {
       method: "POST",
     }),
+
+  /** Read this chat's effective project directory and where it came from. */
+  getProjectDir: (chatId: string) =>
+    request<ChatProjectDir>(
+      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+    ),
+
+  /**
+   * Bind this chat to a project directory.
+   *
+   * Persisted server-side, so it survives a reload or a different browser.
+   * Takes effect on the next turn; an in-flight turn keeps its directory.
+   * A path that does not exist is rejected with 422.
+   */
+  setProjectDir: (chatId: string, projectDir: string) =>
+    request<ChatProjectDir>(
+      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+      {
+        method: "PUT",
+        body: JSON.stringify({ project_dir: projectDir }),
+      },
+    ),
+
+  /** Drop the override so this chat inherits the agent default again. */
+  clearProjectDir: (chatId: string) =>
+    request<ChatProjectDir>(
+      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+      { method: "DELETE" },
+    ),
 };
 
 export const sessionApi = {

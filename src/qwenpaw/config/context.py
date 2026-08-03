@@ -1,9 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Context variable for agent workspace directory.
+"""Context variables for the agent workspace and project directories.
 
-This module provides a context variable to pass the agent's workspace
-directory to tool functions, allowing them to resolve relative paths
-correctly in a multi-agent environment.
+Two distinct directories are tracked per request:
+
+``current_workspace_dir``
+    The agent's **internal** storage root (config, memory, sessions,
+    skills, media, cache).  Never repointed to a business repository.
+
+``current_project_dir``
+    The **effective project directory** for this turn: the base for
+    relative paths in file tools, the default ``cwd`` for shell
+    commands, and the root for code/Git tooling.  Resolved once per
+    turn from session override → agent config → workspace fallback.
+
+Keeping them separate is deliberate: repointing ``current_workspace_dir``
+to simulate a project switch would make memory, skills, cache, approvals
+and audit records leak into the user's repository.
 """
 from __future__ import annotations
 
@@ -38,6 +50,70 @@ def set_current_workspace_dir(workspace_dir: Path | None) -> None:
         workspace_dir: Path to the agent's workspace directory.
     """
     current_workspace_dir.set(workspace_dir)
+
+
+# Context variable to store the effective project directory for this turn.
+# This is what user-facing file/shell/code tools resolve against.
+current_project_dir: ContextVar[Path | None] = ContextVar(
+    "current_project_dir",
+    default=None,
+)
+
+
+def get_current_project_dir() -> Path | None:
+    """Get the effective project directory for the current turn.
+
+    Returns:
+        Path to the effective project directory, or None if not set.
+    """
+    return current_project_dir.get()
+
+
+def set_current_project_dir(project_dir: Path | None) -> None:
+    """Set the effective project directory for the current turn.
+
+    Args:
+        project_dir: Path to the effective project directory.
+    """
+    current_project_dir.set(project_dir)
+
+
+# Provenance of the effective project dir, for audit + UI ("session",
+# "agent", "fork", "mode", "request", "workspace_fallback").
+current_project_dir_source: ContextVar[str | None] = ContextVar(
+    "current_project_dir_source",
+    default=None,
+)
+
+
+def get_current_project_dir_source() -> str | None:
+    """Return where the effective project directory came from."""
+    return current_project_dir_source.get()
+
+
+def set_current_project_dir_source(source: str | None) -> None:
+    """Record where the effective project directory came from."""
+    current_project_dir_source.set(source)
+
+
+def get_tool_base_dir() -> Path:
+    """Return the base directory user-facing file/shell tools resolve from.
+
+    Priority: effective project dir → workspace dir → global WORKING_DIR.
+
+    Internal subsystems (memory, skills, sessions, cache, credentials)
+    must NOT use this; they read ``get_current_workspace_dir()`` so that
+    agent state never lands inside a user's project.
+    """
+    project_dir = current_project_dir.get()
+    if project_dir is not None:
+        return project_dir
+    workspace_dir = current_workspace_dir.get()
+    if workspace_dir is not None:
+        return workspace_dir
+    from ..constant import WORKING_DIR
+
+    return WORKING_DIR
 
 
 # Context variable to store the recent_max_bytes limit

@@ -71,9 +71,10 @@ class ContextVarsSetupHook(LifecycleHook):
             }
         set_current_approval_route(approval_route)
 
-        coding_project_dir = None
+        agent_project_dir = None
         try:
             from ...config.config import load_agent_config
+            from ...config.project_dir import agent_project_dir_from_config
 
             cfg = load_agent_config(ctx.agent_id)
             running = cfg.running
@@ -87,13 +88,9 @@ class ContextVarsSetupHook(LifecycleHook):
             set_current_shell_command_executable(
                 running.shell_command_executable or None,
             )
-            _cm = getattr(cfg, "coding_mode", None)
-            if (
-                _cm
-                and getattr(_cm, "enabled", False)
-                and getattr(_cm, "project_dir", None)
-            ):
-                coding_project_dir = _cm.project_dir
+            # Mode-independent: the project dir applies to every mode, so
+            # it is read regardless of whether Coding Mode is enabled.
+            agent_project_dir = agent_project_dir_from_config(cfg)
         except Exception:
             logger.warning(
                 "contextvars_setup: config-derived vars failed; "
@@ -102,21 +99,180 @@ class ContextVarsSetupHook(LifecycleHook):
             )
 
         # Forked subagents must resolve relative file/shell paths against
-        # the worktree, not the parent workspace.
+        # the worktree they were assigned, and must not be able to escape
+        # it. Validate before handing it to the resolver, which trusts it.
         fork_dir = None
+        request_override = None
         if isinstance(request_context, dict):
             from ...agents.fork_project import resolve_allowed_fork_project_dir
 
             fork_dir = resolve_allowed_fork_project_dir(
                 request_context.get("fork_project_dir"),
                 workspace_dir=ctx.workspace_dir,
-                coding_project_dir=coding_project_dir,
+                coding_project_dir=agent_project_dir,
             )
-        if fork_dir is not None:
-            set_current_workspace_dir(fork_dir)
-        elif ctx.workspace_dir is not None:
+            request_override = _trusted_request_project_dir(request_context)
+
+        # The workspace ContextVar always points at the agent's own storage.
+        # Never repoint it to a project: memory, skills, cache, approvals
+        # and audit records resolve from it and must stay inside the agent.
+        if ctx.workspace_dir is not None:
             set_current_workspace_dir(ctx.workspace_dir)
+
+        self._apply_project_dir(
+            ctx,
+            agent_project_dir=agent_project_dir,
+            session_project_dir=await _session_project_dir(ctx),
+            request_override=request_override,
+            fork_dir=fork_dir,
+        )
         return HookResult()
+
+    @staticmethod
+    def _apply_project_dir(
+        ctx: HookContext,
+        *,
+        agent_project_dir: str | None,
+        session_project_dir: str | None,
+        request_override: str | None,
+        fork_dir: object | None,
+    ) -> None:
+        """Resolve the effective project dir once and pin it for this turn."""
+        from ...config.context import (
+            set_current_project_dir,
+            set_current_project_dir_source,
+        )
+        from ...config.project_dir import resolve_effective_project_dir
+
+        if ctx.workspace_dir is None:
+            # Without a workspace there is no safe fallback; leave the
+            # project ContextVar unset so tools use their own defaults.
+            return
+
+        # A mode may pin a directory for the whole run (Mission fixes its
+        # source project at start so a mid-run session switch cannot make
+        # the worker jump repositories).
+        mode_override = None
+        mode_state = getattr(ctx, "mode_state", None)
+        if isinstance(mode_state, dict):
+            for state in mode_state.values():
+                if isinstance(state, dict) and state.get("project_dir_pin"):
+                    mode_override = state["project_dir_pin"]
+                    break
+
+        try:
+            resolved = resolve_effective_project_dir(
+                workspace_dir=ctx.workspace_dir,
+                agent_project_dir=agent_project_dir,
+                session_project_dir=session_project_dir,
+                request_override=request_override,
+                mode_override=mode_override,
+                fork_project_dir=fork_dir,
+            )
+        except ValueError:
+            logger.warning(
+                "contextvars_setup: could not resolve project dir",
+                exc_info=True,
+            )
+            return
+
+        if not resolved.exists and not resolved.is_workspace_fallback:
+            # Do not silently fall back: writing to the wrong place is far
+            # worse than a clear tool error the user can act on.
+            logger.warning(
+                "Effective project dir does not exist: %s (source=%s)",
+                resolved.path,
+                resolved.source,
+            )
+
+        set_current_project_dir(resolved.path)
+        set_current_project_dir_source(resolved.source)
+
+
+def _trusted_request_project_dir(request_context: dict) -> str | None:
+    """Return an ephemeral project override from a trusted request source.
+
+    Recognised sources:
+
+    * ACP session metadata (``qwenpaw.coding_project_dir``)
+    * cron task config (``cron_project_dir``)
+    * ``pending_project_dir`` — a directory the console user picked for a
+      brand-new chat, before that chat had an id to persist it against.
+      The console router validates the path and writes it onto the chat as
+      soon as the chat exists; reading it here as well is what makes the
+      **first** turn already run in the chosen directory rather than in the
+      agent default.
+
+    Per-run only: never written back to the agent's saved default.
+    """
+    from ...agents.acp.meta import ACP_CODING_PROJECT_META_KEY
+
+    for key in (ACP_CODING_PROJECT_META_KEY, "cron_project_dir"):
+        value = request_context.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+
+    # Client-supplied, so validate here too. The console router refuses to
+    # persist a non-directory; if this accepted one anyway the turn would
+    # run somewhere the chat was never bound to.
+    pending = request_context.get("pending_project_dir")
+    if isinstance(pending, str) and pending.strip():
+        from ...config.project_dir import normalize_project_dir
+
+        normalized = normalize_project_dir(pending)
+        if normalized is not None and normalized.is_dir():
+            return str(normalized)
+        logger.warning(
+            "Ignoring pending_project_dir that is not a directory",
+        )
+    return None
+
+
+async def _session_project_dir(ctx: HookContext) -> str | None:
+    """Read the persisted per-chat project override, if any.
+
+    Runs on **every** turn: the override lives on the chat, so this is what
+    keeps a session-level directory in effect after the turn that set it.
+    """
+    if not ctx.session_id:
+        return None
+    try:
+        from ...app.channels.schema import DEFAULT_CHANNEL
+        from ...config.project_dir import session_project_dir_from_meta
+
+        workspace = getattr(ctx, "workspace", None)
+        chat_manager = getattr(workspace, "chat_manager", None)
+        if chat_manager is None:
+            return None
+
+        request = getattr(ctx, "request", None)
+        # `channel` is required by the lookup: chats are indexed per channel,
+        # so omitting it finds nothing. Cron/heartbeat turns may not carry
+        # one, hence the default.
+        channel = getattr(request, "channel", None) or DEFAULT_CHANNEL
+        user_id = getattr(request, "user_id", None) or None
+
+        chat_id = await chat_manager.get_chat_id_by_session(
+            ctx.session_id,
+            channel,
+            user_id,
+        )
+        if not chat_id:
+            return None
+        chat = await chat_manager.get_chat(chat_id)
+        if chat is None:
+            return None
+        return session_project_dir_from_meta(chat.meta)
+    except Exception:
+        # Warning, not debug: a silent failure here degrades to the agent
+        # default, which looks like "the setting reverted on its own" and is
+        # very hard to trace from the UI.
+        logger.warning(
+            "contextvars_setup: session project dir lookup failed; "
+            "falling back to the agent default",
+            exc_info=True,
+        )
+        return None
 
 
 __all__ = ["ContextVarsSetupHook"]

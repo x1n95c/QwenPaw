@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """Mission Mode state-file management.
 
-State file layout follows the snarktank/ralph convention:
+State file layout follows the snarktank/ralph convention and lives in the
+**agent workspace**::
 
     {workspace_dir}/missions/{loop_id}/
     ├── loop_config.json  # environment metadata (git, paths)
@@ -9,8 +10,15 @@ State file layout follows the snarktank/ralph convention:
     ├── progress.txt      # append-only iteration log
     └── task.md           # original task description (read-only)
 
-Each loop_dir IS the working directory for that loop — fully isolated
-from other loops and the shared agent workspace.
+Mission state is agent bookkeeping, not project content, so it stays out
+of the user's repository entirely — no stray files, no ``.gitignore`` or
+``.git/info/exclude`` edits, nothing to clean up after a run.
+
+Note this is *only* about where the state lives. The mission still
+**works** in the effective project directory (see
+``modes/mission/__init__.py:_effective_project_dir``); the prompt hands
+the controller absolute paths for state and lets code paths stay
+project-relative.
 """
 from __future__ import annotations
 
@@ -61,13 +69,13 @@ async def _git_cmd(
         return 1, ""
 
 
-async def detect_git_context(workspace_dir: Path) -> dict[str, Any]:
+async def detect_git_context(project_dir: Path) -> dict[str, Any]:
     """Probe the environment for git availability (async).
 
     Returns a dict with keys::
 
         git_installed   – bool, ``git`` binary found on PATH
-        is_git_repo     – bool, *workspace_dir* is inside a git repo
+        is_git_repo     – bool, *project_dir* is inside a git repo
         default_branch  – str, e.g. ``"main"``
         current_branch  – str
         repo_root       – str, absolute path of the repo root
@@ -84,7 +92,7 @@ async def detect_git_context(workspace_dir: Path) -> dict[str, Any]:
         return ctx
     ctx["git_installed"] = True
 
-    cwd = str(workspace_dir)
+    cwd = str(project_dir)
 
     try:
         rc, _ = await _git_cmd("rev-parse", "--is-inside-work-tree", cwd=cwd)
@@ -138,10 +146,15 @@ async def detect_git_context(workspace_dir: Path) -> dict[str, Any]:
 # ── loop directory & state files ─────────────────────────────────────────
 
 
+def missions_base(workspace_dir: Path) -> Path:
+    """Return the directory holding all missions for *workspace_dir*."""
+    return workspace_dir / "missions"
+
+
 def create_loop_dir(workspace_dir: Path) -> Path:
-    """Create a new mission directory and return its path."""
+    """Create a new mission directory in the agent workspace."""
     loop_id = f"mission-{_ts()}"
-    loop_dir = workspace_dir / "missions" / loop_id
+    loop_dir = missions_base(workspace_dir) / loop_id
     loop_dir.mkdir(parents=True, exist_ok=True)
     logger.info("Created mission dir: %s", loop_dir)
     return loop_dir
@@ -233,14 +246,14 @@ def get_active_loop_dir(
     loop_config.json.session_id matches the provided session_id.
 
     Args:
-        workspace_dir: Workspace root directory.
+        workspace_dir: The agent workspace whose ``missions/`` to scan.
         session_id: Current session ID. If empty, returns the globally
             latest loop (backward compatibility).
 
     Returns:
         Path to the newest loop matching session_id, or None if not found.
     """
-    base = workspace_dir / "missions"
+    base = missions_base(workspace_dir)
     if not base.exists():
         return None
 
@@ -270,8 +283,14 @@ def get_active_loop_dir(
 
 
 def list_loop_dirs(workspace_dir: Path) -> list[dict[str, Any]]:
-    """Return summary info for all missions in a workspace."""
-    base = workspace_dir / "missions"
+    """Return summary info for all missions stored in *workspace_dir*.
+
+    Scoped to the agent, not the project: state lives in the workspace, so
+    ``/mission list`` shows every mission this agent has run. Each entry's
+    ``loop_config.json`` records ``source_project_dir`` if the caller needs
+    to tell which project a mission acted on.
+    """
+    base = missions_base(workspace_dir)
     if not base.exists():
         return []
     result = []

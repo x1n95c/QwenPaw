@@ -21,9 +21,8 @@ from agentscope.tool import ToolChunk
 from ...config.context import (
     get_current_shell_command_executable,
     get_current_shell_command_timeout,
-    get_current_workspace_dir,
+    get_tool_base_dir,
 )
-from ...constant import WORKING_DIR
 from ...runtime.tool_registry import tool_descriptor
 from ...sandbox import ExecutionResult
 
@@ -531,7 +530,7 @@ async def execute_shell_command(
             Default is 60.0 seconds.
         cwd (`Optional[Path]`, defaults to `None`):
             The working directory for the command execution.
-            If None, defaults to the agent workspace.
+            If None, defaults to the project directory.
         sandbox_config (`Optional[Any]`, defaults to `None`):
             Sandbox execution configuration compiled from governance policy.
             When provided, the command executes within a sandboxed environment
@@ -583,11 +582,13 @@ async def execute_shell_command(
         if configured is not None:
             timeout = configured
 
-    # Use current workspace_dir from context, fallback to WORKING_DIR
+    # An explicit cwd wins; otherwise default to the effective project
+    # directory so a bare `pytest` runs against the user's repository
+    # rather than inside the agent's internal workspace.
     if cwd is not None:
         working_dir = cwd
     else:
-        working_dir = get_current_workspace_dir() or WORKING_DIR
+        working_dir = get_tool_base_dir()
 
     # Ensure the venv Python is on PATH for subprocesses
     env = os.environ.copy()

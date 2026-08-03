@@ -137,17 +137,23 @@ async def get_agent_for_request(
 
 
 def get_coding_dir(workspace: "Workspace") -> Path:
-    """Return the active coding project directory for *workspace*.
+    """Return the agent's default project directory for *workspace*.
 
-    If the agent has set a ``coding_mode.project_dir`` in its config, that
-    path is returned.  Otherwise the agent's default ``workspace_dir`` is used.
+    Reads the mode-independent top-level ``project_dir`` (falling back to
+    the deprecated ``coding_mode.project_dir`` for un-migrated configs).
+    Falls back to ``workspace_dir`` when no project is configured.
+
+    This is the **agent-level default** and is what HTTP handlers should
+    use, since they run outside an agent turn. Code running inside a turn
+    should prefer ``get_current_project_dir()``, which also accounts for a
+    session-level override.
     """
     from ..config.config import load_agent_config
+    from ..config.project_dir import agent_project_dir_from_config
 
     try:
-        config = load_agent_config(workspace.agent_id)
-        project_dir = (
-            config.coding_mode.project_dir if config.coding_mode else None
+        project_dir = agent_project_dir_from_config(
+            load_agent_config(workspace.agent_id),
         )
     except Exception:
         project_dir = None

@@ -28,9 +28,9 @@ import {
 import { useTranslation } from "react-i18next";
 import {
   codingProjectApi,
-  type BrowseDirsResponse,
   type ProjectListItem,
 } from "../../api/modules/codingProject";
+import { useDirectoryBrowser } from "../DirectoryBrowser/useDirectoryBrowser";
 import { useProjectDir } from "../../stores/codingModeStore";
 import styles from "./index.module.less";
 
@@ -435,48 +435,21 @@ function LocalPathTab({ onSelect }: { onSelect: (path: string) => void }) {
 
 function OpenDirTab({ onSelect }: { onSelect: (path: string) => void }) {
   const { t } = useTranslation();
-  const [browsePath, setBrowsePath] = useState<string>("~");
-  const [data, setData] = useState<BrowseDirsResponse | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [showHidden, setShowHidden] = useState(false);
   const listRef = useRef<HTMLDivElement>(null);
-  const navSeq = useRef(0);
-
-  const navigate = (path: string) => {
-    const seq = ++navSeq.current;
-    setBrowsePath(path);
-    setLoading(true);
-    setError(null);
-    codingProjectApi
-      .browseDirs(path, showHidden)
-      .then((res) => {
-        if (seq !== navSeq.current) return;
-        setData(res);
-        listRef.current?.scrollTo(0, 0);
-      })
-      .catch((err: unknown) => {
-        if (seq !== navSeq.current) return;
-        setError(err instanceof Error ? err.message : String(err));
-      })
-      .finally(() => {
-        if (seq === navSeq.current) setLoading(false);
-      });
-  };
-
-  useEffect(() => {
-    navigate("~");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Re-fetch current directory when the hidden-folders toggle changes.
-  // navSeq already discards stale responses, so unconditional re-fetch is safe.
-  useEffect(() => {
-    navigate(browsePath);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [showHidden]);
-
-  const breadcrumbParts = data?.current.split("/").filter(Boolean) ?? [];
+  // Browsing state (including the stale-response guard) is shared with the
+  // chat project-dir popover via this hook.
+  const {
+    path: browsePath,
+    data,
+    loading,
+    error,
+    showHidden,
+    setShowHidden,
+    navigate,
+    breadcrumb: breadcrumbParts,
+  } = useDirectoryBrowser({
+    onLoaded: () => listRef.current?.scrollTo(0, 0),
+  });
 
   return (
     <div className={styles.tabContent}>

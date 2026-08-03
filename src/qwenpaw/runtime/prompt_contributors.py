@@ -263,8 +263,84 @@ class MultimodalHintContributor(SyncPromptContributor):
         return hint or None
 
 
+_DIRECTORY_CONTEXT_TEMPLATE = """\
+### Directories
+
+Project directory: {project_dir}
+Agent workspace: {workspace_dir}
+
+Relative file paths and shell commands resolve from the **project
+directory** — `read_file("src/main.py")` and a bare `pytest` both act on
+the project, so you do not need to pass absolute paths or an explicit
+`cwd` for ordinary work.
+
+The agent workspace holds internal QwenPaw state (config, memory,
+sessions, skills). Do not read or write there unless the user asks.
+"""
+
+_DIRECTORY_CONTEXT_MISSING_SUFFIX = """\
+WARNING: the configured project directory does not currently exist.
+Tell the user instead of writing files to a different location.
+"""
+
+
+class DirectoryContextContributor(SyncPromptContributor):
+    """State the project dir and agent workspace, in every mode.
+
+    The project directory is not a Coding Mode concept — normal chats
+    resolve relative paths the same way — so this block is unconditional
+    rather than gated on a mode being active.
+    """
+
+    name = "directory_context"
+    priority = 84
+
+    def contribute_sync(self, ctx: "HookContext") -> str | None:
+        from ..config.context import (
+            get_current_project_dir,
+            get_current_project_dir_source,
+        )
+
+        workspace_dir = getattr(ctx, "workspace_dir", None)
+        project_dir = get_current_project_dir()
+        if project_dir is None and workspace_dir is None:
+            return None
+        if project_dir is None:
+            project_dir = workspace_dir
+
+        # When no project was ever configured the two paths are identical;
+        # printing the same path twice under two labels invites the model
+        # to treat internal state as project content.
+        if workspace_dir is not None and str(project_dir) == str(
+            workspace_dir,
+        ):
+            return (
+                "### Directories\n\n"
+                f"Working directory: {project_dir}\n\n"
+                "Relative file paths and shell commands resolve from here. "
+                "This directory also holds internal QwenPaw state "
+                "(config, memory, sessions, skills); leave those files "
+                "alone unless the user asks about them.\n"
+            )
+
+        block = _DIRECTORY_CONTEXT_TEMPLATE.format(
+            project_dir=project_dir,
+            workspace_dir=workspace_dir or "(unknown)",
+        )
+        if get_current_project_dir_source() != "workspace_fallback" and not (
+            Path(project_dir).is_dir()
+        ):
+            block = f"{block}\n{_DIRECTORY_CONTEXT_MISSING_SUFFIX}"
+        return block
+
+
 class CodingModeContributor(SyncPromptContributor):
-    """Inject Coding Mode persona block when coding mode is active."""
+    """Inject Coding Mode persona block when coding mode is active.
+
+    Only code-specific guidance lives here. The project/workspace paths
+    themselves come from :class:`DirectoryContextContributor`, which runs
+    for every mode.
+    """
 
     name = "coding_mode"
     priority = 85
@@ -279,37 +355,7 @@ class CodingModeContributor(SyncPromptContributor):
             return None
         from ..modes.coding import _CODING_SYSTEM_PROMPT_TEMPLATE
 
-        workspace_dir = str(getattr(ctx, "workspace_dir", "") or "(unknown)")
-        project_dir = self._resolve_project_dir(agent_config) or workspace_dir
-        return _CODING_SYSTEM_PROMPT_TEMPLATE.format(
-            project_dir=project_dir,
-            workspace_dir=workspace_dir,
-        )
-
-    @staticmethod
-    def _resolve_project_dir(agent_config: Any) -> str | None:
-        """Prefer request config, then reload disk config for API switches."""
-        cm_obj = getattr(agent_config, "coding_mode", None)
-        project_dir = getattr(cm_obj, "project_dir", None)
-        if project_dir:
-            return project_dir
-
-        from ..config.config import load_agent_config
-
-        agent_id = getattr(agent_config, "id", None)
-        if not agent_id:
-            return None
-        try:
-            fresh = load_agent_config(agent_id)
-            cm = fresh.coding_mode
-            if cm and cm.project_dir:
-                return cm.project_dir
-        except Exception:
-            logger.debug(
-                "Failed to reload agent config for Coding Mode prompt",
-                exc_info=True,
-            )
-        return None
+        return _CODING_SYSTEM_PROMPT_TEMPLATE
 
 
 class ScrollContextContributor(SyncPromptContributor):
@@ -367,6 +413,7 @@ _ALL_CONTRIBUTORS = (
     AgentIdentityContributor,
     WorkspacePromptFilesContributor,
     MultimodalHintContributor,
+    DirectoryContextContributor,
     CodingModeContributor,
     ScrollContextContributor,
     DriverPolicyHintContributor,
@@ -389,6 +436,7 @@ __all__ = [
     "ProfileMdContributor",
     "WorkspacePromptFilesContributor",
     "MultimodalHintContributor",
+    "DirectoryContextContributor",
     "CodingModeContributor",
     "ScrollContextContributor",
     "DriverPolicyHintContributor",

@@ -404,16 +404,16 @@ class TestExecuteShellCommand:
 
     @pytest.mark.asyncio
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_timeout")
-    @patch("qwenpaw.agents.tools.shell.get_current_workspace_dir")
+    @patch("qwenpaw.agents.tools.shell.get_tool_base_dir")
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_executable")
     async def test_simple_command_success(
         self,
         mock_shell_exe,
-        mock_workspace,
+        mock_base_dir,
         mock_timeout,
     ):
         mock_shell_exe.return_value = None
-        mock_workspace.return_value = None
+        mock_base_dir.return_value = None
         mock_timeout.return_value = None
 
         async def fake_wait_for(coro, timeout=None):
@@ -447,16 +447,16 @@ class TestExecuteShellCommand:
 
     @pytest.mark.asyncio
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_timeout")
-    @patch("qwenpaw.agents.tools.shell.get_current_workspace_dir")
+    @patch("qwenpaw.agents.tools.shell.get_tool_base_dir")
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_executable")
     async def test_command_failure(
         self,
         mock_shell_exe,
-        mock_workspace,
+        mock_base_dir,
         mock_timeout,
     ):
         mock_shell_exe.return_value = None
-        mock_workspace.return_value = None
+        mock_base_dir.return_value = None
         mock_timeout.return_value = None
 
         async def fake_wait_for(coro, timeout=None):
@@ -489,16 +489,16 @@ class TestExecuteShellCommand:
 
     @pytest.mark.asyncio
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_timeout")
-    @patch("qwenpaw.agents.tools.shell.get_current_workspace_dir")
+    @patch("qwenpaw.agents.tools.shell.get_tool_base_dir")
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_executable")
     async def test_empty_command(
         self,
         mock_shell_exe,
-        mock_workspace,
+        mock_base_dir,
         mock_timeout,
     ):
         mock_shell_exe.return_value = None
-        mock_workspace.return_value = None
+        mock_base_dir.return_value = None
         mock_timeout.return_value = None
 
         async def fake_wait_for(coro, timeout=None):
@@ -529,16 +529,16 @@ class TestExecuteShellCommand:
 
     @pytest.mark.asyncio
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_timeout")
-    @patch("qwenpaw.agents.tools.shell.get_current_workspace_dir")
+    @patch("qwenpaw.agents.tools.shell.get_tool_base_dir")
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_executable")
     async def test_timeout_string_converted(
         self,
         mock_shell_exe,
-        mock_workspace,
+        mock_base_dir,
         mock_timeout,
     ):
         mock_shell_exe.return_value = None
-        mock_workspace.return_value = None
+        mock_base_dir.return_value = None
         mock_timeout.return_value = None
 
         async def fake_wait_for(coro, timeout=None):
@@ -569,16 +569,16 @@ class TestExecuteShellCommand:
 
     @pytest.mark.asyncio
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_timeout")
-    @patch("qwenpaw.agents.tools.shell.get_current_workspace_dir")
+    @patch("qwenpaw.agents.tools.shell.get_tool_base_dir")
     @patch("qwenpaw.agents.tools.shell.get_current_shell_command_executable")
     async def test_invalid_timeout_defaults(
         self,
         mock_shell_exe,
-        mock_workspace,
+        mock_base_dir,
         mock_timeout,
     ):
         mock_shell_exe.return_value = None
-        mock_workspace.return_value = None
+        mock_base_dir.return_value = None
         mock_timeout.return_value = None
 
         async def fake_wait_for(coro, timeout=None):

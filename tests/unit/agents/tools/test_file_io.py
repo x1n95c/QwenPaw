@@ -42,11 +42,12 @@ from qwenpaw.agents.tools.utils import (
 class TestResolveFilePath:
     """Tests for _resolve_file_path."""
 
-    @patch("qwenpaw.agents.tools.file_io.get_current_workspace_dir")
-    def test_absolute_path_unchanged(self, mock_ws):
+    @patch("qwenpaw.agents.tools.file_io.get_tool_base_dir")
+    def test_absolute_path_unchanged(self, mock_base):
         import sys
+        from pathlib import Path
 
-        mock_ws.return_value = None
+        mock_base.return_value = Path("/workspace")
         result = _resolve_file_path("/tmp/test.txt")
         # On Unix, path stays as-is; on Windows, it may get a
         # drive prefix (e.g. C:\tmp\test.txt)
@@ -55,27 +56,57 @@ class TestResolveFilePath:
         else:
             assert result == "/tmp/test.txt"
 
-    @patch("qwenpaw.agents.tools.file_io.get_current_workspace_dir")
-    def test_relative_path_resolved(self, mock_ws):
+    @patch("qwenpaw.agents.tools.file_io.get_tool_base_dir")
+    def test_relative_path_resolves_from_project_dir(self, mock_base):
         from pathlib import Path
 
-        mock_ws.return_value = Path("/workspace")
+        mock_base.return_value = Path("/repos/myproject")
         result = _resolve_file_path("subdir/file.txt")
-        assert result == str(Path("/workspace/subdir/file.txt"))
+        assert result == str(Path("/repos/myproject/subdir/file.txt"))
 
-    @patch("qwenpaw.agents.tools.file_io.get_current_workspace_dir")
-    def test_tilde_expansion(self, mock_ws):
-        mock_ws.return_value = None
+    @patch("qwenpaw.agents.tools.file_io.get_tool_base_dir")
+    def test_tilde_expansion(self, mock_base):
+        from pathlib import Path
+
+        mock_base.return_value = Path("/workspace")
         result = _resolve_file_path("~/test.txt")
         assert "~" not in result
         assert result.endswith("test.txt")
 
-    @patch("qwenpaw.agents.tools.file_io.get_current_workspace_dir")
-    def test_workspace_fallback_to_working_dir(self, mock_ws):
-        mock_ws.return_value = None
-        # When workspace is None, WORKING_DIR is used
-        result = _resolve_file_path("file.txt")
-        assert result.endswith("file.txt")
+    def test_falls_back_to_workspace_when_no_project_dir(self):
+        """With no project dir set, relative paths land in the workspace."""
+        from pathlib import Path
+
+        from qwenpaw.config.context import (
+            set_current_project_dir,
+            set_current_workspace_dir,
+        )
+
+        set_current_project_dir(None)
+        set_current_workspace_dir(Path("/workspace"))
+        try:
+            result = _resolve_file_path("file.txt")
+            assert result == str(Path("/workspace/file.txt"))
+        finally:
+            set_current_workspace_dir(None)
+
+    def test_project_dir_wins_over_workspace(self):
+        """A configured project dir takes precedence over the workspace."""
+        from pathlib import Path
+
+        from qwenpaw.config.context import (
+            set_current_project_dir,
+            set_current_workspace_dir,
+        )
+
+        set_current_workspace_dir(Path("/workspace"))
+        set_current_project_dir(Path("/repos/myproject"))
+        try:
+            result = _resolve_file_path("src/main.py")
+            assert result == str(Path("/repos/myproject/src/main.py"))
+        finally:
+            set_current_project_dir(None)
+            set_current_workspace_dir(None)
 
 
 # ---------------------------------------------------------------------------

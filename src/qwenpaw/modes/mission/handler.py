@@ -203,27 +203,46 @@ def _create_mission_files(workspace_dir: Path, task_text: str) -> Path:
 
 async def start_mission(
     task_text: str,
-    workspace_dir: Path,
+    project_dir: Path,
     agent_id: str,
     session_id: str,
     verify_commands: str,
     max_iterations: int,
     verification_instructions: str = "",
     max_retries_per_story: int = 3,
+    workspace_dir: Path | None = None,
 ) -> tuple[str, Path]:
     """Create state files and return (prompt, loop_dir).
+
+    Two directories, deliberately kept apart:
+
+    *workspace_dir* holds the mission's **state** (``missions/<id>/``). It
+    is agent bookkeeping, so it stays out of the user's repository — a run
+    leaves no trace in the project and needs no ``.gitignore`` handling.
+
+    *project_dir* is where the mission **works**: the effective project
+    directory at start time, **pinned** for the mission's whole life and
+    recorded as ``source_project_dir`` / ``mission_run_dir``. A later
+    session-level directory switch changes where subsequent ordinary turns
+    operate, but must not make a running mission's worker jump to another
+    repository mid-flight.
 
     The caller is responsible for rewriting the user
     message with the returned prompt string, and for
     activating the MissionGate with the loop_dir.
     """
+    if workspace_dir is None:
+        raise ValueError("start_mission requires workspace_dir for state")
+
     loop_dir = await asyncio.to_thread(
         _create_mission_files,
         workspace_dir,
         task_text,
     )
 
-    git_ctx = await detect_git_context(workspace_dir)
+    # Probes the *project*: the mission's git context is the repository it
+    # works on, not the agent's storage.
+    git_ctx = await detect_git_context(project_dir)
 
     loop_config: dict[str, Any] = {
         "git_installed": git_ctx["git_installed"],
@@ -235,6 +254,9 @@ async def start_mission(
         "branch_name": "",
         "repo_root": git_ctx.get("repo_root", ""),
         "workspace_dir": str(workspace_dir),
+        "source_project_dir": str(project_dir),
+        "mission_run_dir": str(project_dir),
+        "mission_state_dir": str(loop_dir),
         "max_iterations": max_iterations,
         "current_phase": "prd_generation",
         "session_id": session_id,
@@ -260,7 +282,7 @@ async def start_mission(
         verification_instructions=verification_instructions,
         max_retries_per_story=max_retries_per_story,
         git_context=git_ctx,
-        workspace_dir=str(workspace_dir),
+        project_dir=str(project_dir),
     )
 
     prompt = (

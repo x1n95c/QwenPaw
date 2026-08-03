@@ -42,16 +42,22 @@ language.
 
 | Item | Path |
 |------|------|
-| Loop dir (= work dir) | `{loop_dir}` |
-| Original workspace | `{workspace_dir}` |
+| Project dir (= work dir) | `{project_dir}` |
+| Mission state dir | `{loop_dir}/` |
 | prd.json | `{loop_dir}/prd.json` |
 | progress.txt | `{loop_dir}/progress.txt` |
 | task.md | `{loop_dir}/task.md` (read-only) |
 
-The loop directory is the **isolated working directory** for this loop.
-Workers MUST `cd {loop_dir}` before doing any work.
-If the task modifies existing code, the first worker should copy or
-clone the relevant files from the original workspace into the loop dir.
+Work happens **directly in the project directory** — that is where this
+mission was started, and it stays pinned there for the mission's whole
+life. Do NOT copy or clone the project somewhere else first. Relative
+paths and shell commands already resolve from the project dir, so refer
+to code as `src/main.py`, not by absolute path.
+
+The mission state dir is **outside the project**, in the agent's own
+storage, so it leaves no trace in the repository. Always reach it by the
+absolute paths in the table above — a relative path like `prd.json` would
+land in the project instead.
 {git_section}
 
 ## Step 0 — Generate prd.json (task decomposition)
@@ -96,9 +102,8 @@ into a structured prd.json.  You have tools — use them.
 ### 0a. Understand the task
 
 1. Read `{loop_dir}/task.md` for the original task description.
-2. Explore the original workspace (`{workspace_dir}`): read key files,
-   search the codebase, check project structure, README, existing
-   tests, etc.
+2. Explore the project (`{project_dir}`): read key files, search the
+   codebase, check project structure, README, existing tests, etc.
 3. If the task is ambiguous, ask 3–5 clarifying questions (with
    lettered options so the user can reply "1A, 2C, 3B" quickly).
    Focus on: Problem/Goal, Core Functionality, Scope/Boundaries,
@@ -493,13 +498,18 @@ and story text you receive.
 
 ## Environment
 
-**Working directory**: `{loop_dir}`
-`cd {loop_dir}` before doing anything.
+**Working directory**: the project. Relative paths and shell commands
+already resolve there — do **not** `cd` anywhere first, and refer to code
+as `src/main.py` rather than by absolute path.
+
+**Mission state** lives outside the project, in the agent's own storage.
+Reach it only by the absolute paths given below.
 {worker_git_section}
 
 ## Your Task
 
-1. `cd {loop_dir}`
+1. Confirm your location with `pwd` — it should print the project dir.
+   Do **not** `cd`; the tools already resolve there.
 2. Read the PRD at `{prd_path}`
 3. Read the progress log at `{progress_path}` — **read the Codebase
    Patterns section first** before touching any code.  This section
@@ -713,7 +723,7 @@ not sufficient.  Clean up after yourself.
 
 ## What You Receive
 
-- **Loop directory**: `{loop_dir}`
+- **Mission state directory** (absolute; outside the project): `{loop_dir}`
 - **Story under verification**:
   ```json
   {{STORY_JSON}}
@@ -848,17 +858,25 @@ def build_master_prompt(
     prd_path: str = "",
     progress_path: str = "",
     git_context: dict | None = None,
-    workspace_dir: str = "",
+    project_dir: str = "",
 ) -> str:
-    """Render the master prompt with concrete paths and config."""
+    """Render the master prompt with concrete paths and config.
+
+    Args:
+        loop_dir: Absolute path to this mission's state directory, which
+            lives in the agent workspace — outside the project.
+        project_dir: The pinned source project; the worker's work dir.
+            State paths in the prompt are absolute precisely because they
+            are *not* under this directory.
+    """
     if not prd_path:
         prd_path = f"{loop_dir}/prd.json"
     if not progress_path:
         progress_path = f"{loop_dir}/progress.txt"
     if not verify_commands:
         verify_commands = "(none specified — rely on acceptance criteria)"
-    if not workspace_dir:
-        workspace_dir = loop_dir
+    if not project_dir:
+        project_dir = loop_dir
 
     gsec = _build_git_sections(git_context)
 
@@ -877,7 +895,7 @@ def build_master_prompt(
 
     return MASTER_PROMPT.format(
         loop_dir=loop_dir,
-        workspace_dir=workspace_dir,
+        project_dir=project_dir,
         agent_id=agent_id,
         max_iterations=max_iterations,
         max_retries_per_story=max_retries_per_story,

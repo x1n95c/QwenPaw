@@ -3298,5 +3298,29 @@
         "description": "Run a structured, persistent multi-step task."
       }
     }
+  },
+  "projectDir": {
+    "title": "Project directory",
+    "hint": "Relative file paths and shell commands for the next message resolve from this directory. Changes apply to the next turn.",
+    "sourceSession": "This chat overrides",
+    "sourceAgent": "Inherited from agent",
+    "tagSession": "Session",
+    "tagInherited": "Agent",
+    "unavailable": "This directory does not exist. Fix it before sending — nothing will fall back automatically.",
+    "placeholder": "Absolute path, e.g. /Users/me/repos/demo",
+    "inputAria": "Project directory path",
+    "apply": "Apply to this chat",
+    "inherit": "Inherit agent default",
+    "agentDefault": "Agent default: {{path}}",
+    "triggerAria": "Project directory: {{path}}. Click to change.",
+    "browse": "Browse folders",
+    "browseHome": "Home",
+    "browseRefresh": "Refresh",
+    "browseHidden": "Show hidden folders",
+    "browseLoading": "Loading…",
+    "browseEmpty": "No subfolders",
+    "tagPending": "Pending",
+    "sourcePending": "Will apply on first message",
+    "noSessionYet": "No session to attach this to yet."
   }
 }

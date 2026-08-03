@@ -1,0 +1,173 @@
+# -*- coding: utf-8 -*-
+"""Per-chat project-directory overrides on ``ChatManager``.
+
+Uses the real :class:`JsonChatRepository` so persistence is exercised too:
+the override has to survive a round-trip through disk, since the whole
+point is that it outlives a page reload.
+"""
+# pylint: disable=redefined-outer-name
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from qwenpaw.app.chats.manager import ChatManager
+from qwenpaw.app.chats.models import ChatSpec
+from qwenpaw.app.chats.repo import JsonChatRepository
+from qwenpaw.config.project_dir import session_project_dir_from_meta
+
+
+@pytest.fixture
+def repo_path(tmp_path: Path) -> Path:
+    return tmp_path / "chats.json"
+
+
+@pytest.fixture
+def manager(repo_path: Path) -> ChatManager:
+    return ChatManager(repo=JsonChatRepository(repo_path))
+
+
+async def _seed(manager: ChatManager, **meta: object) -> ChatSpec:
+    spec = ChatSpec(
+        session_id="console:u1",
+        user_id="u1",
+        name="Chat",
+        meta=dict(meta),
+    )
+    return await manager.create_chat(spec)
+
+
+@pytest.mark.asyncio
+async def test_set_stores_in_controlled_namespace(manager: ChatManager):
+    chat = await _seed(manager)
+
+    updated = await manager.set_session_project_dir(chat.id, "/repos/demo")
+
+    assert updated is not None
+    assert updated.meta["runtime_context"]["project_dir"] == "/repos/demo"
+    assert session_project_dir_from_meta(updated.meta) == "/repos/demo"
+
+
+@pytest.mark.asyncio
+async def test_override_persists_across_repo_reload(
+    manager: ChatManager,
+    repo_path: Path,
+):
+    """The override must outlive the process, not just the in-memory spec."""
+    chat = await _seed(manager)
+    await manager.set_session_project_dir(chat.id, "/repos/demo")
+
+    reloaded = ChatManager(repo=JsonChatRepository(repo_path))
+    fetched = await reloaded.get_chat(chat.id)
+
+    assert fetched is not None
+    assert session_project_dir_from_meta(fetched.meta) == "/repos/demo"
+
+
+@pytest.mark.asyncio
+async def test_clear_removes_empty_namespace(manager: ChatManager):
+    chat = await _seed(manager)
+    await manager.set_session_project_dir(chat.id, "/repos/demo")
+
+    cleared = await manager.set_session_project_dir(chat.id, None)
+
+    assert cleared is not None
+    assert session_project_dir_from_meta(cleared.meta) is None
+    # No leftover scaffolding for a chat that no longer overrides anything.
+    assert "runtime_context" not in cleared.meta
+
+
+@pytest.mark.asyncio
+async def test_sibling_meta_keys_survive(manager: ChatManager):
+    """Setting/clearing must not clobber unrelated system metadata.
+
+    This is why the API has a dedicated endpoint instead of accepting a
+    whole-``meta`` patch from clients.
+    """
+    chat = await _seed(manager, some_system_key="keep-me")
+
+    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    after_set = await manager.get_chat(chat.id)
+    assert after_set is not None
+    assert after_set.meta["some_system_key"] == "keep-me"
+
+    await manager.set_session_project_dir(chat.id, None)
+    after_clear = await manager.get_chat(chat.id)
+    assert after_clear is not None
+    assert after_clear.meta["some_system_key"] == "keep-me"
+
+
+@pytest.mark.asyncio
+async def test_sibling_runtime_context_keys_survive(manager: ChatManager):
+    chat = await _seed(manager, runtime_context={"other_setting": "x"})
+
+    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    after_set = await manager.get_chat(chat.id)
+    assert after_set is not None
+    assert after_set.meta["runtime_context"]["other_setting"] == "x"
+
+    await manager.set_session_project_dir(chat.id, None)
+    after_clear = await manager.get_chat(chat.id)
+    assert after_clear is not None
+    # The namespace stays because a sibling key still lives there.
+    assert after_clear.meta["runtime_context"] == {"other_setting": "x"}
+
+
+@pytest.mark.asyncio
+async def test_unknown_chat_returns_none(manager: ChatManager):
+    assert await manager.set_session_project_dir("nope", "/repos/demo") is None
+
+
+@pytest.mark.asyncio
+async def test_set_bumps_updated_at(manager: ChatManager):
+    chat = await _seed(manager)
+
+    updated = await manager.set_session_project_dir(chat.id, "/repos/demo")
+
+    assert updated is not None
+    assert updated.updated_at >= chat.updated_at
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sets_do_not_lose_updates(manager: ChatManager):
+    """Read-modify-write happens under the lock, so nothing is dropped."""
+    chat = await _seed(manager, some_system_key="keep-me")
+
+    await asyncio.gather(
+        *(
+            manager.set_session_project_dir(chat.id, f"/repos/p{i}")
+            for i in range(10)
+        ),
+    )
+
+    final = await manager.get_chat(chat.id)
+    assert final is not None
+    # Whichever write landed last, the sibling key must not be lost and the
+    # value must be one of the ones we actually wrote (not a merge artifact).
+    assert final.meta["some_system_key"] == "keep-me"
+    assert session_project_dir_from_meta(final.meta) in {
+        f"/repos/p{i}" for i in range(10)
+    }
+
+
+@pytest.mark.asyncio
+async def test_clearing_a_never_set_override_is_safe(manager: ChatManager):
+    chat = await _seed(manager)
+
+    cleared = await manager.set_session_project_dir(chat.id, None)
+
+    assert cleared is not None
+    assert "runtime_context" not in cleared.meta
+
+
+@pytest.mark.asyncio
+async def test_blank_value_is_treated_as_clear(manager: ChatManager):
+    chat = await _seed(manager)
+    await manager.set_session_project_dir(chat.id, "/repos/demo")
+
+    cleared = await manager.set_session_project_dir(chat.id, "")
+
+    assert cleared is not None
+    assert session_project_dir_from_meta(cleared.meta) is None

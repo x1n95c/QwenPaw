@@ -65,14 +65,20 @@ def _projects_base(workspace_dir: Path) -> Path:
 
 
 def _save_project_dir(agent_id: str, project_dir: str | None) -> None:
-    """Persist coding_mode.project_dir to agent.json (sync).
+    """Persist the agent's default project dir to agent.json (sync).
+
+    Writes the mode-independent top-level ``project_dir`` and clears the
+    deprecated ``coding_mode.project_dir`` so the two can never disagree.
 
     Intended to run inside an executor thread.
     """
     from ...config.config import load_agent_config, save_agent_config
+    from ...config.project_dir import normalize_project_dir
 
     config = load_agent_config(agent_id)
-    config.coding_mode.project_dir = project_dir
+    normalized = normalize_project_dir(project_dir)
+    config.project_dir = str(normalized) if normalized else None
+    config.coding_mode.project_dir = None
     save_agent_config(config.id, config)
 
 

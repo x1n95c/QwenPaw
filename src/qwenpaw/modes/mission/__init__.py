@@ -23,6 +23,7 @@ from ...runtime.hooks import HookBase, HookContext
 from ...runtime.slash_command_registry import CommandSpec
 
 if TYPE_CHECKING:
+    from pathlib import Path
     from typing import Any
 
     from .gates import MissionGate
@@ -178,6 +179,9 @@ class MissionMode(AgentMode):
         task_text = parsed["task_text"]
 
         # --- info sub-commands ---
+        # Mission state lives in the agent workspace, so status/list scan
+        # there. Which project each mission acted on is recorded inside its
+        # own loop_config.json (``source_project_dir``).
         if task_text.strip().lower() == "status":
             workspace_dir = getattr(ctx, "workspace_dir")
             session_id = getattr(
@@ -211,11 +215,19 @@ class MissionMode(AgentMode):
 
         # --- start new mission ---
         workspace_dir = getattr(ctx, "workspace_dir")
+        project_dir = _effective_project_dir(ctx)
         agent_id = getattr(ctx, "agent_id", "")
         session_id = getattr(ctx, "session_id", "")
 
+        # Pin the project for the mission's whole life: a later session
+        # directory switch must not move a running mission's worker.
+        ctx.mode_state.setdefault("mission", {})["project_dir_pin"] = str(
+            project_dir,
+        )
+
         prompt, loop_dir = await start_mission(
             task_text=task_text,
+            project_dir=project_dir,
             workspace_dir=workspace_dir,
             agent_id=agent_id,
             session_id=session_id,
@@ -247,6 +259,30 @@ class MissionMode(AgentMode):
             return False
         # pylint: disable=protected-access
         return self._gate._state() is not None
+
+
+def _effective_project_dir(ctx: "HookContext") -> "Path":
+    """Return the project dir Mission should read/write against.
+
+    Prefers a pin already recorded for this mission (so a running mission
+    keeps its original project even if the session has since been pointed
+    elsewhere), then the per-turn resolved project dir, then the agent
+    workspace as a last resort.
+    """
+    from pathlib import Path
+
+    from ...config.context import get_current_project_dir
+
+    mode_state = getattr(ctx, "mode_state", None)
+    if isinstance(mode_state, dict):
+        pinned = (mode_state.get("mission") or {}).get("project_dir_pin")
+        if pinned:
+            return Path(pinned)
+
+    resolved = get_current_project_dir()
+    if resolved is not None:
+        return resolved
+    return Path(getattr(ctx, "workspace_dir", ".") or ".")
 
 
 def _info_msg(text: str) -> Msg:

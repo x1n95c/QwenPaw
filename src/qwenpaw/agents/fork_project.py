@@ -38,10 +38,17 @@ _WINDOWS_LOCK_CONFLICT_WINERRORS = frozenset({32, 33})
 _THREAD_LOCKS_GUARD = threading.Lock()
 _THREAD_LOCKS: dict[str, threading.Lock] = {}
 
+# All four live under the **agent workspace**. Fork bookkeeping is agent
+# state, so it stays out of the user's repository: a 100 MB checkout per
+# fork must not accumulate inside the project working tree.
+#
+# What cannot be moved: git keeps the ``fork/<id>`` ref in
+# ``<project>/.git/refs`` and the worktree admin data in
+# ``<project>/.git/worktrees/<id>``. A linked worktree is by definition a
+# worktree *of* that repository, so those two are unavoidable — only the
+# checkout directory is ours to place.
 WORKTREE_REL = Path(".qwenpaw") / "worktrees"
 REGISTRY_REL = Path(".qwenpaw") / "fork_registry.json"
-# Written in the *agent workspace* so OMP gates can find the coding-project
-# registry when ``coding_mode.project_dir != workspace_dir``.
 INTEGRATION_PROJECT_REL = Path(".qwenpaw") / "fork_integration_project"
 ACTIVE_SCOPE_REL = Path(".qwenpaw") / "fork_active_scope"
 
@@ -113,13 +120,63 @@ def resolve_allowed_fork_project_dir(
     return None
 
 
-def _registry_path_for_project(project_dir: Path) -> Path:
-    return project_dir / REGISTRY_REL
+def _registry_path_for_base(base_dir: Path) -> Path:
+    return base_dir / REGISTRY_REL
 
 
-def project_dir_from_worktree(worktree_path: Path) -> Path:
-    """``<project>/.qwenpaw/worktrees/<id>`` → ``<project>``."""
+def registry_base_from_worktree(worktree_path: Path) -> Path:
+    """``<base>/.qwenpaw/worktrees/<id>`` → ``<base>``.
+
+    *base* is the agent workspace for worktrees created by current code.
+    The arithmetic is unchanged from when worktrees lived under the
+    project, which is what makes this backward compatible: an older
+    worktree at ``<project>/.qwenpaw/worktrees/<id>`` still resolves to
+    ``<project>``, where its own registry sits. So finalize / mark-failed
+    keep working on pre-existing forks with no migration.
+
+    This is **not** the git repository root — use
+    :func:`git_root_from_worktree` for anything that runs git against the
+    project (ancestry checks, ``rev-parse <branch>``).
+    """
     return worktree_path.expanduser().resolve().parent.parent.parent
+
+
+def git_root_from_worktree(worktree_path: Path) -> Path | None:
+    """Return the main repository root that owns *worktree_path*.
+
+    Asks git rather than deriving it from the path: now that the checkout
+    lives in the agent workspace, its location says nothing about which
+    repository it belongs to.
+    """
+    wt = Path(worktree_path).expanduser().resolve()
+    common = _git_stdout(["rev-parse", "--git-common-dir"], wt)
+    if common:
+        git_dir = Path(common)
+        if not git_dir.is_absolute():
+            git_dir = (wt / git_dir).resolve()
+        return git_dir.parent
+
+    # Fallback for a git too old for --git-common-dir, or a broken PATH:
+    # a linked worktree's `.git` is a file pointing at
+    # ``<project>/.git/worktrees/<id>``.
+    dot_git = wt / ".git"
+    try:
+        if dot_git.is_file():
+            content = dot_git.read_text(encoding="utf-8").strip()
+            if content.startswith("gitdir:"):
+                pointer = Path(content.split(":", 1)[1].strip())
+                if not pointer.is_absolute():
+                    pointer = (wt / pointer).resolve()
+                # <project>/.git/worktrees/<id> → <project>
+                return pointer.parent.parent.parent
+    except OSError:
+        pass
+    logger.warning("Could not resolve the git root for worktree %s", wt)
+    return None
+
+
+# Back-compat alias for out-of-tree importers (see __all__).
+project_dir_from_worktree = registry_base_from_worktree
 
 
 def _thread_lock_for(lock_path: Path) -> threading.Lock:
@@ -263,9 +320,9 @@ def _exclusive_file_lock(
 
 
 @contextmanager
-def _registry_lock(project_dir: Path) -> Iterator[None]:
+def _registry_lock(registry_base: Path) -> Iterator[None]:
     """Exclusive lock around registry read-modify-write."""
-    lock_path = _registry_path_for_project(project_dir).with_suffix(
+    lock_path = _registry_path_for_base(registry_base).with_suffix(
         ".json.lock",
     )
     # Dedicated lock file so Windows can replace the JSON atomically.
@@ -275,14 +332,14 @@ def _registry_lock(project_dir: Path) -> Iterator[None]:
         yield
 
 
-def _fork_finalize_lock_path(project_dir: Path, branch: str) -> Path:
+def _fork_finalize_lock_path(registry_base: Path, branch: str) -> Path:
     digest = hashlib.sha256(branch.encode("utf-8")).hexdigest()[:24]
-    return project_dir / ".qwenpaw" / "fork_locks" / f"{digest}.lock"
+    return registry_base / ".qwenpaw" / "fork_locks" / f"{digest}.lock"
 
 
 @contextmanager
 def _fork_finalize_lock(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     *,
     blocking: bool = True,
@@ -294,7 +351,7 @@ def _fork_finalize_lock(
     A crashed owner releases the OS lock automatically.
     """
     with _exclusive_file_lock(
-        _fork_finalize_lock_path(project_dir, branch),
+        _fork_finalize_lock_path(registry_base, branch),
         blocking=blocking,
     ) as acquired:
         yield acquired
@@ -334,7 +391,7 @@ def resolve_git_project_dir(
     - When *workspace_dir* is provided without an explicit *agent_id*, only
       that path is considered (no implicit active-agent fallback).
     - When *agent_id* is provided, priority is:
-      ``coding_mode.project_dir`` → agent ``workspace_dir`` → *workspace_dir*.
+      agent ``project_dir`` → agent ``workspace_dir`` → *workspace_dir*.
     - When *workspace_dir* is omitted, fall back to the active agent config.
 
     Returns None when no git repository is found.
@@ -354,11 +411,15 @@ def resolve_git_project_dir(
         try:
             from ..config.config import load_agent_config
 
+            from ..config.project_dir import agent_project_dir_from_config
+
             cfg = load_agent_config(aid)
-            cm = getattr(cfg, "coding_mode", None)
-            if cm and getattr(cm, "enabled", False) and cm.project_dir:
+            # Mode-independent: a configured project dir counts even when
+            # Coding Mode is off, so normal-mode forks bind to the project.
+            configured = agent_project_dir_from_config(cfg)
+            if configured:
                 candidates.append(
-                    Path(cm.project_dir).expanduser().resolve(),
+                    Path(configured).expanduser().resolve(),
                 )
             if getattr(cfg, "workspace_dir", None):
                 candidates.append(
@@ -540,8 +601,8 @@ def get_active_fork_scope(workspace_dir: str | Path | None) -> str:
     return _read_active_scope(ws)
 
 
-def _read_registry_unlocked(project_dir: Path) -> dict[str, Any]:
-    path = _registry_path_for_project(project_dir)
+def _read_registry_unlocked(registry_base: Path) -> dict[str, Any]:
+    path = _registry_path_for_base(registry_base)
     if not path.is_file():
         return {"forks": {}, "by_task": {}}
     try:
@@ -558,8 +619,11 @@ def _read_registry_unlocked(project_dir: Path) -> dict[str, Any]:
     return data
 
 
-def _write_registry_unlocked(project_dir: Path, data: dict[str, Any]) -> None:
-    path = _registry_path_for_project(project_dir)
+def _write_registry_unlocked(
+    registry_base: Path,
+    data: dict[str, Any],
+) -> None:
+    path = _registry_path_for_base(registry_base)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(".tmp")
     tmp.write_text(
@@ -708,8 +772,13 @@ def register_fork(
             wt,
         )
         return False
-    project_dir = project_dir_from_worktree(wt)
-    bind_workspace_integration_project(workspace_dir, project_dir)
+    # Two different directories, deliberately: the registry base is where
+    # our bookkeeping lives (the agent workspace), while the git root is the
+    # repository the branch belongs to. Gates need the latter.
+    registry_base = registry_base_from_worktree(wt)
+    git_root = git_root_from_worktree(wt)
+    if git_root is not None:
+        bind_workspace_integration_project(workspace_dir, git_root)
     try:
         ws = Path(workspace_dir).expanduser().resolve()
         pointer = ws / INTEGRATION_PROJECT_REL
@@ -733,8 +802,8 @@ def register_fork(
     if not scope_id:
         scope_id = get_active_fork_scope(workspace_dir)
     base = _git_stdout(["rev-parse", "HEAD"], wt) or ""
-    with _registry_lock(project_dir):
-        data = _read_registry_unlocked(project_dir)
+    with _registry_lock(registry_base):
+        data = _read_registry_unlocked(registry_base)
         forks = data.setdefault("forks", {})
         # Drop leftovers from prior scopes so they cannot linger as active.
         if scope_id:
@@ -753,7 +822,11 @@ def register_fork(
         forks[branch] = {
             "worktree": str(wt),
             "branch": branch,
-            "project_dir": str(project_dir),
+            # The repository that owns `branch`. Recorded so a gate can run
+            # ancestry checks without re-deriving it from the worktree path,
+            # which no longer implies the project. Empty when git could not
+            # be reached; gates then fall back to their own resolution.
+            "git_root": str(git_root) if git_root else "",
             "base": base,
             "head": base,
             "session_id": session_id,
@@ -776,7 +849,7 @@ def register_fork(
                     and str(info.get("branch") or "") == branch
                 )
             }
-        _write_registry_unlocked(project_dir, data)
+        _write_registry_unlocked(registry_base, data)
     return True
 
 
@@ -812,9 +885,9 @@ def bind_fork_task(
     wt = Path(worktree_path).expanduser().resolve()
     if not wt.is_dir():
         return False
-    project_dir = project_dir_from_worktree(wt)
-    with _registry_lock(project_dir):
-        data = _read_registry_unlocked(project_dir)
+    registry_base = registry_base_from_worktree(wt)
+    with _registry_lock(registry_base):
+        data = _read_registry_unlocked(registry_base)
         forks = data.setdefault("forks", {})
         meta = forks.get(branch)
         if not isinstance(meta, dict):
@@ -845,15 +918,15 @@ def bind_fork_task(
             by_task[task_id] = {
                 "branch": branch,
                 "worktree": str(wt),
-                "project_dir": str(project_dir),
+                "registry_base": str(registry_base),
                 "scope_id": row_scope,
             }
-        _write_registry_unlocked(project_dir, data)
+        _write_registry_unlocked(registry_base, data)
     return True
 
 
 def _mark_fork_failed_unlocked(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     *,
     reason: str = "",
@@ -865,7 +938,7 @@ def _mark_fork_failed_unlocked(
     ``finalizing`` for that exact scope so a newer workflow that reused the
     branch cannot be poisoned by a stale worker.
     """
-    data = _read_registry_unlocked(project_dir)
+    data = _read_registry_unlocked(registry_base)
     forks = data.setdefault("forks", {})
     meta = forks.get(branch)
     if not isinstance(meta, dict):
@@ -888,7 +961,7 @@ def _mark_fork_failed_unlocked(
     if reason:
         meta["fail_reason"] = reason[:500]
     forks[branch] = meta
-    _write_registry_unlocked(project_dir, data)
+    _write_registry_unlocked(registry_base, data)
 
 
 def mark_fork_failed(
@@ -916,15 +989,15 @@ def mark_fork_failed(
         return
     try:
         wt = Path(worktree_path).expanduser().resolve()
-        project_dir = project_dir_from_worktree(wt)
+        registry_base = registry_base_from_worktree(wt)
     except OSError:
         return
-    with _fork_finalize_lock(project_dir, branch, blocking=True) as acquired:
+    with _fork_finalize_lock(registry_base, branch, blocking=True) as acquired:
         if not acquired:
             return
         recovery_scope = ""
-        with _registry_lock(project_dir):
-            status, meta = _fork_status_unlocked(project_dir, branch)
+        with _registry_lock(registry_base):
+            status, meta = _fork_status_unlocked(registry_base, branch)
             if status in (
                 _STATUS_SUPERSEDED,
                 _STATUS_MERGED,
@@ -947,7 +1020,7 @@ def mark_fork_failed(
                 recovery_scope = expected_scope or ""
             else:
                 _mark_fork_failed_unlocked(
-                    project_dir,
+                    registry_base,
                     branch,
                     reason=reason,
                     expected_scope=expected_scope,
@@ -957,7 +1030,7 @@ def mark_fork_failed(
         # Crash recovery under per-branch lock; Git outside registry lock.
         outcome, head = _inspect_worktree_recovery(wt)
         recovered = _apply_crash_recovery(
-            project_dir,
+            registry_base,
             branch,
             wt,
             expected_scope=recovery_scope,
@@ -976,9 +1049,9 @@ def mark_fork_failed(
         # Dirty leftover — caller asked to fail; record failed now.
         # Re-check scope under the registry lock so a newer workflow that
         # reused this branch is not marked failed by a stale worker.
-        with _registry_lock(project_dir):
+        with _registry_lock(registry_base):
             _mark_fork_failed_unlocked(
-                project_dir,
+                registry_base,
                 branch,
                 reason=reason or "dirty worktree after crashed finalize",
                 expected_scope=recovery_scope,
@@ -994,18 +1067,25 @@ def mark_fork_failed_for_task(
     """Mark the fork bound to *task_id* as failed, if any."""
     if not task_id:
         return
-    project = resolve_integration_project_dir(workspace_dir)
-    if project is None:
-        return
-    with _registry_lock(project):
-        data = _read_registry_unlocked(project)
-        by_task = data.get("by_task") or {}
-        info = by_task.get(task_id) if isinstance(by_task, dict) else None
-        if not isinstance(info, dict):
-            return
-        branch = str(info.get("branch") or "")
-        wt = str(info.get("worktree") or "")
-        scope_id = str(info.get("scope_id") or "")
+    # Records live in the workspace; the integration project is still
+    # consulted for bindings written before the move.
+    roots = _registry_bases(
+        resolve_integration_project_dir(workspace_dir),
+        workspace_dir,
+    )
+    branch = wt = scope_id = ""
+    for root in roots:
+        with _registry_lock(root):
+            data = _read_registry_unlocked(root)
+            by_task = data.get("by_task") or {}
+            info = by_task.get(task_id) if isinstance(by_task, dict) else None
+            if not isinstance(info, dict):
+                continue
+            branch = str(info.get("branch") or "")
+            wt = str(info.get("worktree") or "")
+            scope_id = str(info.get("scope_id") or "")
+        if branch and wt:
+            break
     if branch and wt:
         mark_fork_failed(
             wt,
@@ -1034,9 +1114,9 @@ def update_fork_head(
     head = _git_stdout(["rev-parse", "HEAD"], wt)
     if not head:
         return None
-    project_dir = project_dir_from_worktree(wt)
-    with _registry_lock(project_dir):
-        data = _read_registry_unlocked(project_dir)
+    registry_base = registry_base_from_worktree(wt)
+    with _registry_lock(registry_base):
+        data = _read_registry_unlocked(registry_base)
         forks = data.setdefault("forks", {})
         meta = forks.get(branch)
         if not isinstance(meta, dict):
@@ -1056,7 +1136,7 @@ def update_fork_head(
         meta["head"] = head
         meta["worktree"] = str(wt)
         forks[branch] = meta
-        _write_registry_unlocked(project_dir, data)
+        _write_registry_unlocked(registry_base, data)
     return head
 
 
@@ -1114,10 +1194,10 @@ def commit_dirty_worktree(
 
 
 def _fork_status_unlocked(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
 ) -> tuple[str | None, dict[str, Any] | None]:
-    data = _read_registry_unlocked(project_dir)
+    data = _read_registry_unlocked(registry_base)
     forks = data.get("forks") or {}
     meta = forks.get(branch) if isinstance(forks, dict) else None
     if not isinstance(meta, dict):
@@ -1126,14 +1206,14 @@ def _fork_status_unlocked(
 
 
 def _write_finalized_unlocked(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     wt: Path,
     *,
     head: str,
 ) -> bool:
     """Mark *branch* finalized under the registry lock."""
-    data = _read_registry_unlocked(project_dir)
+    data = _read_registry_unlocked(registry_base)
     forks = data.setdefault("forks", {})
     meta = forks.get(branch)
     if not isinstance(meta, dict):
@@ -1150,7 +1230,7 @@ def _write_finalized_unlocked(
     meta["no_changes"] = bool(head) and head == base
     meta["status"] = _STATUS_FINALIZED
     forks[branch] = meta
-    _write_registry_unlocked(project_dir, data)
+    _write_registry_unlocked(registry_base, data)
     return True
 
 
@@ -1170,7 +1250,7 @@ def _inspect_worktree_recovery(wt: Path) -> tuple[str, str]:
 
 
 def _begin_finalize_unlocked(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     wt: Path,
     *,
@@ -1185,7 +1265,7 @@ def _begin_finalize_unlocked(
     so a stale worker cannot claim a newer scope that reused the branch.
     """
     # pylint: disable=too-many-return-statements
-    status, meta = _fork_status_unlocked(project_dir, branch)
+    status, meta = _fork_status_unlocked(registry_base, branch)
     if meta is None:
         return "skip", ""
     row_scope = str(meta.get("scope_id") or "")
@@ -1202,7 +1282,7 @@ def _begin_finalize_unlocked(
         return "skip", ""
     if status == _STATUS_FINALIZING:
         return "recover", row_scope
-    data = _read_registry_unlocked(project_dir)
+    data = _read_registry_unlocked(registry_base)
     forks = data.setdefault("forks", {})
     row = forks.get(branch)
     if not isinstance(row, dict):
@@ -1210,12 +1290,12 @@ def _begin_finalize_unlocked(
     row["status"] = _STATUS_FINALIZING
     row["worktree"] = str(wt)
     forks[branch] = row
-    _write_registry_unlocked(project_dir, data)
+    _write_registry_unlocked(registry_base, data)
     return "run", row_scope
 
 
 def _apply_crash_recovery(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     wt: Path,
     *,
@@ -1236,8 +1316,8 @@ def _apply_crash_recovery(
     ``finalized``/``no_changes``.
     """
     # pylint: disable=too-many-return-statements
-    with _registry_lock(project_dir):
-        status, meta = _fork_status_unlocked(project_dir, branch)
+    with _registry_lock(registry_base):
+        status, meta = _fork_status_unlocked(registry_base, branch)
         if status in (_STATUS_FINALIZED, _STATUS_MERGED):
             if meta is None:
                 return False
@@ -1251,7 +1331,7 @@ def _apply_crash_recovery(
             return False
         if outcome == "unreadable":
             _mark_fork_failed_unlocked(
-                project_dir,
+                registry_base,
                 branch,
                 reason=fail_reason or "git unreadable after crashed finalize",
                 expected_scope=expected_scope,
@@ -1261,7 +1341,7 @@ def _apply_crash_recovery(
             base = str(meta.get("base") or "")
             if not allow_clean_no_changes and (not head or head == base):
                 _mark_fork_failed_unlocked(
-                    project_dir,
+                    registry_base,
                     branch,
                     reason=fail_reason
                     or "no commit evidence after crashed finalize",
@@ -1269,7 +1349,7 @@ def _apply_crash_recovery(
                 )
                 return False
             return _write_finalized_unlocked(
-                project_dir,
+                registry_base,
                 branch,
                 wt,
                 head=head,
@@ -1278,7 +1358,7 @@ def _apply_crash_recovery(
 
 
 def _finish_finalize_unlocked(
-    project_dir: Path,
+    registry_base: Path,
     branch: str,
     wt: Path,
     *,
@@ -1288,7 +1368,7 @@ def _finish_finalize_unlocked(
 ) -> bool:
     """Persist finalize result under registry lock."""
     # pylint: disable=too-many-return-statements
-    status, meta = _fork_status_unlocked(project_dir, branch)
+    status, meta = _fork_status_unlocked(registry_base, branch)
     if status in (_STATUS_FINALIZED, _STATUS_MERGED):
         if meta is None:
             return False
@@ -1304,16 +1384,16 @@ def _finish_finalize_unlocked(
     if str(meta.get("scope_id") or "") != expected_scope:
         return False
     if not ok:
-        data = _read_registry_unlocked(project_dir)
+        data = _read_registry_unlocked(registry_base)
         forks = data.setdefault("forks", {})
         row = forks.get(branch)
         if isinstance(row, dict):
             row["status"] = _STATUS_PENDING
             forks[branch] = row
-            _write_registry_unlocked(project_dir, data)
+            _write_registry_unlocked(registry_base, data)
         return False
     return _write_finalized_unlocked(
-        project_dir,
+        registry_base,
         branch,
         wt,
         head=head,
@@ -1349,15 +1429,15 @@ def finalize_fork_worktree(
     wt = Path(worktree_path).expanduser().resolve()
     if not wt.is_dir():
         return False
-    project_dir = project_dir_from_worktree(wt)
+    registry_base = registry_base_from_worktree(wt)
 
-    with _fork_finalize_lock(project_dir, branch, blocking=True) as acquired:
+    with _fork_finalize_lock(registry_base, branch, blocking=True) as acquired:
         if not acquired:
             return False
 
-        with _registry_lock(project_dir):
+        with _registry_lock(registry_base):
             action, row_scope = _begin_finalize_unlocked(
-                project_dir,
+                registry_base,
                 branch,
                 wt,
                 expected_scope=expected_scope,
@@ -1374,7 +1454,7 @@ def finalize_fork_worktree(
             # Git I/O under per-branch lock only — do not hold registry lock.
             outcome, recovered_head = _inspect_worktree_recovery(wt)
             recovered = _apply_crash_recovery(
-                project_dir,
+                registry_base,
                 branch,
                 wt,
                 expected_scope=row_scope,
@@ -1389,9 +1469,9 @@ def finalize_fork_worktree(
             message or f"fork worker {branch}",
         )
         head = _git_stdout(["rev-parse", "HEAD"], wt) or ""
-        with _registry_lock(project_dir):
+        with _registry_lock(registry_base):
             return _finish_finalize_unlocked(
-                project_dir,
+                registry_base,
                 branch,
                 wt,
                 expected_scope=row_scope,
@@ -1435,11 +1515,11 @@ def finalize_fork_worktree_or_fail(
     # when the finalized row still belongs to our scope.
     try:
         wt = Path(worktree_path).expanduser().resolve()
-        project_dir = project_dir_from_worktree(wt)
+        registry_base = registry_base_from_worktree(wt)
     except OSError:
         return False
-    with _registry_lock(project_dir):
-        status, meta = _fork_status_unlocked(project_dir, branch)
+    with _registry_lock(registry_base):
+        status, meta = _fork_status_unlocked(registry_base, branch)
     if status not in (_STATUS_FINALIZED, _STATUS_MERGED):
         return False
     if expected_scope is not None and isinstance(meta, dict):
@@ -1462,11 +1542,11 @@ def finalize_fork_for_task(
     """
     if not task_id:
         return False
-    roots: list[Path] = []
-    if project_dir is not None:
-        roots.append(Path(project_dir).expanduser().resolve())
+    # The workspace first (where records are written now), then the project
+    # and the integration pointer for forks registered before the move.
+    roots = _registry_bases(project_dir, workspace_dir)
     resolved = resolve_integration_project_dir(workspace_dir)
-    if resolved is not None:
+    if resolved is not None and resolved not in roots:
         roots.append(resolved)
     seen: set[Path] = set()
     for root in roots:
@@ -1545,8 +1625,13 @@ def forks_merged_into_head(
     project_dir: Path | str | None,
     *,
     scope_id: str | None = None,
+    workspace_dir: Path | str | None = None,
 ) -> bool:
     """Return True when every fork in scope is integrated into HEAD.
+
+    *workspace_dir* is where fork records live; *project_dir* is the
+    repository their branches must be merged into. Both registry locations
+    are checked (see :func:`_registry_bases`) and **every** one must pass.
 
     - Any ``failed`` entry in the current scope blocks completion (failed
       workers must not disappear into an empty-active pass).
@@ -1559,9 +1644,46 @@ def forks_merged_into_head(
     ``register_fork`` cannot fail-open the merge gate.
     """
     # pylint: disable=too-many-return-statements,too-many-branches
-    if project_dir is None:
+    bases = _registry_bases(project_dir, workspace_dir)
+    if not bases:
         return False
-    root = Path(project_dir).expanduser().resolve()
+    return all(
+        _base_forks_merged(root, project_dir, scope_id) for root in bases
+    )
+
+
+def _fork_git_root(
+    meta: dict[str, Any],
+    wt: Path | None,
+    fallback: Path | str | None,
+) -> Path | None:
+    """Resolve the repository whose HEAD a fork must be merged into.
+
+    Recorded at registration; re-derived from the worktree for rows written
+    before that field existed; the caller's project dir last.
+    """
+    recorded = meta.get("git_root")
+    if isinstance(recorded, str) and recorded.strip():
+        return Path(recorded)
+    if wt is not None and wt.is_dir():
+        derived = git_root_from_worktree(wt)
+        if derived is not None:
+            return derived
+    if fallback is None:
+        return None
+    try:
+        return Path(fallback).expanduser().resolve()
+    except OSError:
+        return None
+
+
+def _base_forks_merged(
+    root: Path,
+    project_dir: Path | str | None,
+    scope_id: str | None,
+) -> bool:
+    """Run the merge gate against the registry stored under *root*."""
+    # pylint: disable=too-many-return-statements,too-many-branches
     with _registry_lock(root):
         data = _read_registry_unlocked(root)
         forks = dict(data.get("forks") or {})
@@ -1585,7 +1707,12 @@ def forks_merged_into_head(
                 porcelain = _git_stdout(["status", "--porcelain"], wt)
                 if porcelain:
                     return False
-        tip = _git_stdout(["rev-parse", branch], root)
+        # Git runs against the *repository*, which since the workspace move
+        # is no longer derivable from where the checkout sits.
+        git_root = _fork_git_root(meta, wt, project_dir)
+        if git_root is None:
+            return False
+        tip = _git_stdout(["rev-parse", branch], git_root)
         if tip is None and wt is not None and wt.is_dir():
             tip = _git_stdout(["rev-parse", "HEAD"], wt)
         if not tip:
@@ -1594,7 +1721,7 @@ def forks_merged_into_head(
         no_changes = meta.get("no_changes") is True
         if tip == base and not no_changes:
             return False
-        if not _is_ancestor(root, tip):
+        if not _is_ancestor(git_root, tip):
             return False
         newly_merged.append(branch)
 
@@ -1632,27 +1759,53 @@ def forks_merged_into_head(
     return True
 
 
+def _registry_bases(
+    project_dir: Path | str | None,
+    workspace_dir: Path | str | None,
+) -> list[Path]:
+    """Return every place a gate must look for fork records.
+
+    The workspace is where current code writes. The project is where code
+    before the workspace move wrote, and it is checked too so a leftover
+    unmerged fork keeps the gate **closed** rather than becoming invisible
+    — failing open here would silently drop a worker's commits.
+    """
+    bases: list[Path] = []
+    for raw in (workspace_dir, project_dir):
+        if raw is None:
+            continue
+        try:
+            resolved = Path(raw).expanduser().resolve()
+        except OSError:
+            continue
+        if resolved not in bases:
+            bases.append(resolved)
+    return bases
+
+
 def has_registered_forks(
     project_dir: Path | str | None,
     *,
     scope_id: str | None = None,
+    workspace_dir: Path | str | None = None,
 ) -> bool:
-    """Return True when active (pending/finalized) forks exist."""
-    if project_dir is None:
-        return False
-    root = Path(project_dir).expanduser().resolve()
-    with _registry_lock(root):
-        data = _read_registry_unlocked(root)
-        forks = data.get("forks") or {}
-    for meta in forks.values():
-        if not isinstance(meta, dict):
-            continue
-        status = str(meta.get("status") or _STATUS_PENDING)
-        if status not in _ACTIVE_STATUSES:
-            continue
-        if scope_id and str(meta.get("scope_id") or "") != scope_id:
-            continue
-        return True
+    """Return True when active (pending/finalized) forks exist.
+
+    Checks the agent workspace and, for compatibility, the project.
+    """
+    for root in _registry_bases(project_dir, workspace_dir):
+        with _registry_lock(root):
+            data = _read_registry_unlocked(root)
+            forks = data.get("forks") or {}
+        for meta in forks.values():
+            if not isinstance(meta, dict):
+                continue
+            status = str(meta.get("status") or _STATUS_PENDING)
+            if status not in _ACTIVE_STATUSES:
+                continue
+            if scope_id and str(meta.get("scope_id") or "") != scope_id:
+                continue
+            return True
     return False
 
 
@@ -1663,6 +1816,11 @@ __all__ = [
     "ACTIVE_SCOPE_REL",
     "FORK_WORKER_COMMIT_PROTOCOL",
     "resolve_allowed_fork_project_dir",
+    "registry_base_from_worktree",
+    "git_root_from_worktree",
+    # Pre-workspace-move name for registry_base_from_worktree. Kept so an
+    # out-of-tree plugin importing it does not break; the returned value is
+    # the registry base, which for an old worktree is still the project.
     "project_dir_from_worktree",
     "bind_workspace_integration_project",
     "resolve_git_project_dir",

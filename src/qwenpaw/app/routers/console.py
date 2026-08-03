@@ -516,6 +516,73 @@ async def get_inbox_trace(run_id: str):
 # ── Background chat task endpoints ──
 
 
+def _read_request_context(request_data: Any) -> Dict[str, Any]:
+    """Pull ``request_context`` off either a model or a raw dict payload."""
+    if isinstance(request_data, dict):
+        rc = request_data.get("request_context")
+    else:
+        rc = getattr(request_data, "request_context", None)
+    return rc if isinstance(rc, dict) else {}
+
+
+async def _persist_pending_project_dir(
+    workspace: Any,
+    chat: Any,
+    request_data: Any,
+) -> None:
+    """Bind a pending project dir sent with a new chat's first message.
+
+    The console can only offer a directory picker *before* a chat exists, so
+    the choice arrives as ``request_context.pending_project_dir``. The path
+    is validated here rather than trusted: it comes from a client, and a
+    bad value would otherwise be written into the chat and silently steer
+    every later turn.
+
+    Never overwrites an existing session override — a chat that already has
+    one is not a new chat, and clobbering it would lose the user's setting.
+    """
+    pending = _read_request_context(request_data).get("pending_project_dir")
+    if not isinstance(pending, str) or not pending.strip():
+        return
+    if chat is None:
+        return
+
+    from ...config.project_dir import (
+        normalize_project_dir,
+        session_project_dir_from_meta,
+    )
+
+    if session_project_dir_from_meta(getattr(chat, "meta", None)):
+        return
+
+    normalized = normalize_project_dir(pending)
+    if normalized is None or not normalized.is_dir():
+        logger.warning(
+            "Ignoring pending_project_dir that is not a directory: %s",
+            sanitize_log_value(pending),
+        )
+        return
+
+    try:
+        await workspace.chat_manager.set_session_project_dir(
+            chat.id,
+            str(normalized),
+        )
+        logger.info(
+            "Bound new chat %s to project dir %s",
+            chat.id,
+            sanitize_log_value(str(normalized)),
+        )
+    except Exception:  # pylint: disable=broad-except
+        # A failure here must not block the message the user just sent;
+        # the turn falls back to the agent default.
+        logger.warning(
+            "Could not persist pending_project_dir for chat %s",
+            chat.id,
+            exc_info=True,
+        )
+
+
 def _parse_sse_payload(line: str) -> Optional[Dict[str, Any]]:
     """Parse a single SSE data line into a dict."""
     stripped = line.strip()
@@ -556,12 +623,18 @@ async def post_console_chat_task(  # pylint: disable=too-many-statements
         channel_meta=native_payload["meta"],
     )
     name, _ = _extract_placeholder_name(native_payload["content_parts"])
-    await workspace.chat_manager.get_or_create_chat(
+    chat = await workspace.chat_manager.get_or_create_chat(
         session_id,
         native_payload["sender_id"],
         native_payload["channel_id"],
         name=name,
     )
+    # A brand-new chat has no id until the line above creates it, so the
+    # console cannot bind a project directory before its first message.
+    # It instead sends the pending choice in request_context; persist it
+    # here — after the chat exists, before the turn starts — so the very
+    # first turn already runs in the directory the user picked.
+    await _persist_pending_project_dir(workspace, chat, request_data)
 
     task_timeout: Optional[float] = None
     fork_project_dir = ""

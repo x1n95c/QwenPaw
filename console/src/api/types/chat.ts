@@ -36,6 +36,30 @@ export interface ChatDeleteResponse {
   chat_id: string;
 }
 
+/** Where a chat's project directory comes from, highest precedence first. */
+export type ProjectDirSource =
+  | "fork"
+  | "mode"
+  | "request"
+  | "session"
+  | "agent"
+  | "workspace_fallback";
+
+/** A chat's effective project directory, plus its provenance. */
+export interface ChatProjectDir {
+  /** The directory relative paths and shell commands resolve from. */
+  project_dir: string;
+  /** "session" = this chat overrides; "agent" = inherited. */
+  source: ProjectDirSource;
+  /** The agent-level default, for showing what would be inherited. */
+  agent_project_dir?: string | null;
+  /**
+   * False when the configured path is missing. Surface this as an
+   * "unavailable" state — do NOT silently fall back to another directory.
+   */
+  exists: boolean;
+}
+
 export interface BatchArchiveResult {
   succeeded: string[];
   failed: Array<{

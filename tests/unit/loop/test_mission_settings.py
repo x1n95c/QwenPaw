@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import AsyncMock, patch
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -90,7 +92,8 @@ async def test_start_mission_persists_editable_defaults(tmp_path) -> None:
     ):
         _, loop_dir = await start_mission(
             task_text="Implement the approved feature",
-            workspace_dir=tmp_path,
+            project_dir=tmp_path,
+            workspace_dir=tmp_path / "workspace",
             agent_id="agent",
             session_id="session",
             verify_commands="pytest -q",
@@ -106,3 +109,14 @@ async def test_start_mission_persists_editable_defaults(tmp_path) -> None:
     assert config["verification_instructions"] == (
         "Check accessibility manually."
     )
+
+    # State lives in the agent workspace: a mission must leave no trace in
+    # the user's repository.
+    assert loop_dir.is_relative_to(tmp_path / "workspace" / "missions")
+    assert not loop_dir.is_relative_to(tmp_path / ".qwenpaw")
+    # ...but the mission still *works* in the project, and records which one.
+    assert config["source_project_dir"] == str(tmp_path)
+    assert config["mission_run_dir"] == str(tmp_path)
+    # Absolute, because the state dir is not under the project.
+    assert Path(config["mission_state_dir"]).is_absolute()
+    assert Path(config["mission_state_dir"]) == loop_dir

@@ -16,10 +16,9 @@ from .utils import (
     TRUNCATION_METADATA_KEY,
 )
 from ...config.context import (
-    get_current_workspace_dir,
+    get_tool_base_dir,
     get_current_recent_max_bytes,
 )
-from ...constant import WORKING_DIR
 from ...runtime.tool_registry import tool_descriptor
 from ...utils.io_utils import (
     append_text_async,
@@ -50,8 +49,14 @@ def _path_to_file_url(path: str) -> str:
 
 
 def _resolve_file_path(file_path: str) -> str:
-    """Resolve file path: use absolute path as-is,
-    resolve relative path from current workspace or WORKING_DIR.
+    """Resolve file path: use absolute path as-is, resolve relative paths
+    from the effective **project** directory.
+
+    Relative paths intentionally resolve from the project dir, not the
+    agent workspace, so a plain ``read_file("src/main.py")`` reaches the
+    user's repository in every mode. ``get_tool_base_dir()`` falls back to
+    the workspace when no project dir is configured, preserving the old
+    behaviour for agents that never set one.
 
     Args:
         file_path: The input file path (absolute or relative).
@@ -62,10 +67,7 @@ def _resolve_file_path(file_path: str) -> str:
     path = Path(file_path).expanduser()
     if path.is_absolute():
         return str(path)
-    else:
-        # Use current workspace_dir from context, fallback to WORKING_DIR
-        workspace_dir = get_current_workspace_dir() or WORKING_DIR
-        return str(workspace_dir / file_path)
+    return str(get_tool_base_dir() / file_path)
 
 
 def _get_encoding_for_file(file_path: str) -> str:
@@ -108,7 +110,7 @@ async def read_file(  # pylint: disable=too-many-return-statements
     start_line: Optional[int] = None,
     end_line: Optional[int] = None,
 ) -> ToolChunk:
-    """Read a file. Relative paths resolve from WORKING_DIR.
+    """Read a file. Relative paths resolve from the project directory.
 
     Use start_line/end_line to read a specific line range (output includes
     line numbers). Omit both to read the full file.
@@ -273,7 +275,8 @@ async def write_file(
     file_path: str,
     content: str,
 ) -> ToolChunk:
-    """Create or overwrite a file. Relative paths resolve from WORKING_DIR.
+    """Create or overwrite a file. Relative paths resolve from the
+    project directory.
 
     Args:
         file_path (`str`):
@@ -344,7 +347,8 @@ async def edit_file(
     new_text: str,
 ) -> ToolChunk:
     """Find-and-replace text in a file. All occurrences of old_text are
-    replaced with new_text. Relative paths resolve from WORKING_DIR.
+    replaced with new_text. Relative paths resolve from the project
+    directory.
 
     Args:
         file_path (`str`):
@@ -472,7 +476,7 @@ async def append_file(
     content: str,
 ) -> ToolChunk:
     """Append content to the end of a file. Relative paths resolve from
-    WORKING_DIR.
+    the project directory.
 
     Args:
         file_path (`str`):

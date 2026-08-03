@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from agentscope.message import Msg
 from agentscope.state import AgentState
@@ -338,6 +338,148 @@ async def update_chat(
             detail=f"Chat not found: {chat_id}",
         )
     return updated
+
+
+class ProjectDirRequest(BaseModel):
+    """Payload for setting a chat's project-directory override."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_dir: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute path to use for this chat",
+    )
+
+
+class ProjectDirResponse(BaseModel):
+    """Effective project directory for a chat, plus where it came from."""
+
+    project_dir: str = Field(description="Effective project directory")
+    source: str = Field(
+        description=(
+            "Provenance: 'session' (this chat overrides), 'agent' (agent "
+            "default), or 'workspace_fallback' (nothing configured)"
+        ),
+    )
+    agent_project_dir: Optional[str] = Field(
+        default=None,
+        description="The agent-level default, for showing inheritance",
+    )
+    exists: bool = Field(
+        description=(
+            "Whether the path exists. False is surfaced rather than "
+            "silently corrected so the UI can flag it as unavailable."
+        ),
+    )
+
+
+async def _resolve_chat_project_dir(
+    request: Request,
+    chat_id: str,
+    mgr: ChatManager,
+) -> ProjectDirResponse:
+    """Build the project-dir view for one chat."""
+    from ...config.config import load_agent_config
+    from ...config.project_dir import (
+        agent_project_dir_from_config,
+        resolve_effective_project_dir,
+        session_project_dir_from_meta,
+    )
+
+    chat = await mgr.get_chat(chat_id)
+    if chat is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chat not found: {chat_id}",
+        )
+
+    workspace = await get_workspace(request)
+    agent_project_dir = None
+    try:
+        agent_project_dir = agent_project_dir_from_config(
+            load_agent_config(workspace.agent_id),
+        )
+    except Exception:
+        logger.debug("Could not load agent config", exc_info=True)
+
+    resolved = resolve_effective_project_dir(
+        workspace_dir=workspace.workspace_dir,
+        agent_project_dir=agent_project_dir,
+        session_project_dir=session_project_dir_from_meta(chat.meta),
+    )
+    return ProjectDirResponse(
+        project_dir=str(resolved.path),
+        source=resolved.source,
+        agent_project_dir=agent_project_dir,
+        exists=resolved.exists,
+    )
+
+
+@router.get("/{chat_id}/project-dir", response_model=ProjectDirResponse)
+async def get_chat_project_dir(
+    request: Request,
+    chat_id: str,
+    mgr: ChatManager = Depends(get_chat_manager),
+):
+    """Return this chat's effective project directory and its provenance."""
+    return await _resolve_chat_project_dir(request, chat_id, mgr)
+
+
+@router.put("/{chat_id}/project-dir", response_model=ProjectDirResponse)
+async def set_chat_project_dir(
+    request: Request,
+    chat_id: str,
+    payload: ProjectDirRequest,
+    mgr: ChatManager = Depends(get_chat_manager),
+):
+    """Bind this chat to a project directory.
+
+    The override is persisted server-side, so it survives a page reload or
+    a different browser. It takes effect on the **next** turn — an
+    in-flight turn keeps the directory it started with.
+
+    A path that does not exist is rejected here (rather than stored and
+    flagged) because this endpoint is the point where the user picks it and
+    can still correct the mistake.
+    """
+    from ...config.project_dir import normalize_project_dir
+
+    normalized = normalize_project_dir(payload.project_dir)
+    if normalized is None:
+        raise HTTPException(
+            status_code=422,
+            detail="project_dir must not be blank",
+        )
+    if not normalized.is_dir():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not a directory: {normalized}",
+        )
+
+    updated = await mgr.set_session_project_dir(chat_id, str(normalized))
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chat not found: {chat_id}",
+        )
+    return await _resolve_chat_project_dir(request, chat_id, mgr)
+
+
+@router.delete("/{chat_id}/project-dir", response_model=ProjectDirResponse)
+async def clear_chat_project_dir(
+    request: Request,
+    chat_id: str,
+    mgr: ChatManager = Depends(get_chat_manager),
+):
+    """Drop this chat's override so it inherits the agent default again."""
+    updated = await mgr.set_session_project_dir(chat_id, None)
+    if updated is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Chat not found: {chat_id}",
+        )
+    return await _resolve_chat_project_dir(request, chat_id, mgr)
 
 
 @router.delete("/{chat_id}", response_model=dict)

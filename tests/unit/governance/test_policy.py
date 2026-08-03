@@ -18,6 +18,8 @@ from qwenpaw.governance.policy import (
     GovernanceRule,
     ToolCallSpec,
     _create_default_policy,
+    _resolve_placeholders,
+    _unresolve_placeholders,
     load_governance_policy,
     save_governance_policy,
 )
@@ -175,8 +177,8 @@ class TestDefaultPolicyLoad:
         )
 
     def test_coding_project_dir_placeholder_resolved(self):
-        """CODING_PROJECT_DIR placeholders are replaced with the actual
-        coding project dir, and tool calls under it are ALLOWed."""
+        """PROJECT_DIR placeholders are replaced with the actual
+        project dir, and tool calls under it are ALLOWed."""
         ws = "/home/user/workspace"
         cpd = "/home/user/coding"
         policy = _create_default_policy(
@@ -185,7 +187,7 @@ class TestDefaultPolicyLoad:
         )
         for rule in policy.user_rules:
             assert (
-                "CODING_PROJECT_DIR" not in rule.match
+                "PROJECT_DIR" not in rule.match
             ), f"unresolved placeholder: {rule.match!r}"
         assert policy.evaluate(_tc("Write", f"{cpd}/script.py")).action is (
             GovernanceAction.ALLOW
@@ -195,13 +197,13 @@ class TestDefaultPolicyLoad:
         )
 
     def test_coding_project_dir_defaults_to_workspace(self):
-        """With no coding_project_dir configured, CODING_PROJECT_DIR
+        """With no coding_project_dir configured, PROJECT_DIR
         resolves to the workspace so the rule is still concrete."""
         ws = "/home/user/workspace"
         policy = _create_default_policy(workspace_dir=ws)
         for rule in policy.user_rules:
             assert (
-                "CODING_PROJECT_DIR" not in rule.match
+                "PROJECT_DIR" not in rule.match
             ), f"unresolved placeholder: {rule.match!r}"
         assert policy.evaluate(_tc("Write", f"{ws}/script.py")).action is (
             GovernanceAction.ALLOW
@@ -222,14 +224,14 @@ class TestDefaultPolicyLoad:
         policy.user_rules = [
             rule
             for rule in policy.user_rules
-            if rule.reason != "Coding project dir"
+            if rule.reason != "Project dir"
         ]
         # Pre-migration files carry no applied_migrations marker.
         policy.applied_migrations = []
         save_governance_policy(policy, str(policy_dir), ws, cpd)
 
         yaml_text = (policy_dir / "policy.yaml").read_text(encoding="utf-8")
-        assert "CODING_PROJECT_DIR" not in yaml_text
+        assert "PROJECT_DIR" not in yaml_text
         assert "applied_migrations" not in yaml_text
 
         reloaded = load_governance_policy(str(policy_dir), ws, cpd)
@@ -237,7 +239,7 @@ class TestDefaultPolicyLoad:
             sum(
                 1
                 for rule in reloaded.user_rules
-                if rule.reason == "Coding project dir"
+                if rule.reason == "Project dir"
             )
             == 1
         )
@@ -266,7 +268,7 @@ class TestDefaultPolicyLoad:
         policy.user_rules = [
             rule
             for rule in policy.user_rules
-            if rule.reason != "Coding project dir"
+            if rule.reason != "Project dir"
         ]
         save_governance_policy(policy, str(policy_dir), ws, cpd)
 
@@ -277,7 +279,7 @@ class TestDefaultPolicyLoad:
         assert not [
             rule
             for rule in reloaded.user_rules
-            if rule.reason == "Coding project dir"
+            if rule.reason == "Project dir"
         ]
         # Under STRICT the deleted ALLOW rule can no longer short-circuit
         # the decision, so the write falls through to ASK.
@@ -295,11 +297,11 @@ class TestDefaultPolicyLoad:
         assert not [
             rule
             for rule in again.user_rules
-            if rule.reason == "Coding project dir"
+            if rule.reason == "Project dir"
         ]
 
     def test_coding_project_dir_roundtrip_portable(self, tmp_path):
-        """save→reload keeps the CODING_PROJECT_DIR placeholder in YAML
+        """save→reload keeps the PROJECT_DIR placeholder in YAML
         (distinct coding dir), so the policy stays portable across
         machines and the coding dir remains ALLOWed after reload."""
         ws = "/home/user/workspace"
@@ -319,15 +321,15 @@ class TestDefaultPolicyLoad:
 
         # YAML must store the placeholder, not the absolute coding path.
         yaml_text = (policy_dir / "policy.yaml").read_text(encoding="utf-8")
-        assert "CODING_PROJECT_DIR" in yaml_text
+        assert "PROJECT_DIR" in yaml_text
         assert cpd not in yaml_text
 
         # In-memory rules are untouched by save (no mutation regression):
         # the live coding rule must still carry the resolved path, not the
-        # literal CODING_PROJECT_DIR placeholder.
+        # literal PROJECT_DIR placeholder.
         for rule in policy.user_rules:
             assert (
-                "CODING_PROJECT_DIR" not in rule.match
+                "PROJECT_DIR" not in rule.match
             ), f"save_governance_policy mutated live rule: {rule.match!r}"
 
         # Reload reproduces a policy that still ALLOWs the coding dir.
@@ -476,7 +478,7 @@ class TestDefaultPolicyLoad:
         Symptom before the fix: with ``ws=/home/u/work/sub`` and
         ``cpd=/home/u/work``, the workspace rule
         ``Read(/home/u/work/sub/**)`` was rewritten via the shorter cpd to
-        ``Read(CODING_PROJECT_DIR/sub/**)`` — the WORKSPACE_DIR placeholder
+        ``Read(PROJECT_DIR/sub/**)`` — the WORKSPACE_DIR placeholder
         was lost from YAML, the rule became non-portable, and after reload
         a real workspace write fell through to ASK ("No rule hit").
         """
@@ -497,7 +499,7 @@ class TestDefaultPolicyLoad:
 
         # The YAML must not leak either absolute path and must carry the
         # WORKSPACE_DIR placeholder for the workspace rule. A shorter-path
-        # match would have left a CODING_PROJECT_DIR-prefixed half-rewrite
+        # match would have left a PROJECT_DIR-prefixed half-rewrite
         # in place of WORKSPACE_DIR.
         yaml_text = (policy_dir / "policy.yaml").read_text(encoding="utf-8")
         assert ws not in yaml_text, f"[{label}] workspace path leaked: {ws}"
@@ -1914,3 +1916,83 @@ class TestDefaultDetectionRules:
 
         # Restore cache for other tests
         monkeypatch.setattr(pol, "_DEFAULT_DETECTION_RULES_CACHE", None)
+
+
+class TestProjectDirPlaceholderSubstring:
+    """``CODING_PROJECT_DIR`` contains ``PROJECT_DIR`` as a substring.
+
+    Substituting the short name first would corrupt the long one into
+    ``CODING_/actual/path``, so the resolver must always substitute
+    longest-name-first. These tests lock that ordering in.
+    """
+
+    def test_legacy_alias_resolves_cleanly(self):
+        rules = [GovernanceRule(match="Read(CODING_PROJECT_DIR/**)")]
+
+        _resolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Read(/proj/**)"
+        assert "CODING_" not in rules[0].match
+
+    def test_canonical_name_resolves_cleanly(self):
+        rules = [GovernanceRule(match="Read(PROJECT_DIR/**)")]
+
+        _resolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Read(/proj/**)"
+
+    def test_both_names_in_one_rule_resolve_cleanly(self):
+        """The half-rewrite bug shows up here if the order is wrong."""
+        rules = [
+            GovernanceRule(
+                match="Read(CODING_PROJECT_DIR/a/**|PROJECT_DIR/b/**)",
+            ),
+        ]
+
+        _resolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Read(/proj/a/**|/proj/b/**)"
+        assert "CODING_" not in rules[0].match
+
+    def test_workspace_and_project_both_resolve(self):
+        rules = [
+            GovernanceRule(match="Read(WORKSPACE_DIR/**)"),
+            GovernanceRule(match="Write(PROJECT_DIR/**)"),
+        ]
+
+        _resolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Read(/ws/**)"
+        assert rules[1].match == "Write(/proj/**)"
+
+    def test_unresolve_writes_canonical_name(self):
+        """Persisted policies converge on one spelling."""
+        rules = [GovernanceRule(match="Read(/proj/**)")]
+
+        _unresolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Read(PROJECT_DIR/**)"
+
+    def test_unresolve_prefers_longer_path_first(self):
+        """A project nested inside the workspace must not be half-rewritten."""
+        rules = [GovernanceRule(match="Read(/ws/coding_projects/demo/**)")]
+
+        _unresolve_placeholders(rules, "/ws", "/ws/coding_projects/demo")
+
+        assert rules[0].match == "Read(PROJECT_DIR/**)"
+
+    def test_unresolve_collapses_identical_dirs_to_workspace(self):
+        """When both are the same path they cannot be told apart."""
+        rules = [GovernanceRule(match="Read(/ws/**)")]
+
+        _unresolve_placeholders(rules, "/ws", "/ws")
+
+        assert rules[0].match == "Read(WORKSPACE_DIR/**)"
+
+    def test_resolve_unresolve_round_trip(self):
+        rules = [GovernanceRule(match="Write(PROJECT_DIR/src/**)")]
+
+        _resolve_placeholders(rules, "/ws", "/proj")
+        _unresolve_placeholders(rules, "/ws", "/proj")
+
+        assert rules[0].match == "Write(PROJECT_DIR/src/**)"

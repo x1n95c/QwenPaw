@@ -23,6 +23,7 @@ from qwenpaw.agents.fork_project import (
     finalize_fork_worktree,
     finalize_fork_worktree_or_fail,
     forks_merged_into_head,
+    has_registered_forks,
     mark_fork_failed,
     register_fork,
     resolve_allowed_fork_project_dir,
@@ -1334,4 +1335,130 @@ def test_commit_and_merge_verification(tmp_path: Path) -> None:
             workspace_dir=project,
         )
         is True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Worktrees in the agent workspace
+#
+# Fork bookkeeping moved out of the project: the checkout, the registry and
+# the locks all live under the agent workspace now, so a fork no longer
+# drops a full copy of the repository into the user's working tree. The
+# branch ref and `.git/worktrees/<id>` stay in the project — git requires
+# that — which is why the git root can no longer be derived from the
+# worktree's own path.
+# ---------------------------------------------------------------------------
+
+
+def _worktree_in_workspace(
+    project: Path,
+    workspace: Path,
+    wt_id: str = "w1",
+) -> tuple[Path, str]:
+    """Create a worktree of *project* checked out inside *workspace*."""
+    workspace.mkdir(parents=True, exist_ok=True)
+    wt = workspace / ".qwenpaw" / "worktrees" / wt_id
+    branch = f"fork/{wt_id}"
+    wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(project, "worktree", "add", str(wt), "-b", branch)
+    return wt, branch
+
+
+def test_git_root_resolves_project_from_a_workspace_worktree(
+    tmp_path: Path,
+) -> None:
+    """The checkout's location no longer implies the repository."""
+    project = tmp_path / "code_proj"
+    workspace = tmp_path / "agent_ws"
+    _init_repo(project)
+    wt, _branch = _worktree_in_workspace(project, workspace)
+
+    from qwenpaw.agents.fork_project import (
+        git_root_from_worktree,
+        registry_base_from_worktree,
+    )
+
+    assert git_root_from_worktree(wt) == project.resolve()
+    # ...while the registry base is the workspace, not the project.
+    assert registry_base_from_worktree(wt) == workspace.resolve()
+
+
+def test_git_root_is_none_outside_a_repo(tmp_path: Path) -> None:
+    plain = tmp_path / "not_a_repo"
+    plain.mkdir()
+
+    from qwenpaw.agents.fork_project import git_root_from_worktree
+
+    assert git_root_from_worktree(plain) is None
+
+
+def test_register_fork_writes_registry_into_the_workspace(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "code_proj"
+    workspace = tmp_path / "agent_ws"
+    _init_repo(project)
+    wt, branch = _worktree_in_workspace(project, workspace)
+
+    assert register_fork(str(wt), branch, workspace_dir=workspace) is True
+
+    # The user's repository gains no bookkeeping file.
+    assert not (project / REGISTRY_REL).exists()
+    registry = workspace / REGISTRY_REL
+    assert registry.is_file()
+    meta = json.loads(registry.read_text(encoding="utf-8"))["forks"][branch]
+    # Recorded so a gate need not re-derive it from the checkout path.
+    assert meta["git_root"] == str(project.resolve())
+
+
+def test_merge_gate_uses_workspace_registry_and_project_git(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "code_proj"
+    workspace = tmp_path / "agent_ws"
+    _init_repo(project)
+    wt, branch = _worktree_in_workspace(project, workspace)
+    assert register_fork(str(wt), branch, workspace_dir=workspace) is True
+
+    (wt / "feature.txt").write_text("work\n", encoding="utf-8")
+    _git(wt, "add", "feature.txt")
+    assert finalize_fork_worktree(str(wt), branch, message="feat") is True
+
+    # Unmerged → blocked.
+    assert (
+        forks_merged_into_head(project, workspace_dir=workspace) is False
+    )
+    _git(project, "merge", "--no-ff", branch, "-m", "integrate")
+    assert forks_merged_into_head(project, workspace_dir=workspace) is True
+
+
+def test_gate_stays_closed_for_a_legacy_project_side_registry(
+    tmp_path: Path,
+) -> None:
+    """An unmerged fork recorded before the move must still block.
+
+    Reading only the new location would make it invisible, and an
+    invisible unmerged fork means the gate opens and the worker's commits
+    are silently dropped.
+    """
+    project = tmp_path / "code_proj"
+    workspace = tmp_path / "agent_ws"
+    workspace.mkdir()
+    _init_repo(project)
+    # A worktree in the *old* place registers into the project, as before.
+    legacy_wt = project / ".qwenpaw" / "worktrees" / "old1"
+    legacy_wt.parent.mkdir(parents=True, exist_ok=True)
+    _git(project, "worktree", "add", str(legacy_wt), "-b", "fork/old1")
+    assert (
+        register_fork("%s" % legacy_wt, "fork/old1", workspace_dir=workspace)
+        is True
+    )
+    assert (project / REGISTRY_REL).is_file()
+
+    # The workspace registry is empty, but the gate must not fail open.
+    assert (
+        forks_merged_into_head(project, workspace_dir=workspace) is False
+    )
+    assert (
+        has_registered_forks(project, workspace_dir=workspace) is True
     )

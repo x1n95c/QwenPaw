@@ -222,6 +222,49 @@ class ChatManager:
         await self._repo.upsert_chat(merged)
         return merged
 
+    async def set_session_project_dir(
+        self,
+        chat_id: str,
+        project_dir: Optional[str],
+    ) -> Optional[ChatSpec]:
+        """Set or clear this chat's project-directory override.
+
+        The value lives in the controlled ``meta["runtime_context"]``
+        namespace. This is a dedicated method rather than a ``meta`` field
+        on :class:`ChatUpdate` for two reasons: a whole-``meta`` patch from
+        a client would clobber unrelated system metadata, and the nested
+        read-modify-write has to happen under the manager lock to avoid
+        losing a concurrent update to a sibling key.
+
+        Passing ``None`` removes the override so the chat goes back to
+        inheriting the agent default.
+
+        Returns the updated spec, or ``None`` if the chat does not exist.
+        """
+        async with self._lock:
+            existing = await self._repo.get_chat(chat_id)
+            if existing is None:
+                return None
+
+            meta = dict(existing.meta or {})
+            runtime_context = dict(meta.get("runtime_context") or {})
+            if project_dir:
+                runtime_context["project_dir"] = project_dir
+            else:
+                runtime_context.pop("project_dir", None)
+
+            if runtime_context:
+                meta["runtime_context"] = runtime_context
+            else:
+                # Drop the namespace entirely once it is empty, so a chat
+                # that never used an override has no leftover scaffolding.
+                meta.pop("runtime_context", None)
+
+            merged = existing.model_copy(update={"meta": meta})
+            merged.updated_at = datetime.now(timezone.utc)
+            await self._repo.upsert_chat(merged)
+            return merged
+
     async def touch_chat(self, chat_id: str) -> Optional[ChatSpec]:
         """Refresh updated_at without rewriting other chat fields."""
         return await self.patch_chat(chat_id, ChatUpdate())

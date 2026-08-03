@@ -3317,5 +3317,29 @@
         "description": "运行结构化、可持续的多步骤任务。"
       }
     }
+  },
+  "projectDir": {
+    "title": "项目目录",
+    "hint": "下一条消息的相对路径与 shell 命令都以此目录为基准。修改从下一轮对话开始生效。",
+    "sourceSession": "本会话已单独指定",
+    "sourceAgent": "继承自 Agent",
+    "tagSession": "本会话",
+    "tagInherited": "继承",
+    "unavailable": "该目录不存在。发送前请先修正 —— 系统不会自动回退到其它目录。",
+    "placeholder": "绝对路径，例如 /Users/me/repos/demo",
+    "inputAria": "项目目录路径",
+    "apply": "应用到本会话",
+    "inherit": "继承 Agent 默认",
+    "agentDefault": "Agent 默认：{{path}}",
+    "triggerAria": "项目目录：{{path}}。点击修改。",
+    "browse": "浏览目录",
+    "browseHome": "主目录",
+    "browseRefresh": "刷新",
+    "browseHidden": "显示隐藏目录",
+    "browseLoading": "加载中…",
+    "browseEmpty": "没有子目录",
+    "tagPending": "待生效",
+    "sourcePending": "将在首条消息时生效",
+    "noSessionYet": "当前还没有可绑定的会话。"
   }
 }

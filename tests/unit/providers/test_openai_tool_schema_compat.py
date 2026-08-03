@@ -158,7 +158,7 @@ def test_sanitize_tool_schemas_removes_nullable_builtin_tool_branches() -> (
         "format": "path",
         "description": (
             "The working directory for the command execution.\n"
-            "If None, defaults to the agent workspace."
+            "If None, defaults to the project directory."
         ),
         "default": None,
     }
