@@ -16,6 +16,22 @@
  */
 
 import * as monaco from "monaco-editor";
+// Monaco's own stylesheet, imported explicitly.
+//
+// `monaco-editor`'s ESM entry does `import './x.css'` per module, but those
+// never reach the page: Vite's dep optimizer drops CSS from pre-bundled
+// deps (no `.css` lands in `node_modules/.vite/deps/`), and the production
+// bundle contains no Monaco selectors either — verified by grepping `dist/`
+// for `.view-lines`, which is absent.
+//
+// Without it the editor still *looks* roughly right, because Monaco sets
+// most geometry as inline styles and injects theme colours at runtime from
+// JS. What breaks is everything that relies on a real rule, most visibly
+// `.monaco-editor .ime-text-area`: unstyled, that hidden IME textarea
+// falls back to UA defaults — white background, 1px border, `resize: both`
+// and `position: static` — so it renders as a resizable white box that
+// takes layout space, pushing the code down and covering the first lines.
+import "monaco-editor/min/vs/editor/editor.main.css";
 import { loader } from "@monaco-editor/react";
 import { registerRobotFramework } from "./monaco/robotframework";
 import editorWorker from "monaco-editor/esm/vs/editor/editor.worker?worker";

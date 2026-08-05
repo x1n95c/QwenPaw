@@ -34,6 +34,7 @@ import {
   useCronJobs,
   DEFAULT_FORM_VALUES,
 } from "./components";
+import { expandDottedArgKeys } from "./components/batchValidation";
 import { parseCron, serializeCron } from "./components/parseCron";
 import { jobToFormValues } from "./components/jobToTemplate";
 import { PageHeader } from "@/components/PageHeader";
@@ -377,6 +378,38 @@ function CronJobsPage() {
           console.error("❌ Failed to parse request.input JSON:", error);
         }
       }
+    }
+
+    // Preprocess block: drop it entirely when disabled or empty, and drop
+    // blank rows / empty args so the payload carries no noise.
+    const preprocess = processedValues.preprocess;
+    const rawSteps: { script?: string; args?: Record<string, unknown> }[] =
+      Array.isArray(preprocess?.steps) ? preprocess.steps : [];
+    const steps = rawSteps.filter((step) => step?.script?.trim());
+    if (!preprocess?.enabled || steps.length === 0) {
+      // An enabled block with no script has nothing to run and the server
+      // rejects it, so send no preprocess rather than an empty one.
+      delete processedValues.preprocess;
+    } else {
+      processedValues.preprocess = {
+        enabled: true,
+        steps: steps.map((step) => {
+          const entry: Record<string, unknown> = {
+            script: (step.script as string).trim(),
+          };
+          if (step.args && Object.keys(step.args).length > 0) {
+            // The executor resolves ${args.out.dir} as a nested path, so
+            // flat dotted keys from the form must be expanded on submit.
+            entry.args = expandDottedArgKeys(step.args);
+          }
+          return entry;
+        }),
+        last_only: preprocess.last_only !== false,
+        on_failure: preprocess.on_failure || "continue",
+        timeout_seconds:
+          preprocess.timeout_seconds ??
+          DEFAULT_FORM_VALUES.preprocess.timeout_seconds,
+      };
     }
 
     let success = false;

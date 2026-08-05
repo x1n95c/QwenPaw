@@ -25,9 +25,9 @@ import time
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from .models import CronJobSpec, PreprocessSpec
+from .models import CronJobSpec, PreprocessSpec, PreprocessStepSpec
 
 logger = logging.getLogger(__name__)
 
@@ -43,8 +43,8 @@ _CONTROL_FLOW_TOOLS = frozenset({"label", "goto", "set_var"})
 PreprocessStatus = Literal["ok", "failed", "timeout"]
 
 
-class PreprocessResult(BaseModel):
-    """Outcome of one preprocess run, rendered for both consumers."""
+class PreprocessStepResult(BaseModel):
+    """Outcome of one script in the chain, rendered for both consumers."""
 
     ok: bool
     status: PreprocessStatus
@@ -63,6 +63,60 @@ class PreprocessResult(BaseModel):
     @property
     def failed(self) -> bool:
         return not self.ok
+
+
+class PreprocessResult(BaseModel):
+    """Outcome of a whole preprocess chain.
+
+    Per-script results are kept separate rather than merged into one blob:
+    a consumer has to be able to say *which* collection step produced a
+    value, and more importantly which one failed — one merged ``error``
+    string cannot express "script 2 of 3 failed".
+    """
+
+    ok: bool
+    status: PreprocessStatus
+    steps: list[PreprocessStepResult] = Field(default_factory=list)
+    duration_ms: int = 0
+
+    @property
+    def failed(self) -> bool:
+        return not self.ok
+
+    @property
+    def script_label(self) -> str:
+        """Every label in run order, for logs and the trace."""
+        return " → ".join(step.script_label for step in self.steps)
+
+    @property
+    def error(self) -> str:
+        """Only the failures, each named so the culprit is identifiable."""
+        named = len(self.steps) > 1
+        parts = [
+            f"{step.script_label}: {step.error}" if named else step.error
+            for step in self.steps
+            if step.failed and step.error
+        ]
+        return "; ".join(parts)
+
+    @property
+    def user_text(self) -> str:
+        """Prose for a human, in run order.
+
+        Labelled per script only when there is more than one: on a
+        single-script chain the label is noise in what is often the whole
+        message body.
+        """
+        blocks: list[str] = []
+        for step in self.steps:
+            text = (step.user_text or "").strip()
+            if not text:
+                continue
+            if len(self.steps) > 1:
+                blocks.append(f"【{step.script_label}】\n{text}")
+            else:
+                blocks.append(text)
+        return "\n\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +216,18 @@ def render_user_text(payload: dict[str, Any]) -> str:
     return _truncate("\n\n".join(parts))
 
 
-def _render_call_text(spec: PreprocessSpec, script_label: str) -> str:
+def _render_call_text(
+    spec: PreprocessSpec,
+    step: PreprocessStepSpec,
+    script_label: str,
+) -> str:
     """Describe the call that already happened, for the model."""
     return json.dumps(
         {
             "tool_name": "run_tool_batch",
             "arguments": {
                 "file_path": script_label,
-                "args": spec.args,
+                "args": step.args,
                 "last_only": spec.last_only,
             },
         },
@@ -181,34 +239,60 @@ def _render_call_text(spec: PreprocessSpec, script_label: str) -> str:
 def build_prompt_block(result: PreprocessResult) -> str:
     """Render the block appended to the user prompt.
 
-    Two instructions carry real weight here. "Do not run it again" exists
-    because the script is a real file the agent can see and
+    Two instructions carry real weight here. "Do not run them again" exists
+    because the scripts are real files the agent can see and
     ``run_tool_batch`` is in its toolkit — a helpful model will absolutely
-    retry it. And on failure, "do not invent the missing data" exists
+    retry them. And for a failure, "do not invent the missing data" exists
     because a model told only that collection failed will otherwise fill
     the gap with plausible numbers.
+
+    With several scripts the two states can coexist, so each script gets
+    its own section and the header states the mixed outcome plainly rather
+    than picking one story.
     """
-    if result.ok:
-        return (
-            "<preprocess_result>\n"
-            "A data-collection script was executed automatically before "
-            "this task.\n"
-            "It has ALREADY RUN — do not call run_tool_batch again.\n\n"
-            f"Call:\n{result.call_text}\n\n"
-            f"Result:\n{result.result_json}\n"
-            "</preprocess_result>"
+    total = len(result.steps)
+    failed = sum(1 for step in result.steps if step.failed)
+
+    if failed == 0:
+        header = (
+            f"{total} data-collection script(s) were executed automatically "
+            "before this task.\n"
+            "They have ALREADY RUN — do not call run_tool_batch again."
         )
-    return (
-        "<preprocess_result>\n"
-        "A data-collection script was executed automatically before this "
-        "task, and it FAILED.\n"
-        "Do not retry it. Continue with the information you have, and say "
-        "plainly in your reply that data collection failed — do not invent "
-        "or assume the missing data.\n\n"
-        f"Call:\n{result.call_text}\n\n"
-        f"Error:\n{result.error or 'unknown error'}\n"
-        "</preprocess_result>"
-    )
+    elif failed == total:
+        header = (
+            f"{total} data-collection script(s) were executed automatically "
+            "before this task, and they ALL FAILED.\n"
+            "Do not retry them. Continue with the information you have, and "
+            "say plainly in your reply that data collection failed — do not "
+            "invent or assume the missing data."
+        )
+    else:
+        header = (
+            f"{total} data-collection script(s) were executed automatically "
+            f"before this task; {failed} of them FAILED.\n"
+            "They have ALREADY RUN — do not call run_tool_batch again and do "
+            "not retry the failed ones. Use the results that succeeded, say "
+            "plainly which data could not be collected, and do not invent or "
+            "assume the missing values."
+        )
+
+    sections: list[str] = []
+    for index, step in enumerate(result.steps, start=1):
+        prefix = f"[{index}/{total}] {step.script_label}" if total > 1 else ""
+        body = (
+            f"Result:\n{step.result_json}"
+            if step.ok
+            else f"Error:\n{step.error or 'unknown error'}"
+        )
+        sections.append(
+            (f"{prefix}\n" if prefix else "")
+            + f"Call:\n{step.call_text}\n\n"
+            + body,
+        )
+
+    joined = "\n\n".join(sections)
+    return f"<preprocess_result>\n{header}\n\n{joined}\n</preprocess_result>"
 
 
 def inject_preprocess_block(
@@ -267,22 +351,45 @@ def inject_preprocess_block(
 # ---------------------------------------------------------------------------
 
 
-def _failure(
+def _step_failure(
     spec: PreprocessSpec,
-    script_label: str,
+    step: PreprocessStepSpec,
     error: str,
     status: PreprocessStatus = "failed",
     duration_ms: int = 0,
-) -> PreprocessResult:
-    return PreprocessResult(
+) -> PreprocessStepResult:
+    label = step.label
+    return PreprocessStepResult(
         ok=False,
         status=status,
-        script_label=script_label,
-        call_text=_render_call_text(spec, script_label),
+        script_label=label,
+        call_text=_render_call_text(spec, step, label),
         result_json=json.dumps({"ok": False, "error": error}),
         user_text=f"⚠️ 数据采集失败：{error}",
         error=error,
         duration_ms=duration_ms,
+    )
+
+
+def _collect(
+    steps: list[PreprocessStepResult],
+    started: float,
+) -> PreprocessResult:
+    """Fold per-script results into the chain result."""
+    ok = all(step.ok for step in steps)
+    if ok:
+        status: PreprocessStatus = "ok"
+    elif any(step.status == "timeout" for step in steps):
+        # Surfaced ahead of "failed" because a timeout is the one outcome
+        # that says something about the *budget* rather than the script.
+        status = "timeout"
+    else:
+        status = "failed"
+    return PreprocessResult(
+        ok=ok,
+        status=status,
+        steps=steps,
+        duration_ms=int((time.monotonic() - started) * 1000),
     )
 
 
@@ -294,10 +401,16 @@ async def run_preprocess(
     user_id: str,
     channel: str,
 ) -> Optional[PreprocessResult]:
-    """Run the job's preprocess batch, if it has one.
+    """Run the job's preprocess chain, if it has one.
 
     Returns ``None`` when there is nothing to run, so the executor can tell
     "no preprocess configured" from "preprocess ran and failed".
+
+    Scripts run in order under one shared wall-clock budget and one shared
+    toolkit. A failing script does not stop the ones after it — the
+    contract with the executor is "continue and report", and
+    ``on_failure="abort"`` is applied by the executor once it can see the
+    whole picture.
     """
     if not job.has_preprocess:
         return None
@@ -314,108 +427,145 @@ async def run_preprocess(
     def _elapsed_ms() -> int:
         return int((time.monotonic() - started) * 1000)
 
+    request_context = {
+        "source": "cron",
+        "cron_job_id": job.id or "",
+        # Lets an audit trail tell the deterministic collection phase
+        # apart from the model's own tool calls.
+        "cron_phase": "preprocess",
+        "session_id": session_id,
+        "root_session_id": session_id,
+        "agent_id": agent_id,
+        "user_id": user_id,
+        "channel": channel,
+        "approval_level": (
+            ToolExecutionLevel.AUTO.value
+            if job.runtime.tool_safety
+            else ToolExecutionLevel.OFF.value
+        ),
+    }
+
+    # Built once for the whole chain: `set_governor` mutates workspace-level
+    # shared state, so rebuilding per script would swap the governor out
+    # from under any concurrent request several times per run.
+    try:
+        toolkit = await AgentBuilder(
+            app_services=getattr(workspace, "app_services", None),
+        ).build_standalone_toolkit(
+            workspace=workspace,
+            request_context=request_context,
+            agent_id=agent_id,
+        )
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.warning(
+            "cron preprocess: toolkit build failed job_id=%s error=%s",
+            job.id,
+            repr(exc),
+        )
+        error = f"could not prepare tools: {exc}"
+        elapsed = _elapsed_ms()
+        return _collect(
+            [
+                _step_failure(spec, step, error, duration_ms=elapsed)
+                for step in spec.steps
+            ],
+            started,
+        )
+
+    results: list[PreprocessStepResult] = []
     # `${args.*}` is only substituted for file-backed batches, so inline
     # actions are staged to a file rather than passed through as a list —
     # one code path, and args behave identically either way.
     with staged_dir("preprocess", prefix="qwenpaw_cron_pre_") as stage:
-        script_path: Path
-        if spec.script:
-            script_label = spec.script
-            resolved = resolve_batch_script(spec.script)
-            if resolved is None:
-                return _failure(
-                    spec,
-                    script_label,
-                    f"batch script not found in pool: {spec.script}",
-                    duration_ms=_elapsed_ms(),
+        for index, step in enumerate(spec.steps):
+            remaining = spec.timeout_seconds - (time.monotonic() - started)
+            if remaining <= 0:
+                # The budget belongs to the chain, so a script that never
+                # got a chance to start is reported rather than skipped
+                # silently — otherwise its absence from the output looks
+                # like it returned nothing.
+                results.append(
+                    _step_failure(
+                        spec,
+                        step,
+                        "preprocess budget of "
+                        f"{spec.timeout_seconds}s was exhausted before this "
+                        "script started",
+                        status="timeout",
+                    ),
                 )
-            script_path = resolved
-        else:
-            script_label = f"<inline:{len(spec.actions or [])} steps>"
-            try:
-                stage.mkdir(parents=True, exist_ok=True)
-                script_path = stage / "inline.json"
-                script_path.write_text(
-                    json.dumps({"actions": spec.actions}, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-            except OSError as exc:
-                return _failure(
-                    spec,
-                    script_label,
-                    f"could not stage inline actions: {exc}",
-                    duration_ms=_elapsed_ms(),
-                )
+                continue
 
-        request_context = {
-            "source": "cron",
-            "cron_job_id": job.id or "",
-            # Lets an audit trail tell the deterministic collection phase
-            # apart from the model's own tool calls.
-            "cron_phase": "preprocess",
-            "session_id": session_id,
-            "root_session_id": session_id,
-            "agent_id": agent_id,
-            "user_id": user_id,
-            "channel": channel,
-            "approval_level": (
-                ToolExecutionLevel.AUTO.value
-                if job.runtime.tool_safety
-                else ToolExecutionLevel.OFF.value
-            ),
-        }
+            script_path = _resolve_step_path(step, stage, index)
+            if isinstance(script_path, str):
+                results.append(
+                    _step_failure(spec, step, script_path),
+                )
+                continue
 
-        try:
-            toolkit = await AgentBuilder(
-                app_services=getattr(workspace, "app_services", None),
-            ).build_standalone_toolkit(
-                workspace=workspace,
-                request_context=request_context,
-                agent_id=agent_id,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.warning(
-                "cron preprocess: toolkit build failed job_id=%s error=%s",
-                job.id,
-                repr(exc),
-            )
-            return _failure(
-                spec,
-                script_label,
-                f"could not prepare tools: {exc}",
-                duration_ms=_elapsed_ms(),
+            results.append(
+                await _execute_step(
+                    spec=spec,
+                    step=step,
+                    job=job,
+                    script_path=script_path,
+                    toolkit=toolkit,
+                    session_id=session_id,
+                    user_id=user_id,
+                    channel=channel,
+                    agent_id=agent_id,
+                    workspace_dir=getattr(workspace, "workspace_dir", None),
+                    timeout=remaining,
+                ),
             )
 
-        return await _execute_batch(
-            spec=spec,
-            job=job,
-            script_path=script_path,
-            script_label=script_label,
-            toolkit=toolkit,
-            session_id=session_id,
-            user_id=user_id,
-            channel=channel,
-            agent_id=agent_id,
-            workspace_dir=getattr(workspace, "workspace_dir", None),
-            started=started,
+    return _collect(results, started)
+
+
+def _resolve_step_path(
+    step: PreprocessStepSpec,
+    stage: Path,
+    index: int,
+) -> Path | str:
+    """Resolve one step to a file, or return an error message.
+
+    Returning the message instead of raising keeps the caller's "one result
+    row per configured script" invariant: a bad script becomes a reported
+    failure, never a gap in the list.
+    """
+    if step.script:
+        resolved = resolve_batch_script(step.script)
+        if resolved is None:
+            return f"batch script not found in pool: {step.script}"
+        return resolved
+    try:
+        stage.mkdir(parents=True, exist_ok=True)
+        # Indexed so chained inline steps cannot overwrite each other.
+        path = stage / f"inline_{index}.json"
+        path.write_text(
+            json.dumps({"actions": step.actions}, ensure_ascii=False),
+            encoding="utf-8",
         )
+        return path
+    except OSError as exc:
+        return f"could not stage inline actions: {exc}"
 
 
-async def _execute_batch(
+async def _execute_step(
     *,
     spec: PreprocessSpec,
+    step: PreprocessStepSpec,
     job: CronJobSpec,
     script_path: Path,
-    script_label: str,
     toolkit: Any,
     session_id: str,
     user_id: str,
     channel: str,
     agent_id: str,
     workspace_dir: Path | None,
-    started: float,
-) -> PreprocessResult:
-    """Run the batch under a scoped tool context, bounded by a timeout."""
+    timeout: float,
+) -> PreprocessStepResult:
+    """Run one script under a scoped tool context, bounded by a timeout."""
     from agentscope.state import AgentState
 
     from ...runtime.tool_context import (
@@ -425,6 +575,11 @@ async def _execute_batch(
 
     rtb = _run_tool_batch_module()
     config_values = config_derived_tool_values(agent_id)
+    label = step.label
+    step_started = time.monotonic()
+
+    def _step_ms() -> int:
+        return int((time.monotonic() - step_started) * 1000)
 
     async def _run() -> Any:
         with scoped_tool_context(
@@ -446,7 +601,7 @@ async def _execute_batch(
         ):
             return await rtb.run_tool_batch(
                 file_path=str(script_path),
-                args=spec.args or None,
+                args=step.args or None,
                 stop_on_error=spec.stop_on_error,
                 last_only=spec.last_only,
                 maxstep=spec.maxstep,
@@ -458,43 +613,43 @@ async def _execute_batch(
     # supports 3.11 through 3.13.
     task = asyncio.create_task(_run(), name=f"cron-preprocess-{job.id}")
     try:
-        chunk = await asyncio.wait_for(task, timeout=spec.timeout_seconds)
+        chunk = await asyncio.wait_for(task, timeout=timeout)
     except asyncio.TimeoutError:
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
         logger.warning(
-            "cron preprocess timed out: job_id=%s script=%s timeout=%ss",
+            "cron preprocess timed out: job_id=%s script=%s budget=%ss",
             job.id,
-            script_label,
+            label,
             spec.timeout_seconds,
         )
-        return _failure(
+        return _step_failure(
             spec,
-            script_label,
+            step,
             f"preprocess timed out after {spec.timeout_seconds}s",
             status="timeout",
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=_step_ms(),
         )
     except Exception as exc:  # pylint: disable=broad-except
         logger.warning(
             "cron preprocess raised: job_id=%s script=%s error=%s",
             job.id,
-            script_label,
+            label,
             repr(exc),
         )
-        return _failure(
+        return _step_failure(
             spec,
-            script_label,
+            step,
             f"{type(exc).__name__}: {exc}",
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=_step_ms(),
         )
 
     return _normalize(
         spec=spec,
-        script_label=script_label,
+        step=step,
         chunk=chunk,
-        duration_ms=int((time.monotonic() - started) * 1000),
+        duration_ms=_step_ms(),
     )
 
 
@@ -513,11 +668,11 @@ def _run_tool_batch_module() -> Any:
 def _normalize(
     *,
     spec: PreprocessSpec,
-    script_label: str,
+    step: PreprocessStepSpec,
     chunk: Any,
     duration_ms: int,
-) -> PreprocessResult:
-    """Turn a ToolChunk into a PreprocessResult."""
+) -> PreprocessStepResult:
+    """Turn a ToolChunk into a PreprocessStepResult."""
     rtb = _run_tool_batch_module()
     raw = rtb._extract_text(chunk)  # pylint: disable=protected-access
 
@@ -533,11 +688,12 @@ def _normalize(
     if not ok and not error:
         error = "batch reported failure without an error message"
 
-    return PreprocessResult(
+    label = step.label
+    return PreprocessStepResult(
         ok=ok,
         status="ok" if ok else "failed",
-        script_label=script_label,
-        call_text=_render_call_text(spec, script_label),
+        script_label=label,
+        call_text=_render_call_text(spec, step, label),
         result_json=_truncate(raw),
         user_text=render_user_text(payload),
         error=error,
@@ -548,6 +704,7 @@ def _normalize(
 __all__ = [
     "MAX_INJECTED_RESULT_CHARS",
     "PreprocessResult",
+    "PreprocessStepResult",
     "build_prompt_block",
     "get_batch_pool_dir",
     "inject_preprocess_block",

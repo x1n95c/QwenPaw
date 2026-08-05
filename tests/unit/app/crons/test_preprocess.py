@@ -144,18 +144,35 @@ def test_tolerates_a_non_dict_payload():
 # ---------------------------------------------------------------------------
 
 
-def make_result(ok: bool = True, **overrides: Any) -> pre.PreprocessResult:
-    payload = {
+def make_step_result(
+    ok: bool = True,
+    label: str = "collect.json",
+    **overrides: Any,
+) -> pre.PreprocessStepResult:
+    payload: dict[str, Any] = {
         "ok": ok,
         "status": "ok" if ok else "failed",
-        "script_label": "collect.json",
+        "script_label": label,
         "call_text": '{"tool_name": "run_tool_batch"}',
         "result_json": '{"ok": true}',
         "user_text": "data",
         "error": "" if ok else "boom",
     }
     payload.update(overrides)
-    return pre.PreprocessResult(**payload)
+    return pre.PreprocessStepResult(**payload)
+
+
+def make_result(
+    ok: bool = True,
+    steps: list[pre.PreprocessStepResult] | None = None,
+) -> pre.PreprocessResult:
+    resolved = steps if steps is not None else [make_step_result(ok=ok)]
+    all_ok = all(step.ok for step in resolved)
+    return pre.PreprocessResult(
+        ok=all_ok,
+        status="ok" if all_ok else "failed",
+        steps=resolved,
+    )
 
 
 def last_user_text(messages: list[dict]) -> str:
@@ -245,6 +262,34 @@ def test_failure_block_forbids_retry_and_invention():
     assert "Do not retry" in block
     assert "do not invent" in block
     assert "boom" in block
+
+
+def test_mixed_block_states_both_outcomes():
+    """With a chain, "all fine" and "all broken" are not the only cases.
+
+    Telling the model only one of the two stories is how it ends up either
+    re-running the script that worked or inventing the data that did not
+    arrive.
+    """
+    block = pre.build_prompt_block(
+        make_result(
+            steps=[
+                make_step_result(ok=True, label="good"),
+                make_step_result(ok=False, label="bad"),
+            ],
+        ),
+    )
+    assert "1 of them FAILED" in block
+    assert "do not call run_tool_batch again" in block
+    assert "do not invent" in block
+    # Each script is identified, so the model can tell them apart.
+    assert "[1/2] good" in block
+    assert "[2/2] bad" in block
+
+
+def test_single_script_block_omits_the_index_prefix():
+    block = pre.build_prompt_block(make_result(ok=True))
+    assert "[1/1]" not in block
 
 
 # ---------------------------------------------------------------------------
@@ -614,6 +659,183 @@ async def test_records_a_duration(tmp_path: Path, pool: Path, stub_toolkit):
 
 def test_spec_defaults_are_carried_into_the_call_text():
     spec = PreprocessSpec(script="collect", args={"a": 1})
-    text = pre._render_call_text(spec, "collect")
+    text = pre._render_call_text(spec, spec.steps[0], "collect")
     assert '"last_only": true' in text
+    # Args come from the step, not the chain: two scripts have their own.
     assert '"a": 1' in text
+
+
+# ---------------------------------------------------------------------------
+# Chained scripts
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_runs_several_scripts_in_order(
+    tmp_path: Path,
+    pool: Path,
+    stub_toolkit,
+):
+    write_script(
+        pool,
+        "first.json",
+        [{"tool_name": "tool_a", "arguments": {"v": "${args.x}"}}],
+    )
+    write_script(
+        pool, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
+    )
+    job = make_cron_job_spec(
+        preprocess={
+            "steps": [
+                {"script": "first", "args": {"x": "1"}},
+                {"script": "second"},
+            ],
+        },
+    )
+
+    result = await pre.run_preprocess(
+        workspace=FakeWorkspace(tmp_path),
+        job=job,
+        session_id="s",
+        user_id="u",
+        channel="console",
+    )
+
+    assert result is not None and result.ok is True
+    assert [s.script_label for s in result.steps] == ["first", "second"]
+    # Execution order, and each step's own args were applied to its script.
+    assert [c["tool_name"] for c in stub_toolkit] == ["tool_a", "tool_b"]
+    assert stub_toolkit[0]["v"] == "1"
+
+
+@pytest.mark.asyncio
+async def test_a_failing_script_does_not_stop_the_rest(
+    tmp_path: Path,
+    pool: Path,
+    stub_toolkit,
+):
+    """ "Continue and report" has to hold per script, not just per chain."""
+    write_script(
+        pool, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
+    )
+    job = make_cron_job_spec(
+        preprocess={
+            "steps": [{"script": "ghost"}, {"script": "second"}],
+        },
+    )
+
+    result = await pre.run_preprocess(
+        workspace=FakeWorkspace(tmp_path),
+        job=job,
+        session_id="s",
+        user_id="u",
+        channel="console",
+    )
+
+    assert result is not None
+    assert result.ok is False
+    assert len(result.steps) == 2
+    assert result.steps[0].failed and "not found" in result.steps[0].error
+    assert result.steps[1].ok
+    # The second script really ran despite the first failing.
+    assert [c["tool_name"] for c in stub_toolkit] == ["tool_b"]
+    # The chain error names the culprit rather than blaming the chain.
+    assert "ghost" in result.error
+
+
+@pytest.mark.asyncio
+async def test_chain_user_text_labels_each_script(
+    tmp_path: Path,
+    pool: Path,
+    stub_toolkit,
+):
+    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(pool, "b.json", [{"tool_name": "t", "arguments": {}}])
+    job = make_cron_job_spec(
+        preprocess={"steps": [{"script": "a"}, {"script": "b"}]},
+    )
+    result = await pre.run_preprocess(
+        workspace=FakeWorkspace(tmp_path),
+        job=job,
+        session_id="s",
+        user_id="u",
+        channel="console",
+    )
+    assert result is not None
+    assert "【a】" in result.user_text
+    assert "【b】" in result.user_text
+
+
+@pytest.mark.asyncio
+async def test_single_script_user_text_has_no_label(
+    tmp_path: Path,
+    pool: Path,
+    stub_toolkit,
+):
+    """The label would be noise in what is often the whole message body."""
+    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
+    job = make_cron_job_spec(preprocess={"script": "a"})
+    result = await pre.run_preprocess(
+        workspace=FakeWorkspace(tmp_path),
+        job=job,
+        session_id="s",
+        user_id="u",
+        channel="console",
+    )
+    assert result is not None
+    assert result.user_text == "collected"
+
+
+@pytest.mark.asyncio
+async def test_budget_is_shared_across_the_chain(
+    tmp_path: Path,
+    pool: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """timeout_seconds bounds the chain, not each script.
+
+    Otherwise adding scripts would multiply how long one job can hold its
+    concurrency slot — the exact thing the timeout exists to prevent.
+    """
+    from qwenpaw.runtime.builder import AgentBuilder
+
+    monkeypatch.setattr(
+        AgentBuilder,
+        "build_standalone_toolkit",
+        lambda self, **_kw: _async_value(object()),
+        raising=False,
+    )
+    rtb = pre._run_tool_batch_module()
+
+    async def _hang(_tool_name, _arguments):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(rtb, "_call_tool", _hang)
+
+    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(pool, "b.json", [{"tool_name": "t", "arguments": {}}])
+    job = make_cron_job_spec(
+        preprocess={
+            "steps": [{"script": "a"}, {"script": "b"}],
+            "timeout_seconds": 1,
+        },
+    )
+
+    result = await asyncio.wait_for(
+        pre.run_preprocess(
+            workspace=FakeWorkspace(tmp_path),
+            job=job,
+            session_id="s",
+            user_id="u",
+            channel="console",
+        ),
+        # Comfortably under 2x the budget: a per-script timeout would need
+        # ~2s here, a shared one finishes in ~1s.
+        timeout=1.8,
+    )
+
+    assert result is not None
+    assert result.status == "timeout"
+    # Both scripts are still accounted for; the second never got to start.
+    assert len(result.steps) == 2
+    assert "exhausted" in result.steps[1].error

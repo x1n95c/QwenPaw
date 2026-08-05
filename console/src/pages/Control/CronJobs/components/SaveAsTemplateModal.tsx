@@ -1,7 +1,9 @@
 import { useEffect } from "react";
 import { Checkbox, Form, Input, Modal, Select } from "@agentscope-ai/design";
 import { useTranslation } from "react-i18next";
+import api from "../../../../api";
 import type { CronJobSpecOutput } from "../../../../api/types";
+import { useAppMessage } from "../../../../hooks/useAppMessage";
 import { buildCreateTemplateRequest } from "./jobToTemplate";
 import { useCronTemplates } from "./useCronTemplates";
 
@@ -40,6 +42,7 @@ export function SaveAsTemplateModal({
   onSaved,
 }: SaveAsTemplateModalProps) {
   const { t } = useTranslation();
+  const { message } = useAppMessage();
   const [form] = Form.useForm<FormValues>();
   const { createTemplate, busy } = useCronTemplates();
 
@@ -61,6 +64,35 @@ export function SaveAsTemplateModal({
   const handleOk = async () => {
     if (!job) return;
     const values = await form.validateFields();
+
+    // A template must be self-contained: every pool script the job's
+    // preprocess chain references is packaged under batch/ so an importer
+    // can install them. A missing script aborts the save — shipping a
+    // dangling reference defeats the point of packaging.
+    let batchFiles: Record<string, string> | undefined;
+    let batchEntry: string | undefined;
+    const scriptNames = (job.preprocess?.steps || [])
+      .map((step) => step.script?.trim())
+      .filter((name): name is string => Boolean(name));
+    if (job.preprocess?.enabled && scriptNames.length > 0) {
+      const collected: Record<string, string> = {};
+      for (const name of scriptNames) {
+        // Sequential on purpose: the first missing script should abort
+        // with its own name rather than race several failures.
+        try {
+          const detail = await api.getToolBatch(name);
+          collected[`${name}.json`] = JSON.stringify(detail.content, null, 2);
+        } catch {
+          message.error(t("cronJobs.saveAsTemplateBatchMissing", { name }));
+          return;
+        }
+      }
+      batchFiles = collected;
+      // The entry names the first script; the rest travel alongside and
+      // are installed together by install-batches.
+      batchEntry = `batch/${scriptNames[0]}.json`;
+    }
+
     const ok = await createTemplate(
       buildCreateTemplateRequest(job, {
         name: values.name.trim(),
@@ -70,6 +102,8 @@ export function SaveAsTemplateModal({
         emoji: values.emoji?.trim() || "",
         tags: values.tags || [],
         includeDispatchTarget: Boolean(values.includeDispatchTarget),
+        batchFiles,
+        batchEntry,
       }),
     );
     if (ok) {

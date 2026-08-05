@@ -11,10 +11,12 @@ import pytest
 from qwenpaw.app.cron_templates import store
 from qwenpaw.app.cron_templates.models import (
     CreateCronTemplateRequest,
+    InstallTemplateBatchesRequest,
     InstallTemplateSkillsRequest,
     UpdateCronTemplateRequest,
 )
 from qwenpaw.app.cron_templates.service import CronTemplateService
+from qwenpaw.app.tool_batches.models import CreateToolBatchRequest
 from qwenpaw.exceptions import CronTemplateConflictError, CronTemplateError
 
 from .conftest import BATCH_JSON, SKILL_DOC, make_zip, valid_zip_entries
@@ -779,3 +781,114 @@ def test_install_skills_from_builtin_package(service: CronTemplateService):
         InstallTemplateSkillsRequest(target="pool"),
     )
     assert result["installed"] == ["weather-report"]
+
+
+# ---------------------------------------------------------------------------
+# Bundled batches (install into the tool-batch pool)
+# ---------------------------------------------------------------------------
+
+
+def test_install_batches_copies_into_pool(service: CronTemplateService):
+    """Scripts are copied into the pool, keeping their base names."""
+    from qwenpaw.app.tool_batches.store import get_tool_batch_dir
+
+    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
+    result = service.install_batches(
+        "daily-brief",
+        InstallTemplateBatchesRequest(),
+    )
+    assert result == {"imported": ["collect"], "conflicts": []}
+    pool_file = get_tool_batch_dir() / "collect.json"
+    assert pool_file.is_file()
+    assert json.loads(pool_file.read_text(encoding="utf-8"))["actions"]
+
+
+def test_install_batches_conflict_writes_nothing(
+    service: CronTemplateService,
+):
+    from qwenpaw.app.tool_batches.service import ToolBatchService
+
+    batches = ToolBatchService()
+    service.create_template(
+        make_request(
+            batch_files={"collect": BATCH_JSON, "extra": BATCH_JSON},
+        ),
+    )
+    batches.create_batch(
+        CreateToolBatchRequest(
+            name="collect",
+            content=[{"tool_name": "x", "arguments": {}}],
+        ),
+    )
+    result = service.install_batches(
+        "daily-brief",
+        InstallTemplateBatchesRequest(),
+    )
+    assert result["imported"] == []
+    assert result["conflicts"][0]["name"] == "collect"
+    assert result["conflicts"][0]["file_name"] == "batch/collect.json"
+    assert result["conflicts"][0]["suggested_name"] == "collect-2"
+    # All-or-nothing: the clean "extra" must not land either.
+    assert {b.name for b in batches.list_batches()} == {"collect"}
+
+
+def test_install_batches_overwrite(service: CronTemplateService):
+    from qwenpaw.app.tool_batches.service import ToolBatchService
+
+    batches = ToolBatchService()
+    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
+    service.install_batches("daily-brief", InstallTemplateBatchesRequest())
+    again = service.install_batches(
+        "daily-brief",
+        InstallTemplateBatchesRequest(overwrite=True),
+    )
+    assert again == {"imported": ["collect"], "conflicts": []}
+    assert len(batches.list_batches()) == 1
+
+
+def test_install_batches_rename_map(service: CronTemplateService):
+    from qwenpaw.app.tool_batches.service import ToolBatchService
+
+    batches = ToolBatchService()
+    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
+    service.install_batches("daily-brief", InstallTemplateBatchesRequest())
+    again = service.install_batches(
+        "daily-brief",
+        InstallTemplateBatchesRequest(rename_map={"collect": "collect-v2"}),
+    )
+    assert again["imported"] == ["collect-v2"]
+    assert {b.name for b in batches.list_batches()} == {
+        "collect",
+        "collect-v2",
+    }
+
+
+def test_install_batches_without_bundle_raises(
+    service: CronTemplateService,
+):
+    service.create_template(make_request())
+    with pytest.raises(CronTemplateError, match="does not bundle any batch"):
+        service.install_batches("daily-brief", InstallTemplateBatchesRequest())
+
+
+def test_install_batches_unknown_template_raises(
+    service: CronTemplateService,
+):
+    with pytest.raises(CronTemplateError, match="not found"):
+        service.install_batches("ghost", InstallTemplateBatchesRequest())
+
+
+def test_install_batches_from_builtin_package(
+    service: CronTemplateService,
+):
+    """Builtins ship batch scripts; installing from them works unforked."""
+    from qwenpaw.app.tool_batches.service import ToolBatchService
+
+    result = service.install_batches(
+        "workspace-usage",
+        InstallTemplateBatchesRequest(),
+    )
+    assert sorted(result["imported"]) == ["scan-unix", "scan-windows"]
+    assert result["conflicts"] == []
+    names = {b.name for b in ToolBatchService().list_batches()}
+    assert {"scan-unix", "scan-windows"} <= names

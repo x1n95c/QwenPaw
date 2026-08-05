@@ -10,6 +10,7 @@ import { channelApi } from "./modules/channel";
 import { heartbeatApi } from "./modules/heartbeat";
 import { cronJobApi } from "./modules/cronjob";
 import { cronTemplateApi } from "./modules/cronTemplate";
+import { toolBatchApi } from "./modules/toolBatch";
 import { chatApi, sessionApi } from "./modules/chat";
 import { envApi } from "./modules/env";
 import { providerApi } from "./modules/provider";
@@ -48,6 +49,9 @@ export const api = {
 
   // Cron Job Templates (folder packages)
   ...cronTemplateApi,
+
+  // Tool Batch Scripts (script pool)
+  ...toolBatchApi,
 
   // Chats
   ...chatApi,

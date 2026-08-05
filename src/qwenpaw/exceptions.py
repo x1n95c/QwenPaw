@@ -341,6 +341,28 @@ class CronTemplateConflictError(CronTemplateError):
         self.detail = detail
 
 
+class ToolBatchError(AgentRuntimeErrorException):
+    """Exception raised for tool batch script pool errors."""
+
+    def __init__(
+        self,
+        message: str,
+        details: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        super().__init__("TOOL_BATCH_ERROR", message, details)
+
+
+class ToolBatchConflictError(ToolBatchError):
+    """Raised when an import would overwrite an existing batch script."""
+
+    def __init__(self, detail: Dict[str, Any]) -> None:
+        super().__init__(
+            message=str(detail.get("message") or "Tool batch conflict"),
+            details=detail,
+        )
+        self.detail = detail
+
+
 class HookCycleError(AgentRuntimeErrorException):
     """Raised when ``before``/``after`` constraints contain a cycle."""
 

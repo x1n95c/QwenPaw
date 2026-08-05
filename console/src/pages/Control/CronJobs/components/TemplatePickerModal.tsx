@@ -8,7 +8,9 @@ import {
   ImportOutlined,
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
+import api from "../../../../api";
 import type { CronTemplateInfo } from "../../../../api/types";
+import { useAppMessage } from "../../../../hooks/useAppMessage";
 import type { CronTemplateCategory, CronTemplateDefinition } from "./templates";
 import {
   templateDescription,
@@ -40,6 +42,7 @@ export function TemplatePickerModal({
   onUseTemplate,
 }: TemplatePickerModalProps) {
   const { t } = useTranslation();
+  const { message } = useAppMessage();
   const [category, setCategory] = useState<CronTemplateCategory>("cron");
   const [detailName, setDetailName] = useState<string | null>(null);
   const [editing, setEditing] = useState<CronTemplateInfo | null>(null);
@@ -70,7 +73,22 @@ export function TemplatePickerModal({
     { label: t("cronJobs.scheduleTypeOnce"), value: "once" },
   ];
 
-  const handleUseTemplate = (template: CronTemplateDefinition) => {
+  const handleUseTemplate = async (template: CronTemplateDefinition) => {
+    // Templates bundle their batch scripts: deploy them into the pool
+    // first so the job's preprocess script resolves without a separate
+    // import step. A conflict only means a script with the same name is
+    // already in the pool, which is exactly what the job references —
+    // so proceed; only a hard failure gets a warning.
+    if (template.batchFiles.length > 0 && template.packageName) {
+      try {
+        await api.installCronTemplateBatches(template.packageName, {});
+      } catch (error) {
+        const status = error instanceof Error ? error.message : String(error);
+        if (!/^409\b/.test(status)) {
+          message.warning(t("cronJobs.templateInstallBatchesFailed"));
+        }
+      }
+    }
     const templateValues = template.toFormValues(timezone);
     onUseTemplate({
       ...templateValues,
@@ -85,7 +103,7 @@ export function TemplatePickerModal({
   /** Use a template straight from the detail drawer's footer button. */
   const handleUseFromDetail = (info: CronTemplateInfo) => {
     setDetailName(null);
-    handleUseTemplate(toTemplateDefinition(info));
+    void handleUseTemplate(toTemplateDefinition(info));
   };
 
   const handlePickFile = () => fileInputRef.current?.click();

@@ -12,6 +12,7 @@ import type {
   CreateCronTemplateRequest,
   CronJobSpecOutput,
 } from "../../../../api/types";
+import { normalizePreprocessValue } from "./constants";
 import { parseCron } from "./parseCron";
 
 type CronJob = CronJobSpecOutput;
@@ -30,6 +31,10 @@ export function jobToFormValues(job: CronJob): Record<string, unknown> {
         : "",
     },
     scheduleType: job.schedule?.type || "cron",
+    // Always emit a complete preprocess value: the drawer form is not
+    // reset before editing, so a job without the block must overwrite
+    // whatever the previously edited job left behind.
+    preprocess: normalizePreprocessValue(job.preprocess),
   };
 
   if (job.schedule?.type === "once") {
@@ -135,6 +140,9 @@ export function jobToTemplateSpec(
   if (job.request) {
     spec.request = { ...job.request, user_id: "", session_id: "" };
   }
+  // A template is the job definition, so the preprocess block travels
+  // with it (the referenced script must exist in the target's pool).
+  if (job.preprocess) spec.preprocess = { ...job.preprocess };
   if (job.save_result_to_inbox !== undefined) {
     spec.save_result_to_inbox = job.save_result_to_inbox;
   }
@@ -155,6 +163,14 @@ export interface SaveAsTemplateOptions {
   emoji: string;
   tags: string[];
   includeDispatchTarget: boolean;
+  /**
+   * Batch scripts referenced by the job's preprocess, packaged under
+   * `batch/` so the template is self-contained (an importer installs
+   * them into its own pool via install-batches).
+   */
+  batchFiles?: Record<string, string>;
+  /** Package-relative entry, e.g. `batch/collect.json`. */
+  batchEntry?: string;
 }
 
 /** Build the request body for POST /cron-templates from a job. */
@@ -162,7 +178,7 @@ export function buildCreateTemplateRequest(
   job: CronJob,
   options: SaveAsTemplateOptions,
 ): CreateCronTemplateRequest {
-  return {
+  const request: CreateCronTemplateRequest = {
     name: options.name,
     title: options.title || job.name,
     description: options.description,
@@ -173,4 +189,9 @@ export function buildCreateTemplateRequest(
     form: jobToTemplateForm(job, options.includeDispatchTarget),
     job: jobToTemplateSpec(job, options.includeDispatchTarget),
   };
+  if (options.batchFiles && Object.keys(options.batchFiles).length > 0) {
+    request.batch_files = options.batchFiles;
+    if (options.batchEntry) request.batch_entry = options.batchEntry;
+  }
+  return request;
 }

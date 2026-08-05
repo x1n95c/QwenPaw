@@ -3,8 +3,17 @@ import { defineConfig, loadEnv } from "vite";
 import react from "@vitejs/plugin-react";
 import path from "path";
 
-// Vitest plugin: transforms .css imports inside node_modules to empty stubs.
+// Vitest-only: transforms .css imports inside node_modules to empty stubs.
 // This prevents errors from packages like @agentscope-ai/icons that import CSS.
+//
+// MUST stay test-only. It was previously registered unconditionally, which
+// silently dropped every stylesheet shipped by a dependency from the dev
+// server AND the production bundle. antd and the design system were
+// unaffected (both are CSS-in-JS), so the app looked fine — but Monaco's
+// stylesheet vanished, and an unstyled `.monaco-editor .ime-text-area`
+// falls back to UA defaults (white background, 1px border, resize: both,
+// position: static), rendering as a resizable white box that pushes the
+// code down and covers the first lines of the editor.
 const cssStubPlugin = {
   name: "css-stub",
   transform(_code: string, id: string) {
@@ -13,6 +22,9 @@ const cssStubPlugin = {
     }
   },
 };
+
+// Vitest sets this; `vite dev` and `vite build` do not.
+const isVitest = Boolean(process.env.VITEST);
 
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), "");
@@ -26,7 +38,7 @@ export default defineConfig(({ mode }) => {
       TOKEN: JSON.stringify(env.TOKEN || ""),
       MOBILE: false,
     },
-    plugins: [react(), cssStubPlugin],
+    plugins: [react(), ...(isVitest ? [cssStubPlugin] : [])],
     css: {
       modules: {
         localsConvention: "camelCase",

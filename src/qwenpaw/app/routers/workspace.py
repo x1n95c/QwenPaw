@@ -34,6 +34,7 @@ from ...agents.memory.agent_md_manager import AgentMdManager
 from ...agents.templates import get_workspace_md_template_id
 from ...agents.utils import copy_workspace_md_files
 from ...constant import BUILTIN_QA_AGENT_ID, SUPPORTED_AGENT_LANGUAGES
+from ...utils.http import content_disposition_attachment
 from ..agent_context import get_agent_for_request, get_coding_dir
 
 
@@ -1082,7 +1083,7 @@ async def download_workspace(request: Request):
         buf,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition_attachment(filename),
         },
     )
 

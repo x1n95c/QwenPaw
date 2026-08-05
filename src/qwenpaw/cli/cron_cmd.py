@@ -215,6 +215,66 @@ def _build_schedule_from_cli(
     return {"type": "cron", "cron": cron, "timezone": timezone}
 
 
+def _parse_key_value_pairs(
+    pairs: tuple[str, ...],
+    option_name: str,
+) -> Dict[str, str]:
+    """Parse repeatable ``KEY=VALUE`` CLI options into a dict."""
+    values: Dict[str, str] = {}
+    for pair in pairs:
+        if "=" not in pair:
+            raise click.UsageError(
+                f"{option_name} expects KEY=VALUE, got: {pair}",
+            )
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if not key:
+            raise click.UsageError(
+                f"{option_name} expects KEY=VALUE, got: {pair}",
+            )
+        values[key] = value
+    return values
+
+
+def _expand_dotted_args(values: Dict[str, Any]) -> Dict[str, Any]:
+    """Expand dotted keys into nested dicts.
+
+    The executor resolves ``${args.a.b}`` by walking ``args["a"]["b"]``
+    (``run_tool_batch._lookup_arg``), so ``--preprocess-arg a.b=v`` must
+    land as a nested mapping — a flat ``"a.b"`` key would fail with
+    "Missing arg" at run time.
+    """
+    expanded: Dict[str, Any] = {}
+    for key, value in values.items():
+        if "." not in key:
+            expanded[key] = value
+            continue
+        node = expanded
+        parts = key.split(".")
+        for part in parts[:-1]:
+            existing = node.get(part)
+            if not isinstance(existing, dict):
+                existing = {}
+                node[part] = existing
+            node = existing
+        node[parts[-1]] = value
+    return expanded
+
+
+def _build_preprocess(
+    preprocess_script: Optional[str],
+    preprocess_args: Optional[Dict[str, Any]],
+) -> Optional[dict]:
+    """Build the ``preprocess`` block for a CLI-created job spec."""
+    if not preprocess_script or not preprocess_script.strip():
+        return None
+    return {
+        "enabled": True,
+        "script": preprocess_script.strip(),
+        "args": _expand_dotted_args(dict(preprocess_args or {})),
+    }
+
+
 def _build_spec_from_cli(
     task_type: str,
     schedule_type: str,
@@ -237,8 +297,17 @@ def _build_spec_from_cli(
     share_session: bool = True,
     timeout_seconds: int = 120,
     tool_safety: bool = False,
+    preprocess_script: Optional[str] = None,
+    preprocess_args: Optional[Dict[str, Any]] = None,
 ) -> dict:
     """Build CronJobSpec JSON payload from CLI args (no id)."""
+    if preprocess_args and not (
+        preprocess_script and preprocess_script.strip()
+    ):
+        raise click.UsageError(
+            "--preprocess-arg requires --preprocess-script",
+        )
+    preprocess = _build_preprocess(preprocess_script, preprocess_args)
     schedule = _build_schedule_from_cli(
         schedule_type=schedule_type,
         cron=cron,
@@ -269,9 +338,11 @@ def _build_spec_from_cli(
             raise click.UsageError(
                 "--silent is only supported when task type is 'agent'",
             )
-        if not (text and text.strip()):
+        clean_text = text.strip() if text and text.strip() else None
+        if clean_text is None and preprocess is None:
             raise click.UsageError(
-                "--text is required when task type is 'text'",
+                "--text is required when task type is 'text' "
+                "and no --preprocess-script is given",
             )
         payload = {
             "id": "",
@@ -279,11 +350,13 @@ def _build_spec_from_cli(
             "enabled": enabled,
             "schedule": schedule,
             "task_type": "text",
-            "text": text.strip(),
+            "text": clean_text,
             "dispatch": dispatch,
             "runtime": runtime,
             "meta": {},
         }
+        if preprocess is not None:
+            payload["preprocess"] = preprocess
         if save_result_to_inbox is not None:
             payload["save_result_to_inbox"] = save_result_to_inbox
         return payload
@@ -312,6 +385,8 @@ def _build_spec_from_cli(
             "runtime": runtime,
             "meta": {},
         }
+        if preprocess is not None:
+            payload["preprocess"] = preprocess
         if save_result_to_inbox is not None:
             payload["save_result_to_inbox"] = save_result_to_inbox
         return payload
@@ -513,6 +588,25 @@ def _build_spec_from_cli(
     ),
 )
 @click.option(
+    "--preprocess-script",
+    default=None,
+    help=(
+        "Batch script name from the tool-batch pool to run before every "
+        "fire. For 'text' tasks the collected result is delivered "
+        "directly; for 'agent' tasks it is injected into the prompt."
+    ),
+)
+@click.option(
+    "--preprocess-arg",
+    "preprocess_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Value for the preprocess script's ${args.KEY} placeholders; "
+        "repeatable. Example: --preprocess-arg project=QwenPaw"
+    ),
+)
+@click.option(
     "--base-url",
     default=None,
     help="Override the API base URL. Defaults to global --host/--port.",
@@ -547,6 +641,8 @@ def create_job(
     share_session: bool,
     timeout_seconds: int,
     tool_safety: bool,
+    preprocess_script: Optional[str],
+    preprocess_pairs: tuple[str, ...],
     base_url: Optional[str],
     agent_id: str,
 ) -> None:
@@ -584,6 +680,12 @@ def create_job(
             raise click.UsageError(
                 "When --schedule-type is scheduled, --run-at is required",
             )
+        preprocess_args: Optional[Dict[str, str]] = None
+        if preprocess_pairs:
+            preprocess_args = _parse_key_value_pairs(
+                preprocess_pairs,
+                "--preprocess-arg",
+            )
         payload = _build_spec_from_cli(
             task_type=task_type or "agent",
             schedule_type=schedule_type,
@@ -606,6 +708,8 @@ def create_job(
             share_session=share_session,
             timeout_seconds=timeout_seconds,
             tool_safety=tool_safety,
+            preprocess_script=preprocess_script,
+            preprocess_args=preprocess_args,
         )
     with client(base_url) as c:
         headers = {"X-Agent-Id": agent_id}
@@ -637,6 +741,9 @@ def _resolve_update_spec(
     share_session: Optional[bool],
     timeout_seconds: Optional[int],
     tool_safety: Optional[bool] = None,
+    preprocess_script: Optional[str] = None,
+    preprocess_args: Optional[Dict[str, str]] = None,
+    remove_preprocess: bool = False,
 ) -> Dict[str, Any]:
     # pylint: disable=too-many-branches,too-many-statements
     """Merge CLI overrides with an existing cron-job spec.
@@ -718,6 +825,39 @@ def _resolve_update_spec(
                 ]
         else:
             payload["text"] = text.strip()
+
+    # --- preprocess ---
+    if remove_preprocess and preprocess_script is not None:
+        raise click.UsageError(
+            "--remove-preprocess cannot be combined with "
+            "--preprocess-script",
+        )
+    if remove_preprocess:
+        payload.pop("preprocess", None)
+    elif preprocess_script is not None or preprocess_args is not None:
+        block = payload.get("preprocess")
+        if not isinstance(block, dict):
+            block = {}
+        block = dict(block)
+        if preprocess_script is not None:
+            if not preprocess_script.strip():
+                raise click.UsageError(
+                    "--preprocess-script must not be empty",
+                )
+            block["script"] = preprocess_script.strip()
+            # script and inline actions are mutually exclusive
+            block.pop("actions", None)
+        if preprocess_args is not None:
+            merged = dict(block.get("args") or {})
+            merged.update(preprocess_args)
+            block["args"] = _expand_dotted_args(merged)
+        if not block.get("script") and block.get("actions") is None:
+            raise click.UsageError(
+                "--preprocess-arg requires the job to already have a "
+                "preprocess script (or pass --preprocess-script)",
+            )
+        block.setdefault("enabled", True)
+        payload["preprocess"] = block
 
     if save_result_to_inbox is not None:
         payload["save_result_to_inbox"] = save_result_to_inbox
@@ -856,6 +996,30 @@ def _resolve_update_spec(
     ),
 )
 @click.option(
+    "--preprocess-script",
+    default=None,
+    help=(
+        "Set the batch script (from the tool-batch pool) run before "
+        "every fire. Replaces any previously configured script."
+    ),
+)
+@click.option(
+    "--preprocess-arg",
+    "preprocess_pairs",
+    multiple=True,
+    metavar="KEY=VALUE",
+    help=(
+        "Value for the preprocess script's ${args.KEY} placeholders; "
+        "repeatable. Merged over the existing args."
+    ),
+)
+@click.option(
+    "--remove-preprocess",
+    is_flag=True,
+    default=False,
+    help="Remove the preprocess block from the job.",
+)
+@click.option(
     "--base-url",
     default=None,
     help="Override the API base URL.",
@@ -891,6 +1055,9 @@ def update_job(
     share_session: Optional[bool],
     timeout_seconds: Optional[int],
     tool_safety: Optional[bool],
+    preprocess_script: Optional[str],
+    preprocess_pairs: tuple[str, ...],
+    remove_preprocess: bool,
     base_url: Optional[str],
     agent_id: str,
 ) -> None:
@@ -914,6 +1081,12 @@ def update_job(
     if file_ is not None:
         payload = json.loads(file_.read_text(encoding="utf-8"))
     else:
+        preprocess_args: Optional[Dict[str, str]] = None
+        if preprocess_pairs:
+            preprocess_args = _parse_key_value_pairs(
+                preprocess_pairs,
+                "--preprocess-arg",
+            )
         payload = _resolve_update_spec(
             spec=existing.get("spec", existing),
             task_type=task_type,
@@ -937,6 +1110,9 @@ def update_job(
             share_session=share_session,
             timeout_seconds=timeout_seconds,
             tool_safety=tool_safety,
+            preprocess_script=preprocess_script,
+            preprocess_args=preprocess_args,
+            remove_preprocess=remove_preprocess,
         )
 
     payload["id"] = job_id

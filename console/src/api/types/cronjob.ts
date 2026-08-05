@@ -44,6 +44,40 @@ export interface CronJobRequest {
   [key: string]: unknown;
 }
 
+/**
+ * One script in the preprocess chain. `script` references a batch script
+ * from the shared pool; `actions` is the inline alternative (the UI only
+ * edits `script`). Exactly one of the two per step.
+ */
+export interface CronJobPreprocessStep {
+  script?: string;
+  actions?: Record<string, unknown>[];
+  args?: Record<string, unknown>;
+}
+
+/**
+ * Deterministic run_tool_batch scripts executed before the job body, in
+ * `steps` order.
+ */
+export interface CronJobPreprocessSpec {
+  enabled?: boolean;
+  steps?: CronJobPreprocessStep[];
+  /**
+   * Legacy single-script form. The server folds it into a one-entry
+   * `steps` and clears it, so a *response* only ever carries `steps`;
+   * these stay because the CLI and older clients still send them.
+   */
+  script?: string;
+  actions?: Record<string, unknown>[];
+  args?: Record<string, unknown>;
+  last_only?: boolean;
+  stop_on_error?: boolean;
+  maxstep?: number;
+  /** Budget for the whole chain, not per script. */
+  timeout_seconds?: number;
+  on_failure?: "continue" | "abort";
+}
+
 export interface CronJobSpecInput {
   id: string;
   name: string;
@@ -53,6 +87,7 @@ export interface CronJobSpecInput {
   task_type?: "text" | "agent";
   text?: string;
   request?: CronJobRequest;
+  preprocess?: CronJobPreprocessSpec | null;
   dispatch: CronJobDispatch;
   runtime?: CronJobRuntime;
   meta?: Record<string, unknown>;

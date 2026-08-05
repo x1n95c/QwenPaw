@@ -1,24 +1,9 @@
-import { useState, useCallback } from "react";
+import { useEffect, useState, useCallback } from "react";
 import { Form } from "@agentscope-ai/design";
 import { useAppMessage } from "../../../hooks/useAppMessage";
 import { useTranslation } from "react-i18next";
 import api from "../../../api";
 import { useToolGuard, type MergedRule } from "./useToolGuard";
-
-const BUILTIN_TOOLS = [
-  "execute_shell_command",
-  "execute_python_code",
-  "browser_use",
-  "desktop_screenshot",
-  "view_image",
-  "read_file",
-  "write_file",
-  "edit_file",
-  "append_file",
-  "view_text_file",
-  "write_text_file",
-  "send_file_to_user",
-];
 
 export function useSecurityPage() {
   const { t } = useTranslation();
@@ -88,6 +73,24 @@ export function useSecurityPage() {
     updateCustomRule,
     buildSaveBody,
   } = useToolGuard();
+
+  // Tool names for the guarded/denied tool selects. Fetched from the
+  // same GET /tools registry the Tools page and the batch editor use,
+  // instead of a hardcoded list that drifts from the backend.
+  const [toolNames, setToolNames] = useState<string[]>([]);
+
+  useEffect(() => {
+    let mounted = true;
+    api
+      .listTools()
+      .then((tools) => {
+        if (mounted) setToolNames((tools || []).map((tool) => tool.name));
+      })
+      .catch((error) => console.error("Failed to load tools", error));
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   // Modal states
   const [editModal, setEditModal] = useState(false);
@@ -230,7 +233,7 @@ export function useSecurityPage() {
     t,
   ]);
 
-  const toolOptions = BUILTIN_TOOLS.map((name) => ({
+  const toolOptions = toolNames.map((name) => ({
     label: name,
     value: name,
   }));

@@ -6,6 +6,8 @@ import type {
   CronTemplateFileContent,
   CronTemplateImportResult,
   CronTemplateInfo,
+  InstallTemplateBatchesRequest,
+  InstallTemplateBatchesResult,
   InstallTemplateSkillsRequest,
   InstallTemplateSkillsResult,
   UpdateCronTemplateRequest,
@@ -130,6 +132,20 @@ export const cronTemplateApi = {
   ) =>
     request<InstallTemplateSkillsResult>(
       `/cron-templates/${encodeURIComponent(name)}/install-skills`,
+      { method: "POST", body: JSON.stringify(body) },
+    ),
+
+  /**
+   * Copy the package's bundled batch/*.json scripts into the shared
+   * script pool, so jobs can reference them by name without depending
+   * on the package staying installed.
+   */
+  installCronTemplateBatches: (
+    name: string,
+    body: InstallTemplateBatchesRequest = {},
+  ) =>
+    request<InstallTemplateBatchesResult>(
+      `/cron-templates/${encodeURIComponent(name)}/install-batches`,
       { method: "POST", body: JSON.stringify(body) },
     ),
 

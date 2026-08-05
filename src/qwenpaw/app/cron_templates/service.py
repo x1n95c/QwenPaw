@@ -17,11 +17,13 @@ from typing import Any, TypeVar
 
 from ...exceptions import CronTemplateConflictError, CronTemplateError
 from ...utils.io_utils import staged_dir
+from ..tool_batches.service import ToolBatchService
 from .models import (
     CreateCronTemplateRequest,
     CronTemplateFrontmatter,
     CronTemplateInfo,
     CronTemplatePayload,
+    InstallTemplateBatchesRequest,
     InstallTemplateSkillsRequest,
     UpdateCronTemplateRequest,
     TEMPLATE_BATCH_DIR,
@@ -36,6 +38,7 @@ from .store import (
     get_builtin_cron_template_dir,
     get_cron_template_dir,
     iter_template_dirs,
+    list_batch_files,
     normalize_template_name,
     pack_template_to_zip,
     read_template_package,
@@ -468,6 +471,41 @@ class CronTemplateService:
             "skipped": skipped,
             "target": body.target,
         }
+
+    # ----- bundled batches -----
+
+    def install_batches(
+        self,
+        name: str,
+        body: InstallTemplateBatchesRequest,
+    ) -> dict[str, Any]:
+        """Copy a template package's ``batch/*.json`` scripts into the pool.
+
+        Mirrors ``install_skills`` but for batch scripts: the files are
+        copied (base names kept) rather than referenced, so jobs only
+        ever resolve scripts from the one pool directory. The copy goes
+        through the tool-batches import pipeline, so the scripts get the
+        same validation, security scan and batch conflict reporting as a
+        zip upload. Returns ``{"imported": [...], "conflicts": [...]}``;
+        when conflicts is non-empty nothing was written.
+        """
+        resolved = resolve_template_dir(name)
+        if resolved is None:
+            raise CronTemplateError(f"Template not found: {name}")
+        package_dir, _ = resolved
+        relative_paths = list_batch_files(package_dir)
+        if not relative_paths:
+            raise CronTemplateError(
+                f"Template '{name}' does not bundle any batch scripts",
+            )
+        candidates = [
+            (package_dir / relative, relative) for relative in relative_paths
+        ]
+        return ToolBatchService().import_batch_files(
+            candidates,
+            rename_map=body.rename_map,
+            overwrite=body.overwrite,
+        )
 
     # ----- helpers -----
 

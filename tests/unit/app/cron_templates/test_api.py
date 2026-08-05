@@ -326,3 +326,79 @@ def test_install_skills_unknown_template_is_404(client: TestClient):
         json={"target": "pool"},
     )
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Bundled batches (install into the tool-batch pool)
+# ---------------------------------------------------------------------------
+
+
+def test_install_batches_into_pool(client: TestClient):
+    from qwenpaw.app.tool_batches.service import ToolBatchService
+
+    client.post(
+        "/cron-templates",
+        json=create_body(batch_files={"collect": BATCH_JSON}),
+    )
+    response = client.post(
+        "/cron-templates/api-tpl/install-batches",
+        json={},
+    )
+    assert response.status_code == 200
+    assert response.json() == {"installed": ["collect"], "conflicts": []}
+    listed = ToolBatchService().list_batches()
+    assert [b.name for b in listed] == ["collect"]
+
+
+def test_install_batches_conflict_is_409(client: TestClient):
+    client.post(
+        "/cron-templates",
+        json=create_body(batch_files={"collect": BATCH_JSON}),
+    )
+    client.post("/cron-templates/api-tpl/install-batches", json={})
+    response = client.post("/cron-templates/api-tpl/install-batches", json={})
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["message"]
+    assert detail["conflicts"][0]["name"] == "collect"
+    assert detail["conflicts"][0]["file_name"] == "batch/collect.json"
+    assert detail["conflicts"][0]["suggested_name"] == "collect-2"
+
+
+def test_install_batches_overwrite(client: TestClient):
+    client.post(
+        "/cron-templates",
+        json=create_body(batch_files={"collect": BATCH_JSON}),
+    )
+    client.post("/cron-templates/api-tpl/install-batches", json={})
+    response = client.post(
+        "/cron-templates/api-tpl/install-batches",
+        json={"overwrite": True},
+    )
+    assert response.status_code == 200
+    assert response.json()["installed"] == ["collect"]
+
+
+def test_install_batches_rename_map(client: TestClient):
+    client.post(
+        "/cron-templates",
+        json=create_body(batch_files={"collect": BATCH_JSON}),
+    )
+    client.post("/cron-templates/api-tpl/install-batches", json={})
+    response = client.post(
+        "/cron-templates/api-tpl/install-batches",
+        json={"rename_map": {"collect": "collect-v2"}},
+    )
+    assert response.status_code == 200
+    assert response.json()["installed"] == ["collect-v2"]
+
+
+def test_install_batches_without_bundle_is_400(client: TestClient):
+    client.post("/cron-templates", json=create_body())
+    response = client.post("/cron-templates/api-tpl/install-batches", json={})
+    assert response.status_code == 400
+
+
+def test_install_batches_unknown_template_is_404(client: TestClient):
+    response = client.post("/cron-templates/ghost/install-batches", json={})
+    assert response.status_code == 404

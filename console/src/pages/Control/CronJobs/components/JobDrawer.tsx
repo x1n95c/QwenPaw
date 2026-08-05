@@ -17,6 +17,7 @@ import type {
   CronJobSpecOutput,
 } from "../../../../api/types";
 import { DEFAULT_FORM_VALUES } from "./constants";
+import { PreprocessSection } from "./PreprocessSection";
 import { useTimezoneOptions } from "../../../../hooks/useTimezoneOptions";
 import styles from "../index.module.less";
 
@@ -536,6 +537,10 @@ export function JobDrawer({
             <Select.Option value="agent">agent</Select.Option>
           </Select>
         </Form.Item>
+
+        {/* Between the task type and the message content: the batch
+            script collects data first, then the task body consumes it. */}
+        <PreprocessSection form={form} />
 
         <Form.Item
           noStyle

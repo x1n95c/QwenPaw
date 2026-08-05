@@ -24,11 +24,14 @@ from ...exceptions import (
     CronTemplateConflictError,
     CronTemplateError,
     SkillScanError,
+    ToolBatchError,
 )
+from ...utils.http import content_disposition_attachment
 from ..utils import check_upload_size, schedule_agent_reload
 from .models import (
     CreateCronTemplateRequest,
     CronTemplateInfo,
+    InstallTemplateBatchesRequest,
     InstallTemplateSkillsRequest,
     UpdateCronTemplateRequest,
 )
@@ -158,7 +161,7 @@ async def export_template(name: str) -> Response:
         content=blob,
         media_type="application/zip",
         headers={
-            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Disposition": content_disposition_attachment(filename),
             "Content-Length": str(len(blob)),
         },
     )
@@ -317,3 +320,40 @@ async def install_template_skills(
         workspace = await get_agent_for_request(request)
         schedule_agent_reload(request, workspace.agent_id)
     return result
+
+
+@router.post("/{name}/install-batches")
+async def install_template_batches(
+    name: str,
+    body: InstallTemplateBatchesRequest,
+) -> dict[str, Any]:
+    """Copy a template package's ``batch/*.json`` scripts into the pool.
+
+    Scripts are copied (base names kept) through the same
+    validate + scan + conflict pipeline as ``POST /tool-batches/upload``,
+    so jobs only ever resolve scripts from the one pool directory.
+    """
+    try:
+        result = await asyncio.to_thread(
+            CronTemplateService().install_batches,
+            name,
+            body,
+        )
+    except SkillScanError as exc:
+        return _scan_error_response(exc)  # type: ignore[return-value]
+    except CronTemplateError as exc:
+        raise _not_found(exc) from exc
+    except ToolBatchError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=exc.message or str(exc),
+        ) from exc
+    if result.get("conflicts"):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": "Batch install has conflicts",
+                "conflicts": result["conflicts"],
+            },
+        )
+    return {"installed": result["imported"], "conflicts": []}

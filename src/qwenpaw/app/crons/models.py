@@ -189,30 +189,92 @@ class JobRuntimeSpec(BaseModel):
 MAX_PREPROCESS_STEPS = 50
 DEFAULT_PREPROCESS_MAX_EXECUTION_STEPS = 500
 
+#: How many scripts one preprocess chain may hold. Each one is a separate
+#: ``run_tool_batch`` invocation with its own toolkit build, and the whole
+#: chain shares a single wall-clock budget — so a long chain mostly means
+#: later scripts get starved. Ten is well past any real collection recipe.
+MAX_PREPROCESS_SCRIPTS = 10
 
-class PreprocessSpec(BaseModel):
-    """A ``run_tool_batch`` script run deterministically before each fire.
 
-    Not a tool the model may choose: the batch runs first, every time,
-    unconditionally. That is the point — collecting data needs no reasoning,
-    so making the LLM decide to collect it wastes a whole turn.
+class PreprocessStepSpec(BaseModel):
+    """One batch script in the preprocess chain.
 
-    Applies to both task types, with different destinations for the result:
-
-    * ``agent`` — the call and its result are appended to the user prompt,
-      so the model starts with the data already in hand.
-    * ``text`` — the result is delivered to the user directly; no LLM is
-      involved at any point.
+    Args live per step, not on the chain: two scripts declare their own
+    ``${args.*}`` placeholders, and a shared bag would make a name
+    collision silently feed one script the other's value.
     """
 
-    enabled: bool = True
     #: Script name in the shared batch pool, with or without ``.json``.
     #: Mutually exclusive with ``actions``.
     script: Optional[str] = None
     #: Inline actions, for a one-off not worth pooling.
     actions: Optional[list[dict[str, Any]]] = None
-    #: Values for the script's ``${args.<name>}`` placeholders.
+    #: Values for this script's ``${args.<name>}`` placeholders.
     args: Dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> "PreprocessStepSpec":
+        # `is None` rather than truthiness: `actions=[]` means "provided but
+        # empty", which deserves its own message instead of being reported
+        # as "you gave me neither source".
+        has_script = bool(self.script and self.script.strip())
+        has_actions = self.actions is not None
+        if has_script == has_actions:
+            raise ValueError(
+                "preprocess step requires exactly one of "
+                "'script' or 'actions'",
+            )
+        if self.actions is not None:
+            if not self.actions:
+                raise ValueError("preprocess step actions must be non-empty")
+            if len(self.actions) > MAX_PREPROCESS_STEPS:
+                raise ValueError(
+                    f"preprocess step has {len(self.actions)} actions; "
+                    f"maximum is {MAX_PREPROCESS_STEPS}",
+                )
+        return self
+
+    @property
+    def label(self) -> str:
+        """Human-readable identity for logs and the injected prompt."""
+        if self.script:
+            return self.script
+        return f"<inline:{len(self.actions or [])} steps>"
+
+
+class PreprocessSpec(BaseModel):
+    """``run_tool_batch`` scripts run deterministically before each fire.
+
+    Not a tool the model may choose: the chain runs first, every time,
+    unconditionally. That is the point — collecting data needs no reasoning,
+    so making the LLM decide to collect it wastes a whole turn.
+
+    Several scripts may be chained; they run in list order, and each one's
+    result is reported separately so a consumer can tell which collection
+    step produced what (and which one failed).
+
+    Applies to both task types, with different destinations for the result:
+
+    * ``agent`` — the calls and their results are appended to the user
+      prompt, so the model starts with the data already in hand.
+    * ``text`` — the results are delivered to the user directly; no LLM is
+      involved at any point.
+    """
+
+    enabled: bool = True
+    #: Scripts to run, in order. Populated from the legacy single-script
+    #: fields below when those are what a caller sent.
+    steps: list[PreprocessStepSpec] = Field(default_factory=list)
+
+    # --- Legacy single-script form -----------------------------------
+    # Kept so a `jobs.json` written before chaining existed still loads,
+    # and so an API/CLI caller can keep posting the simple shape. The
+    # validator folds these into `steps` and clears them, which means
+    # everything downstream only ever reads `steps`.
+    script: Optional[str] = None
+    actions: Optional[list[dict[str, Any]]] = None
+    args: Dict[str, Any] = Field(default_factory=dict)
+
     #: Default True, unlike ``run_tool_batch``'s own False: this output goes
     #: into a prompt on a schedule, so full per-step results for a 20-step
     #: batch would compound in token cost every single run.
@@ -222,33 +284,51 @@ class PreprocessSpec(BaseModel):
         default=DEFAULT_PREPROCESS_MAX_EXECUTION_STEPS,
         ge=1,
     )
-    #: Wall-clock bound. ``run_tool_batch`` caps step *count*, not time, and
-    #: a step may carry an arbitrary ``wait`` — so without this a hung
-    #: command would hold the job's concurrency slot forever.
+    #: Wall-clock bound for the WHOLE chain, not per script.
+    #: ``run_tool_batch`` caps step *count*, not time, and a step may carry
+    #: an arbitrary ``wait`` — so without this a hung command would hold the
+    #: job's concurrency slot forever. Budgeting the chain rather than each
+    #: script keeps that guarantee no matter how many scripts are added.
     timeout_seconds: int = Field(default=120, ge=1)
-    #: ``continue`` reports the failure to the agent / user and carries on;
-    #: ``abort`` skips delivery entirely.
+    #: ``continue`` reports the failure to the agent / user and carries on
+    #: with the remaining scripts; ``abort`` skips delivery entirely.
     on_failure: Literal["continue", "abort"] = "continue"
 
     @model_validator(mode="after")
-    def _validate_source(self) -> "PreprocessSpec":
-        # `is None` rather than truthiness: `actions=[]` means "provided but
-        # empty", which deserves its own message instead of being reported
-        # as "you gave me neither source".
-        has_script = bool(self.script and self.script.strip())
-        has_actions = self.actions is not None
-        if has_script == has_actions:
+    def _normalize_steps(self) -> "PreprocessSpec":
+        legacy_given = (
+            bool(self.script and self.script.strip())
+            or self.actions is not None
+        )
+        if self.steps and legacy_given:
             raise ValueError(
-                "preprocess requires exactly one of 'script' or 'actions'",
+                "preprocess accepts either 'steps' or the single-script "
+                "'script'/'actions' form, not both",
             )
-        if self.actions is not None:
-            if not self.actions:
-                raise ValueError("preprocess.actions must be non-empty")
-            if len(self.actions) > MAX_PREPROCESS_STEPS:
+        if not self.steps:
+            if not legacy_given:
                 raise ValueError(
-                    f"preprocess.actions has {len(self.actions)} steps; "
-                    f"maximum is {MAX_PREPROCESS_STEPS}",
+                    "preprocess requires at least one script: set 'steps', "
+                    "or the single-script 'script'/'actions' form",
                 )
+            # Raises with the step-level message if the legacy pair is
+            # itself contradictory (both or neither).
+            self.steps = [
+                PreprocessStepSpec(
+                    script=self.script,
+                    actions=self.actions,
+                    args=self.args,
+                ),
+            ]
+        if len(self.steps) > MAX_PREPROCESS_SCRIPTS:
+            raise ValueError(
+                f"preprocess has {len(self.steps)} scripts; "
+                f"maximum is {MAX_PREPROCESS_SCRIPTS}",
+            )
+        # One source of truth from here on: downstream reads `steps` only.
+        self.script = None
+        self.actions = None
+        self.args = {}
         return self
 
 

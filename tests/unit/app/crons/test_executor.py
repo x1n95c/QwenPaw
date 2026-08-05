@@ -247,17 +247,28 @@ async def test_fast_text_delivery_is_unaffected():
 
 
 def _preprocess_result(ok: bool = True, user_text: str = "collected"):
-    from qwenpaw.app.crons.preprocess import PreprocessResult
+    """A one-script chain result, which is what the executor consumes."""
+    from qwenpaw.app.crons.preprocess import (
+        PreprocessResult,
+        PreprocessStepResult,
+    )
 
     return PreprocessResult(
         ok=ok,
         status="ok" if ok else "failed",
-        script_label="collect",
-        call_text='{"tool_name": "run_tool_batch"}',
-        result_json='{"ok": true, "text": "collected"}',
-        user_text=user_text,
-        error="" if ok else "boom",
         duration_ms=7,
+        steps=[
+            PreprocessStepResult(
+                ok=ok,
+                status="ok" if ok else "failed",
+                script_label="collect",
+                call_text='{"tool_name": "run_tool_batch"}',
+                result_json='{"ok": true, "text": "collected"}',
+                user_text=user_text,
+                error="" if ok else "boom",
+                duration_ms=7,
+            ),
+        ],
     )
 
 

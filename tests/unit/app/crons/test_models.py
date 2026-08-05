@@ -178,21 +178,72 @@ def test_preprocess_step_caps_match_run_tool_batch():
     )
 
 
-def test_preprocess_requires_exactly_one_source():
+def test_preprocess_requires_at_least_one_script():
     from qwenpaw.app.crons.models import PreprocessSpec
 
-    with pytest.raises(ValidationError, match="exactly one of"):
+    with pytest.raises(ValidationError, match="at least one script"):
         PreprocessSpec()
+
+
+def test_preprocess_step_requires_exactly_one_source():
+    from qwenpaw.app.crons.models import PreprocessSpec
+
     with pytest.raises(ValidationError, match="exactly one of"):
         PreprocessSpec(script="a", actions=[{"tool_name": "x"}])
+    with pytest.raises(ValidationError, match="exactly one of"):
+        PreprocessSpec(
+            steps=[{"script": "a", "actions": [{"tool_name": "x"}]}],
+        )
 
 
-def test_preprocess_accepts_either_source():
+def test_preprocess_rejects_mixing_steps_with_the_legacy_form():
+    """Two sources of truth for the same thing is how one gets ignored."""
     from qwenpaw.app.crons.models import PreprocessSpec
 
-    assert PreprocessSpec(script="collect").script == "collect"
-    spec = PreprocessSpec(actions=[{"tool_name": "x"}])
-    assert spec.actions == [{"tool_name": "x"}]
+    with pytest.raises(ValidationError, match="not both"):
+        PreprocessSpec(script="a", steps=[{"script": "b"}])
+
+
+def test_preprocess_folds_the_legacy_form_into_one_step():
+    """A jobs.json written before chaining existed must still load.
+
+    The legacy fields are cleared afterwards so everything downstream has
+    exactly one place to read from.
+    """
+    from qwenpaw.app.crons.models import PreprocessSpec
+
+    spec = PreprocessSpec(script="collect", args={"path": "/tmp"})
+    assert [step.script for step in spec.steps] == ["collect"]
+    assert spec.steps[0].args == {"path": "/tmp"}
+    assert spec.script is None and spec.args == {}
+
+    inline = PreprocessSpec(actions=[{"tool_name": "x"}])
+    assert inline.steps[0].actions == [{"tool_name": "x"}]
+    assert inline.actions is None
+
+
+def test_preprocess_accepts_a_chain_of_scripts():
+    from qwenpaw.app.crons.models import PreprocessSpec
+
+    spec = PreprocessSpec(
+        steps=[{"script": "a", "args": {"x": "1"}}, {"script": "b"}],
+    )
+    assert [step.script for step in spec.steps] == ["a", "b"]
+    # Args are per step, so one script cannot see another's values.
+    assert spec.steps[0].args == {"x": "1"}
+    assert spec.steps[1].args == {}
+
+
+def test_preprocess_enforces_the_script_chain_cap():
+    from qwenpaw.app.crons.models import (
+        MAX_PREPROCESS_SCRIPTS,
+        PreprocessSpec,
+    )
+
+    ok = [{"script": f"s{i}"} for i in range(MAX_PREPROCESS_SCRIPTS)]
+    assert len(PreprocessSpec(steps=ok).steps) == MAX_PREPROCESS_SCRIPTS
+    with pytest.raises(ValidationError, match="maximum is"):
+        PreprocessSpec(steps=[*ok, {"script": "one-too-many"}])
 
 
 def test_preprocess_rejects_empty_actions():
@@ -229,7 +280,8 @@ def test_preprocess_does_not_validate_script_existence():
     """A deleted script must not make jobs.json unparseable."""
     from qwenpaw.app.crons.models import PreprocessSpec
 
-    assert PreprocessSpec(script="does-not-exist").script == "does-not-exist"
+    spec = PreprocessSpec(script="does-not-exist")
+    assert spec.steps[0].script == "does-not-exist"
 
 
 # ---------------------------------------------------------------------------
@@ -296,5 +348,24 @@ def test_preprocess_survives_a_round_trip():
     )
     restored = CronJobSpec.model_validate(spec.model_dump(mode="json"))
     assert restored.preprocess is not None
-    assert restored.preprocess.script == "collect"
-    assert restored.preprocess.args == {"path": "/tmp"}
+    assert restored.preprocess.steps[0].script == "collect"
+    assert restored.preprocess.steps[0].args == {"path": "/tmp"}
+
+
+def test_preprocess_chain_survives_a_round_trip():
+    """The dump must reload: the legacy fields are cleared on the way in,
+    so a chain has to round-trip through `steps` alone."""
+    spec = make_cron_job_spec(
+        preprocess={
+            "steps": [
+                {"script": "a", "args": {"x": "1"}},
+                {"actions": [{"tool_name": "t"}]},
+            ],
+        },
+    )
+    restored = CronJobSpec.model_validate(spec.model_dump(mode="json"))
+    assert restored.preprocess is not None
+    steps = restored.preprocess.steps
+    assert [step.script for step in steps] == ["a", None]
+    assert steps[0].args == {"x": "1"}
+    assert steps[1].actions == [{"tool_name": "t"}]

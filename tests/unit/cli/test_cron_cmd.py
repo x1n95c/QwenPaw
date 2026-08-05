@@ -7,6 +7,8 @@ from click.testing import CliRunner
 
 from qwenpaw.cli.cron_cmd import (
     _build_spec_from_cli,
+    _expand_dotted_args,
+    _parse_key_value_pairs,
     _resolve_update_spec,
     cron_group,
 )
@@ -278,3 +280,153 @@ def test_update_agent_text_with_malformed_input_rebuilds():
 
     content2 = result2["request"]["input"][0]["content"][0]
     assert content2["text"] == "fresh prompt"
+
+
+# --- preprocess options ---
+
+
+def test_build_spec_with_preprocess_script():
+    payload = _agent_spec(
+        preprocess_script="collect-news",
+        preprocess_args={"topic": "ai"},
+    )
+
+    assert payload["preprocess"] == {
+        "enabled": True,
+        "script": "collect-news",
+        "args": {"topic": "ai"},
+    }
+
+
+def test_build_text_spec_allows_empty_text_with_preprocess():
+    payload = _agent_spec(
+        task_type="text",
+        text=None,
+        preprocess_script="scan-disk",
+    )
+
+    assert payload["task_type"] == "text"
+    assert payload["text"] is None
+    assert payload["preprocess"]["script"] == "scan-disk"
+
+
+def test_build_text_spec_still_requires_text_without_preprocess():
+    with pytest.raises(click.UsageError, match="--text is required"):
+        _agent_spec(task_type="text", text=None)
+
+
+def test_build_spec_preprocess_arg_requires_script():
+    with pytest.raises(
+        click.UsageError,
+        match="requires --preprocess-script",
+    ):
+        _agent_spec(preprocess_args={"a": "b"})
+
+
+def test_parse_key_value_pairs():
+    result = _parse_key_value_pairs(
+        ("a=b", "c=d=e"),
+        "--preprocess-arg",
+    )
+
+    assert result == {"a": "b", "c": "d=e"}
+
+
+def test_expand_dotted_args_nests_paths():
+    """${args.a.b} resolves via nested lookup, so flat keys must nest."""
+    result = _expand_dotted_args({"a.b": "1", "a.c": "2", "plain": "3"})
+
+    assert result == {"a": {"b": "1", "c": "2"}, "plain": "3"}
+
+
+def test_build_spec_expands_dotted_preprocess_args():
+    payload = _agent_spec(
+        preprocess_script="collect",
+        preprocess_args={"out.dir": "/tmp"},
+    )
+
+    assert payload["preprocess"]["args"] == {"out": {"dir": "/tmp"}}
+
+
+def test_parse_key_value_pairs_rejects_malformed():
+    with pytest.raises(click.UsageError, match="expects KEY=VALUE"):
+        _parse_key_value_pairs(("novalue",), "--preprocess-arg")
+    with pytest.raises(click.UsageError, match="expects KEY=VALUE"):
+        _parse_key_value_pairs(("=v",), "--preprocess-arg")
+
+
+def test_create_help_exposes_preprocess_options():
+    result = CliRunner().invoke(cron_group, ["create", "--help"])
+
+    assert result.exit_code == 0
+    assert "--preprocess-script" in result.output
+    assert "--preprocess-arg KEY=VALUE" in result.output
+
+
+def test_update_help_exposes_preprocess_options():
+    result = CliRunner().invoke(cron_group, ["update", "--help"])
+
+    assert result.exit_code == 0
+    assert "--preprocess-script" in result.output
+    assert "--remove-preprocess" in result.output
+
+
+def test_update_sets_preprocess_script():
+    result = _update(
+        _text_job_spec(),
+        preprocess_script="collect",
+        preprocess_args={"k": "v"},
+    )
+
+    assert result["preprocess"] == {
+        "enabled": True,
+        "script": "collect",
+        "args": {"k": "v"},
+    }
+
+
+def test_update_preprocess_merges_args_and_keeps_knobs():
+    spec = _text_job_spec()
+    spec["preprocess"] = {
+        "enabled": True,
+        "script": "old-script",
+        "args": {"keep": "1", "override": "old"},
+        "last_only": False,
+        "timeout_seconds": 60,
+    }
+
+    result = _update(
+        spec,
+        preprocess_script="new-script",
+        preprocess_args={"override": "new"},
+    )
+
+    block = result["preprocess"]
+    assert block["script"] == "new-script"
+    assert block["args"] == {"keep": "1", "override": "new"}
+    assert block["last_only"] is False
+    assert block["timeout_seconds"] == 60
+    assert "actions" not in block
+
+
+def test_update_preprocess_args_only_requires_existing():
+    with pytest.raises(click.UsageError, match="already have a"):
+        _update(_text_job_spec(), preprocess_args={"k": "v"})
+
+
+def test_update_remove_preprocess():
+    spec = _text_job_spec()
+    spec["preprocess"] = {"enabled": True, "script": "x", "args": {}}
+
+    result = _update(spec, remove_preprocess=True)
+
+    assert "preprocess" not in result
+
+
+def test_update_remove_preprocess_conflicts_with_script():
+    with pytest.raises(click.UsageError, match="cannot be combined"):
+        _update(
+            _text_job_spec(),
+            preprocess_script="x",
+            remove_preprocess=True,
+        )

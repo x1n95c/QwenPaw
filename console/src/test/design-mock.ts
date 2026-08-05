@@ -61,6 +61,36 @@ export const Modal = Object.assign(passThrough, {
 
 export const Tag = passThrough;
 export const Tooltip = passThrough;
+
+/**
+ * Renders every panel's label and children unconditionally.
+ *
+ * Expand/collapse is the real component's business; a test that asserts
+ * on panel content should not have to drive an animation first.
+ */
+export const Collapse = ({
+  items,
+  ...props
+}: Record<string, unknown> & {
+  items?: {
+    key?: string;
+    label?: React.ReactNode;
+    children?: React.ReactNode;
+  }[];
+}) =>
+  React.createElement(
+    "div",
+    props,
+    (items || []).map((item, index) =>
+      React.createElement(
+        "div",
+        { key: item.key ?? index },
+        React.createElement("div", null, item.label),
+        React.createElement("div", null, item.children),
+      ),
+    ),
+  );
+export const CollapsePanel = passThrough;
 export const Form = Object.assign(passThrough, {
   Item: passThrough,
   useForm: () => [{}],
@@ -78,6 +108,8 @@ export default {
   Modal,
   Tag,
   Tooltip,
+  Collapse,
+  CollapsePanel,
   Form,
   InputNumber,
   Spin,

@@ -426,6 +426,286 @@
   word-break: break-word;
 }
 
+.batchPickerEmpty {
+  padding: 32px 0;
+  text-align: center;
+  color: rgba(20, 20, 19, 0.45);
+  font-size: 13px;
+}
+
+.batchEditor {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.batchEditorField {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.batchEditorLabel {
+  font-size: 13px;
+  color: rgba(20, 20, 19, 0.88);
+}
+
+.batchEditorFieldHint {
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.45);
+}
+
+.batchEditorFieldError {
+  font-size: 12px;
+  color: #d4380d;
+}
+
+.batchEditorJson {
+  border: 1px solid #eaeaea;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.batchEditorIssues {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12px;
+}
+
+.templateImportHint {
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.55);
+  margin-bottom: 8px;
+}
+
+.templateImportRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 0;
+  border-bottom: 1px solid #f0f0f0;
+
+  &:last-child {
+    border-bottom: none;
+  }
+}
+
+.templateImportFileName {
+  margin-left: 8px;
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.45);
+}
+
+/* --- preprocess section (job drawer) --- */
+
+/* The enable switch is a plain Form.Item; everything below appears only
+   once it is on, so a job without a preprocess shows a single row. */
+.preprocessBody {
+  display: flex;
+  flex-direction: column;
+}
+
+.preprocessSteps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.preprocessStep {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #eaeaea;
+  border-radius: 8px;
+  background: #fcfcfc;
+}
+
+.preprocessStepHead {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preprocessStepOrdinal {
+  flex: 0 0 auto;
+  width: 22px;
+  height: 22px;
+  border-radius: 11px;
+  background: #f0f0f0;
+  color: rgba(20, 20, 19, 0.65);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.preprocessStepSelect {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.preprocessStepArgs {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.preprocessArgRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.preprocessArgName {
+  flex: 0 0 auto;
+  width: 140px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.65);
+}
+
+/* Pool-level actions, below the list they do not belong to any row of. */
+.preprocessPoolActions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+// The design system sets antd's prefixCls to "qwenpaw" (App.tsx passes
+// prefix/prefixCls), so antd internals are `.qwenpaw-*`. A `.ant-*`
+// selector here silently matches nothing.
+.preprocessAdvanced {
+  :global(.qwenpaw-collapse-header) {
+    padding: 0 0 8px !important;
+    align-items: center !important;
+  }
+
+  :global(.qwenpaw-collapse-content-box) {
+    padding: 0 !important;
+  }
+}
+
+.batchStepPreview {
+  border: 1px solid #f0f0f0;
+  border-radius: 8px;
+  background: #fafafa;
+
+  :global(.qwenpaw-collapse-header) {
+    padding: 6px 10px !important;
+    align-items: center !important;
+  }
+
+  :global(.qwenpaw-collapse-content-box) {
+    padding: 0 10px 10px !important;
+  }
+}
+
+.batchStepPreviewTitle {
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.55);
+}
+
+.batchStepList {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.batchStepMore {
+  font-size: 12px;
+  color: rgba(20, 20, 19, 0.45);
+}
+
+/* --- batch script cards (manage-scripts modal) --- */
+
+.batchCardHeader {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.batchCardMain {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.batchCardTags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.batchCardActions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 8px;
+}
+
+.batchStepRow {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  background: #fff;
+  border: 1px solid #eaeaea;
+  border-radius: 8px;
+  padding: 8px 10px;
+}
+
+.batchStepIndex {
+  flex: 0 0 auto;
+  min-width: 20px;
+  height: 20px;
+  border-radius: 10px;
+  background: #f0f0f0;
+  color: rgba(20, 20, 19, 0.65);
+  font-size: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.batchStepBody {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.batchStepTool {
+  font-weight: 500;
+  font-size: 13px;
+  color: rgba(20, 20, 19, 0.88);
+}
+
+.batchStepParam {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  min-width: 0;
+}
+
+.batchStepParamKey {
+  flex: 0 0 auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: rgba(20, 20, 19, 0.55);
+}
+
+.batchStepParamValue {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  color: rgba(20, 20, 19, 0.88);
+}
+
 .historyList {
   max-height: 420px;
   overflow-y: auto;

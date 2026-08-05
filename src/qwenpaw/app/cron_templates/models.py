@@ -207,6 +207,20 @@ class InstallTemplateSkillsRequest(BaseModel):
     overwrite: bool = False
 
 
+class InstallTemplateBatchesRequest(BaseModel):
+    """Copy a template package's ``batch/*.json`` scripts into the pool.
+
+    The scripts are copied (keeping their base names), never referenced
+    in place — a job pointing at a file inside a template package would
+    break the moment the package is updated, forked or deleted.
+    """
+
+    overwrite: bool = False
+    #: ``{"old": "new"}`` pool-name renames, same semantics as the
+    #: tool-batches ``upload`` endpoint.
+    rename_map: dict[str, str] = Field(default_factory=dict)
+
+
 __all__ = [
     "KNOWN_TEMPLATE_TAGS",
     "MANIFEST_SCHEMA_VERSION",
@@ -220,6 +234,7 @@ __all__ = [
     "CronTemplateFrontmatter",
     "CronTemplateInfo",
     "CronTemplatePayload",
+    "InstallTemplateBatchesRequest",
     "InstallTemplateSkillsRequest",
     "TemplateCategory",
     "TemplateSource",

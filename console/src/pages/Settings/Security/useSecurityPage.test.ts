@@ -22,6 +22,9 @@ const hoisted = vi.hoisted(() => {
     getBuiltinRules: vi.fn(),
     updateToolGuard: vi.fn(),
     updateSandbox: vi.fn(),
+    // useSecurityPage loads the tool registry for the rule modal's
+    // tool dropdown on mount.
+    listTools: vi.fn().mockResolvedValue([]),
   };
   const stableT = (k: string) => k;
   const buildSaveBodyMock = vi.fn(() => ({
