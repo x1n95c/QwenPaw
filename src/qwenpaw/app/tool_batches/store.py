@@ -1,11 +1,11 @@
 # -*- coding: utf-8 -*-
-"""Filesystem layer for the shared ``run_tool_batch`` script pool.
+"""Filesystem layer for a directory of ``run_tool_batch`` scripts.
 
-The pool is a flat directory of ``<name>.json`` files — no manifest, no
-frontmatter, the filesystem is the source of truth. It is the same
-directory cron preprocesses resolve pool scripts from
-(``app/crons/preprocess.py``), so anything stored here is immediately
-runnable by name, and the file-name contract stays in one place.
+A flat directory of ``<name>.json`` files — no manifest, no frontmatter,
+the filesystem is the source of truth. The directory belongs to one cron
+job (``<workspace_dir>/cron_jobs/<job_id>/batch/``), which is the same
+place ``crons/script_paths`` resolves a step's script from, so anything
+stored here is immediately runnable by name.
 
 Storage rules mirror ``run_tool_batch._load_batch_file``: a bare JSON
 array of actions or an object with an ``actions`` array. Validation is
@@ -20,9 +20,10 @@ import io
 import json
 import logging
 import zipfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from ...agents.skill_system.store import is_ignored_skill_entry
 from ...agents.tools.run_tool_batch import (
@@ -33,6 +34,7 @@ from ...agents.tools.run_tool_batch import (
 from ...exceptions import ToolBatchError
 from ...security.skill_scanner import scan_skill_directory
 from ...utils.io_utils import extract_zip_safely
+from ..crons.script_paths import WINDOWS_RESERVED_NAMES
 from .models import ToolBatchInfo
 
 logger = logging.getLogger(__name__)
@@ -44,12 +46,10 @@ MAX_BATCH_ZIP_BYTES = 100 * 1024 * 1024
 MAX_BATCH_ZIP_ENTRIES = 4096
 
 #: DOS device names, which Windows resolves before the filesystem does.
-#: ``is_ignored_skill_entry`` does not cover them.
-_WINDOWS_RESERVED_NAMES = frozenset(
-    ["CON", "PRN", "AUX", "NUL"]
-    + [f"COM{index}" for index in range(1, 10)]
-    + [f"LPT{index}" for index in range(1, 10)],
-)
+#: ``is_ignored_skill_entry`` does not cover them. Defined in
+#: ``crons.script_paths`` (a leaf module) so the job-id gate and the
+#: script-name gate cannot drift apart.
+_WINDOWS_RESERVED_NAMES = WINDOWS_RESERVED_NAMES
 
 #: Ceiling on one batch script, comfortably under the security scanner's
 #: own 5 MB ``max_file_size_bytes`` (``security/skill_scanner/
@@ -70,26 +70,30 @@ PREVIEW_ACTION_LIMIT = 2
 # ---------------------------------------------------------------------------
 
 
-def get_tool_batch_dir() -> Path:
-    """Return the shared batch pool directory.
+def job_batch_dir(workspace_dir: Path | str, job_id: str) -> Path:
+    """Return (and create) one cron job's own scripts directory.
 
-    Delegates to the preprocess runner so the pool location has exactly
-    one definition (``WORKING_DIR/tool_batches``).
+    Raises :class:`ToolBatchError` for an id that cannot be a directory
+    name — callers here are HTTP handlers, which want an error rather than
+    the ``None`` the fail-closed resolution path wants.
     """
-    from ..crons.preprocess import get_batch_pool_dir
+    from ..crons.script_paths import job_scripts_dir
 
-    return get_batch_pool_dir()
+    directory = job_scripts_dir(workspace_dir, job_id)
+    if directory is None:
+        raise ToolBatchError(f"Unsafe cron job id: {job_id}")
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
 
-def ensure_batch_pool_initialized() -> Path:
-    """Create the pool directory if missing."""
-    pool = get_tool_batch_dir()
-    pool.mkdir(parents=True, exist_ok=True)
-    return pool
+def ensure_batch_root(root: Path) -> Path:
+    """Create a scripts directory if missing."""
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def normalize_batch_name(name: str) -> str:
-    """Validate a pool script name.
+    """Validate a batch script name.
 
     Same layered defense as ``normalize_template_name``: reject empty,
     NUL, dot-relative and separator-bearing names before they ever reach
@@ -154,11 +158,10 @@ def iter_batch_files(root: Path) -> Iterator[Path]:
         yield path
 
 
-def resolve_batch_file(name: str) -> Path | None:
-    """Locate a pool script by name, or ``None`` if absent."""
-    pool = get_tool_batch_dir()
+def resolve_batch_file(root: Path, name: str) -> Path | None:
+    """Locate a script by name under ``root``, or ``None`` if absent."""
     try:
-        path = safe_batch_path(pool, name)
+        path = safe_batch_path(root, name)
     except ToolBatchError:
         return None
     return path if path.is_file() else None
@@ -208,12 +211,12 @@ def _reject_oversized(content: Any) -> None:
 
 
 def validate_batch_content(content: Any) -> list[dict[str, Any]]:
-    """Validate batch content before it is written to the pool.
+    """Validate batch content before it is written to disk.
 
     Accepts the two shapes ``run_tool_batch._load_batch_file`` accepts
     and rejects everything the executor would trip over at run time —
     reporting it at save time instead, when the error is actionable.
-    Label/goto checks reuse ``_build_label_map`` itself so the pool's
+    Label/goto checks reuse ``_build_label_map`` itself so this module's
     rules cannot drift from the executor's.
     """
     actions = extract_actions(content)
@@ -340,7 +343,7 @@ def apply_description(content: Any, description: str) -> Any:
 
 
 def read_batch_content(path: Path) -> Any:
-    """Parse one pool file, raising :class:`ToolBatchError` on failure.
+    """Parse one batch file, raising :class:`ToolBatchError` on failure.
 
     ``RecursionError`` is caught alongside the JSON errors: deeply nested
     input (``"[" * 20000``) exceeds the interpreter's recursion limit
@@ -435,8 +438,51 @@ def collect_command_strings(content: Any) -> list[str]:
     return commands
 
 
-def scan_batch_dir_or_raise(dir_path: Path, label: str) -> None:
-    """Run the skill security scanner over staged batch files.
+def collect_command_strings_from_files(paths: Iterable[Path]) -> list[str]:
+    """Pull the executable strings out of several batch files, in order.
+
+    Unparseable content is skipped: validation rejects it with a precise
+    message, and the scan should not pre-empt that.
+    """
+    commands: list[str] = []
+    for path in paths:
+        try:
+            commands.extend(
+                collect_command_strings(
+                    json.loads(path.read_text(encoding="utf-8")),
+                ),
+            )
+        except (OSError, ValueError, RecursionError):
+            continue
+    return commands
+
+
+def _free_surrogate_path(dir_path: Path) -> Path:
+    """Pick a surrogate file name that is not already taken.
+
+    Only ``.json`` is ever copied out of a staging directory, so a
+    collision there would be harmless — but template packages copy the
+    *whole* staged directory to their target
+    (``cron_templates/service.py``). Writing over a package's own
+    ``_batch_commands.sh`` and then unlinking it in ``finally`` would make
+    the file vanish from the imported package, so step aside instead.
+    """
+    candidate = dir_path / _SCAN_SURROGATE_NAME
+    if not candidate.exists():
+        return candidate
+    stem = _SCAN_SURROGATE_NAME[: -len(".sh")]
+    index = 2
+    while (dir_path / f"{stem}.{index}.sh").exists():
+        index += 1
+    return dir_path / f"{stem}.{index}.sh"
+
+
+@contextmanager
+def staged_command_surrogate(
+    dir_path: Path,
+    batch_paths: Iterable[Path],
+) -> Iterator[None]:
+    """Expose batch command strings to the scanner as shell, temporarily.
 
     A batch's shell payload has to be handed to the scanner **as shell**.
     Being absent from the scanner's skip set only means a ``.json`` file
@@ -446,37 +492,39 @@ def scan_batch_dir_or_raise(dir_path: Path, label: str) -> None:
     ``arguments.command``. Verified: the same ``chmod 777 /etc/passwd``
     payload scores CRITICAL as ``.sh`` and SAFE as ``.json``.
 
-    So write the command strings to a ``.sh`` surrogate beside the batch
-    and let the bash rules do their job. The surrogate is staged only for
-    the scan — it is never copied into the pool, because callers scan a
-    staging directory and copy the ``.json`` alone.
+    So write the command strings to a ``.sh`` surrogate inside the
+    directory about to be scanned, and remove it again on the way out —
+    including when the scan raises.
+    """
+    surrogate: Path | None = None
+    try:
+        commands = collect_command_strings_from_files(batch_paths)
+        if commands:
+            surrogate = _free_surrogate_path(dir_path)
+            surrogate.write_text("\n".join(commands), encoding="utf-8")
+        yield
+    finally:
+        if surrogate is not None:
+            surrogate.unlink(missing_ok=True)
+
+
+def scan_batch_dir_or_raise(dir_path: Path, label: str) -> None:
+    """Run the skill security scanner over staged batch files.
+
+    The scanner cannot see a batch's payload in its stored form, so the
+    directory is scanned with a shell surrogate alongside it — see
+    :func:`staged_command_surrogate` for why.
 
     Note this reports rather than blocks: ``scan_skill_directory``
     defaults to ``warn`` mode, so a finding is logged and the import
     proceeds. Turning that into a hard gate is a policy choice that would
     also need to apply to skills and template packages.
     """
-    surrogate: Path | None = None
-    try:
-        commands: list[str] = []
-        for path in sorted(dir_path.glob("*.json")):
-            try:
-                commands.extend(
-                    collect_command_strings(
-                        json.loads(path.read_text(encoding="utf-8")),
-                    ),
-                )
-            except (OSError, ValueError, RecursionError):
-                # Unparseable content is rejected by validation with a
-                # precise message; the scan should not pre-empt that.
-                continue
-        if commands:
-            surrogate = dir_path / _SCAN_SURROGATE_NAME
-            surrogate.write_text("\n".join(commands), encoding="utf-8")
+    with staged_command_surrogate(
+        dir_path,
+        sorted(dir_path.glob("*.json")),
+    ):
         scan_skill_directory(dir_path, skill_name=label)
-    finally:
-        if surrogate is not None:
-            surrogate.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +579,9 @@ def discover_zip_batch_files(root: Path) -> list[tuple[Path, str]]:
 
 
 def name_from_file_name(file_name: str) -> str:
-    """Derive a pool name from a source file name.
+    """Derive a script name from a source file name.
 
-    Only ``.json`` files can become pool scripts
+    Only ``.json`` files can become batch scripts
     (``_load_batch_file`` hard-requires the extension), so anything else
     is rejected here instead of producing an unloadable script.
     """
@@ -563,13 +611,15 @@ def build_import_conflict(
     }
 
 
-def suggest_conflict_name(name: str, existing: set[str] | None = None) -> str:
-    """Return ``<name>-2``, ``<name>-3``, … skipping taken names."""
-    taken = set(existing or ())
-    if not taken:
-        pool = get_tool_batch_dir()
-        if pool.exists():
-            taken = {path.stem for path in iter_batch_files(pool)}
+def suggest_conflict_name(name: str, existing: set[str]) -> str:
+    """Return ``<name>-2``, ``<name>-3``, … skipping taken names.
+
+    ``existing`` is required. It used to default to scanning one global
+    directory shared by every job, which is meaningless now that a script
+    belongs to exactly one job — a caller that forgot to pass the set would
+    silently get suggestions based on some other job's names.
+    """
+    taken = set(existing)
     index = 2
     while f"{name}-{index}" in taken:
         index += 1
@@ -583,13 +633,15 @@ __all__ = [
     "apply_description",
     "build_batch_info",
     "build_import_conflict",
+    "collect_command_strings",
+    "collect_command_strings_from_files",
     "discover_zip_batch_files",
-    "ensure_batch_pool_initialized",
+    "ensure_batch_root",
     "extract_actions",
     "extract_arg_names",
     "extract_description",
     "extract_upload_zip",
-    "get_tool_batch_dir",
+    "job_batch_dir",
     "iter_batch_files",
     "name_from_file_name",
     "normalize_batch_name",
@@ -598,6 +650,7 @@ __all__ = [
     "resolve_batch_file",
     "safe_batch_path",
     "scan_batch_dir_or_raise",
+    "staged_command_surrogate",
     "suggest_conflict_name",
     "validate_batch_content",
     "write_batch_file",

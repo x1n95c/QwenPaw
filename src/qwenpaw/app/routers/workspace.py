@@ -999,14 +999,68 @@ def _validate_zip_data(data: bytes, workspace_dir: Path) -> None:
             status_code=400,
             detail="Uploaded file is not a valid zip archive",
         )
+    workspace_resolved = Path(workspace_dir).resolve()
     with zipfile.ZipFile(io.BytesIO(data)) as zf:
         for name in zf.namelist():
             resolved = (workspace_dir / name).resolve()
-            if not str(resolved).startswith(str(workspace_dir)):
+            # `is_relative_to`, not `str.startswith`: a sibling directory
+            # like `<workspace>-evil` shares the prefix and would have
+            # passed the string comparison this replaced.
+            if not resolved.is_relative_to(workspace_resolved):
                 raise HTTPException(
                     status_code=400,
                     detail=f"Zip contains unsafe path: {name}",
                 )
+
+
+def _scan_executable_workspace_content(extract_root: Path) -> None:
+    """Security-scan the parts of an uploaded workspace that get *run*.
+
+    A workspace holds cron job batch scripts
+    (``cron_jobs/<job_id>/batch/*.json``) and cron template packages, and a
+    preprocess executes those unattended with no model in the loop. Every
+    other way a batch script enters the system — ``POST
+    /cron/jobs/{id}/batches``, zip import, template install — stages it and
+    scans it first; merging a workspace zip used to be the one path around
+    that, which made it the cheapest way to plant a payload.
+
+    Scanned in the staging directory, before anything is copied, so a
+    rejection leaves the live workspace untouched.
+
+    Note the batch files are handed to the scanner through
+    ``staged_command_surrogate``: their shell lives inside JSON, and no
+    shipped signature rule lists ``json`` among its ``file_types``, so
+    scanning them as-is finds nothing regardless of content.
+
+    This is deliberately *parity*, not a new stricter rule —
+    ``scan_skill_directory`` honours the configured mode, which defaults to
+    warn. Making batch content a hard gate is a separate policy decision
+    that would also have to apply to skills and template packages.
+    """
+    from ...security.skill_scanner import scan_skill_directory
+    from ..crons.script_paths import (
+        CRON_JOBS_DIRNAME,
+        JOB_SCRIPTS_DIRNAME,
+    )
+    from ..tool_batches.store import staged_command_surrogate
+
+    targets: list[tuple[Path, str]] = []
+    jobs_root = extract_root / CRON_JOBS_DIRNAME
+    if jobs_root.is_dir():
+        for job_dir in sorted(jobs_root.iterdir()):
+            scripts = job_dir / JOB_SCRIPTS_DIRNAME
+            if scripts.is_dir():
+                targets.append((scripts, f"cron-job:{job_dir.name}"))
+    templates_root = extract_root / "cron_templates"
+    if templates_root.is_dir():
+        for package in sorted(templates_root.iterdir()):
+            if package.is_dir():
+                targets.append((package, f"cron-template:{package.name}"))
+
+    for directory, label in targets:
+        jsons = sorted(directory.rglob("*.json"))
+        with staged_command_surrogate(directory, jsons):
+            scan_skill_directory(directory, skill_name=label)
 
 
 def _extract_and_merge_zip(data: bytes, workspace_dir: Path) -> None:
@@ -1021,6 +1075,8 @@ def _extract_and_merge_zip(data: bytes, workspace_dir: Path) -> None:
         extract_root = tmp_dir
         if len(top_entries) == 1 and top_entries[0].is_dir():
             extract_root = top_entries[0]
+
+        _scan_executable_workspace_content(extract_root)
 
         workspace_dir.mkdir(parents=True, exist_ok=True)
 

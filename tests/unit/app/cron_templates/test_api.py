@@ -17,15 +17,28 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from qwenpaw.app.cron_templates.api import router
+from qwenpaw.app.cron_templates.api import batch_script_router, router
 
 from .conftest import BATCH_JSON, SKILL_DOC, make_zip, valid_zip_entries
 
 
 @pytest.fixture
-def client(working_dir: Path) -> TestClient:
+def client(workspace: Path) -> TestClient:
+    """Templates are per workspace, so the service needs one resolved.
+
+    Overriding the dependency rather than faking the agent lookup: it is
+    the seam the endpoints actually use, and it keeps these tests about
+    status codes rather than about agent resolution.
+    """
+    from qwenpaw.app.cron_templates.api import get_template_service
+    from qwenpaw.app.cron_templates.service import CronTemplateService
+
     app = FastAPI()
     app.include_router(router)
+    app.include_router(batch_script_router)
+    app.dependency_overrides[
+        get_template_service
+    ] = lambda: CronTemplateService(workspace)
     return TestClient(app)
 
 
@@ -66,6 +79,29 @@ def test_list_can_exclude_builtins(client: TestClient):
     response = client.get("/cron-templates?include_builtin=false")
     assert response.status_code == 200
     assert response.json() == []
+
+
+def test_list_batch_scripts_returns_refs_and_metadata(client: TestClient):
+    response = client.get("/cron-template-batches")
+    assert response.status_code == 200
+    by_ref = {item["ref"]: item for item in response.json()}
+    weather = by_ref["weather-report/batch/weather.json"]
+    assert weather["template"] == "weather-report"
+    assert weather["file_name"] == "weather.json"
+    assert weather["arg_names"] == ["city"]
+
+
+def test_list_batch_scripts_can_exclude_builtins(client: TestClient):
+    response = client.get("/cron-template-batches?include_builtin=false")
+    assert response.status_code == 200
+    assert response.json() == []
+
+
+def test_batch_scripts_route_does_not_shadow_a_template(client: TestClient):
+    """Its own prefix, so a template cannot be named out of reach."""
+    client.post("/cron-templates", json=create_body(name="batches"))
+    assert client.get("/cron-templates/batches").status_code == 200
+    assert client.get("/cron-template-batches").status_code == 200
 
 
 def test_get_missing_is_404(client: TestClient):
@@ -291,114 +327,3 @@ def test_upload_rejects_traversal(client: TestClient):
 def test_upload_rejects_non_zip_bytes(client: TestClient):
     response = upload(client, b"not a zip at all")
     assert response.status_code == 400
-
-
-# ---------------------------------------------------------------------------
-# Bundled skills
-# ---------------------------------------------------------------------------
-
-
-def test_install_skills_into_pool(client: TestClient):
-    client.post(
-        "/cron-templates",
-        json=create_body(skills={"writer": SKILL_DOC}),
-    )
-    response = client.post(
-        "/cron-templates/api-tpl/install-skills",
-        json={"target": "pool"},
-    )
-    assert response.status_code == 200
-    assert response.json()["installed"] == ["writer"]
-
-
-def test_install_skills_without_bundle_is_400(client: TestClient):
-    client.post("/cron-templates", json=create_body())
-    response = client.post(
-        "/cron-templates/api-tpl/install-skills",
-        json={"target": "pool"},
-    )
-    assert response.status_code == 400
-
-
-def test_install_skills_unknown_template_is_404(client: TestClient):
-    response = client.post(
-        "/cron-templates/ghost/install-skills",
-        json={"target": "pool"},
-    )
-    assert response.status_code == 404
-
-
-# ---------------------------------------------------------------------------
-# Bundled batches (install into the tool-batch pool)
-# ---------------------------------------------------------------------------
-
-
-def test_install_batches_into_pool(client: TestClient):
-    from qwenpaw.app.tool_batches.service import ToolBatchService
-
-    client.post(
-        "/cron-templates",
-        json=create_body(batch_files={"collect": BATCH_JSON}),
-    )
-    response = client.post(
-        "/cron-templates/api-tpl/install-batches",
-        json={},
-    )
-    assert response.status_code == 200
-    assert response.json() == {"installed": ["collect"], "conflicts": []}
-    listed = ToolBatchService().list_batches()
-    assert [b.name for b in listed] == ["collect"]
-
-
-def test_install_batches_conflict_is_409(client: TestClient):
-    client.post(
-        "/cron-templates",
-        json=create_body(batch_files={"collect": BATCH_JSON}),
-    )
-    client.post("/cron-templates/api-tpl/install-batches", json={})
-    response = client.post("/cron-templates/api-tpl/install-batches", json={})
-    assert response.status_code == 409
-    detail = response.json()["detail"]
-    assert detail["message"]
-    assert detail["conflicts"][0]["name"] == "collect"
-    assert detail["conflicts"][0]["file_name"] == "batch/collect.json"
-    assert detail["conflicts"][0]["suggested_name"] == "collect-2"
-
-
-def test_install_batches_overwrite(client: TestClient):
-    client.post(
-        "/cron-templates",
-        json=create_body(batch_files={"collect": BATCH_JSON}),
-    )
-    client.post("/cron-templates/api-tpl/install-batches", json={})
-    response = client.post(
-        "/cron-templates/api-tpl/install-batches",
-        json={"overwrite": True},
-    )
-    assert response.status_code == 200
-    assert response.json()["installed"] == ["collect"]
-
-
-def test_install_batches_rename_map(client: TestClient):
-    client.post(
-        "/cron-templates",
-        json=create_body(batch_files={"collect": BATCH_JSON}),
-    )
-    client.post("/cron-templates/api-tpl/install-batches", json={})
-    response = client.post(
-        "/cron-templates/api-tpl/install-batches",
-        json={"rename_map": {"collect": "collect-v2"}},
-    )
-    assert response.status_code == 200
-    assert response.json()["installed"] == ["collect-v2"]
-
-
-def test_install_batches_without_bundle_is_400(client: TestClient):
-    client.post("/cron-templates", json=create_body())
-    response = client.post("/cron-templates/api-tpl/install-batches", json={})
-    assert response.status_code == 400
-
-
-def test_install_batches_unknown_template_is_404(client: TestClient):
-    response = client.post("/cron-templates/ghost/install-batches", json={})
-    assert response.status_code == 404

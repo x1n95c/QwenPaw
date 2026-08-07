@@ -45,9 +45,12 @@ export interface CronJobRequest {
 }
 
 /**
- * One script in the preprocess chain. `script` references a batch script
- * from the shared pool; `actions` is the inline alternative (the UI only
- * edits `script`). Exactly one of the two per step.
+ * One script in the preprocess chain. Exactly one of the two per step.
+ *
+ * `script` is either a name in the shared pool, or — when it contains a
+ * `/` — a script bundled inside a cron template package, addressed as
+ * `<template>/batch/<file>.json`. `actions` is the inline alternative
+ * (the UI only edits `script`).
  */
 export interface CronJobPreprocessStep {
   script?: string;
@@ -78,6 +81,20 @@ export interface CronJobPreprocessSpec {
   on_failure?: "continue" | "abort";
 }
 
+/**
+ * A skill the job runs with, addressed rather than installed.
+ *
+ * `template` is the discriminator: absent means a skill installed in this
+ * workspace, set means one bundled inside that template package and read
+ * in place. Nothing is copied — the trigger path reads `SKILL.md` out of
+ * whichever directory this names and prepends the body to the prompt.
+ */
+export interface CronJobSkillRef {
+  /** Skill directory name. */
+  name: string;
+  template?: string;
+}
+
 export interface CronJobSpecInput {
   id: string;
   name: string;
@@ -88,6 +105,8 @@ export interface CronJobSpecInput {
   text?: string;
   request?: CronJobRequest;
   preprocess?: CronJobPreprocessSpec | null;
+  /** Inert for `task_type: "text"` — that path never runs a model. */
+  skills?: CronJobSkillRef[];
   dispatch: CronJobDispatch;
   runtime?: CronJobRuntime;
   meta?: Record<string, unknown>;

@@ -12,7 +12,7 @@ interface BatchStepPreviewProps {
   actions: unknown[];
   /** Total steps in the script, used for the "N more" line. */
   actionCount: number;
-  /** Header text; differs between the job form and the pool manager. */
+  /** Header text; differs between the job form and the script manager. */
   title: string;
   defaultExpanded?: boolean;
 }
@@ -28,7 +28,7 @@ export const BATCH_PREVIEW_STEP_LIMIT = 2;
  * Collapsible read-only preview of a batch script's leading steps.
  *
  * Shared by the job form (what will run before the task body) and the
- * pool manager (what a stored script does), so both describe a script
+ * script manager (what a stored script does), so both describe a script
  * the same way. Deliberately shows only the first couple of steps: this
  * is an "is this the script I meant" check, not a program listing — the
  * editor is one click away for the full JSON.

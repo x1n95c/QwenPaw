@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Lifecycle service for the shared ``run_tool_batch`` script pool.
+"""Lifecycle service for a directory of ``run_tool_batch`` scripts.
 
 The shape follows ``CronTemplateService``: one class owning create /
-update / delete / import-from-zip / export-to-zip over a shared pool
-directory. The pool itself is flatter — plain ``<name>.json`` files with
-no manifest — but every write is still staged in a temp directory,
-validated and security-scanned there, and only then copied into the
-pool, so a rejected script never lands on disk.
+update / delete / import-from-zip / export-to-zip over one
+directory. The layout is flatter than a template package — plain
+``<name>.json`` files with no manifest — but every write is still staged
+in a temp directory, validated and security-scanned there, and only then
+copied into place, so a rejected script never lands on disk.
 """
 
 from __future__ import annotations
@@ -32,12 +32,11 @@ from .store import (
     build_batch_info,
     build_import_conflict,
     discover_zip_batch_files,
-    ensure_batch_pool_initialized,
+    ensure_batch_root,
     extract_arg_names,
     extract_actions,
     extract_description,
     extract_upload_zip,
-    get_tool_batch_dir,
     iter_batch_files,
     name_from_file_name,
     normalize_batch_name,
@@ -58,33 +57,42 @@ _STAGE_PREFIX = "qwenpaw_tool_batch_"
 
 
 class ToolBatchService:
-    """Manage ``run_tool_batch`` scripts in the shared pool.
+    """Manage ``run_tool_batch`` scripts inside one directory.
 
-    The pool lives at ``WORKING_DIR/tool_batches`` and is agent-agnostic:
-    a script is a recipe, shared across agents the same way the skill and
-    cron-template pools are. Cron preprocesses resolve ``script`` names
-    against this same directory, so anything stored here is immediately
-    runnable by name.
+    The directory is a cron job's own
+    ``<workspace_dir>/cron_jobs/<job_id>/batch/`` — scripts belong to the
+    job that runs them, so editing one cannot change what another job does
+    and deleting a job cannot leave another dangling. Callers build the
+    root with ``store.job_batch_dir``.
+
+    The class is root-agnostic on purpose: every method works against
+    whatever directory it was handed, which is what let the tests written
+    against the old shared directory carry over unchanged.
     """
 
-    def __init__(self) -> None:
-        ensure_batch_pool_initialized()
+    def __init__(self, root: Path) -> None:
+        self._root = ensure_batch_root(Path(root))
+
+    @property
+    def root(self) -> Path:
+        """The directory this service manages."""
+        return self._root
 
     # ----- read -----
 
     def list_batches(self) -> list[ToolBatchInfo]:
-        """List pool scripts in stable order, skipping unreadable ones."""
+        """List the scripts in stable order, skipping unreadable ones."""
         batches: list[ToolBatchInfo] = []
-        for path in iter_batch_files(get_tool_batch_dir()):
+        for path in iter_batch_files(self._root):
             info = self._safe_read(path)
             if info is not None:
                 batches.append(info)
         return batches
 
     def get_batch(self, name: str) -> ToolBatchDetail:
-        """Fetch one pool script with its parsed content."""
+        """Fetch one script with its parsed content."""
         normalized = normalize_batch_name(name)
-        path = resolve_batch_file(normalized)
+        path = resolve_batch_file(self._root, normalized)
         if path is None:
             raise ToolBatchError(f"Batch not found: {name}")
         content = read_batch_content(path)
@@ -94,16 +102,19 @@ class ToolBatchService:
     # ----- write -----
 
     def create_batch(self, body: CreateToolBatchRequest) -> ToolBatchInfo:
-        """Create a pool script. Conflicts are reported, not overwritten."""
+        """Create a script. Conflicts are reported, not overwritten."""
         name = normalize_batch_name(body.name)
-        pool = ensure_batch_pool_initialized()
-        target = safe_batch_path(pool, name)
+        root = self._root
+        target = safe_batch_path(root, name)
         if target.exists():
             raise ToolBatchConflictError(
                 {
                     "message": f"Batch '{name}' already exists",
                     "name": name,
-                    "suggested_name": suggest_conflict_name(name),
+                    "suggested_name": suggest_conflict_name(
+                        name,
+                        self._existing_names(),
+                    ),
                 },
             )
         description = (
@@ -121,14 +132,14 @@ class ToolBatchService:
         name: str,
         body: UpdateToolBatchRequest,
     ) -> ToolBatchInfo:
-        """Patch an existing pool script in place.
+        """Patch an existing script in place.
 
         ``None`` fields keep their current values, so a partial edit never
         blanks out the part the client did not send.
         """
         normalized = normalize_batch_name(name)
-        pool = ensure_batch_pool_initialized()
-        target = safe_batch_path(pool, normalized)
+        root = self._root
+        target = safe_batch_path(root, normalized)
         if not target.is_file():
             raise ToolBatchError(f"Batch not found: {name}")
 
@@ -145,9 +156,9 @@ class ToolBatchService:
         return self._read_info(target, normalized)
 
     def delete_batch(self, name: str) -> bool:
-        """Remove a pool script. Returns ``False`` when it is absent."""
+        """Remove a script. Returns ``False`` when it is absent."""
         normalized = normalize_batch_name(name)
-        target = safe_batch_path(get_tool_batch_dir(), normalized)
+        target = safe_batch_path(self._root, normalized)
         if not target.is_file():
             return False
         target.unlink()
@@ -156,13 +167,13 @@ class ToolBatchService:
     # ----- import / export -----
 
     def export_to_zip(self, name: str) -> tuple[str, bytes]:
-        """Package a pool script as a zip. Returns ``(filename, bytes)``.
+        """Package a script as a zip. Returns ``(filename, bytes)``.
 
         The stored bytes are zipped as-is, so the download can be fed
         straight back into ``POST /tool-batches/upload``.
         """
         normalized = normalize_batch_name(name)
-        path = resolve_batch_file(normalized)
+        path = resolve_batch_file(self._root, normalized)
         if path is None:
             raise ToolBatchError(f"Batch not found: {name}")
         try:
@@ -199,7 +210,7 @@ class ToolBatchService:
             if select is not None:
                 candidates = self._apply_select(candidates, select)
             if select is None and len(candidates) > 1:
-                existing = self._pool_names()
+                existing = self._existing_names()
                 return {
                     "imported": [],
                     "candidates": [
@@ -222,7 +233,7 @@ class ToolBatchService:
         rename_map: dict[str, str] | None = None,
         overwrite: bool = False,
     ) -> dict[str, Any]:
-        """Shared pool-writing path behind zip upload and template install.
+        """Shared write path behind zip upload and bulk import.
 
         Every candidate is parsed, validated and security-scanned before
         anything is written. Conflicts are reported as a batch — all
@@ -231,9 +242,9 @@ class ToolBatchService:
 
         ``candidates`` are ``(source_path, display_file_name)`` pairs.
         """
-        pool = ensure_batch_pool_initialized()
+        root = self._root
         renames = rename_map or {}
-        existing = self._pool_names()
+        existing = self._existing_names()
         conflicts: list[dict[str, Any]] = []
         planned: list[tuple[str, str, Any]] = []
         seen: set[str] = set()
@@ -262,7 +273,7 @@ class ToolBatchService:
             for _file_name, name, content in planned:
                 shutil.copyfile(
                     stage / f"{name}.json",
-                    pool / f"{name}.json",
+                    root / f"{name}.json",
                 )
         return {
             "imported": [name for _file_name, name, _c in planned],
@@ -362,7 +373,7 @@ class ToolBatchService:
         """Write, scan and land one batch file atomically.
 
         The file is built in a temp directory and scanned there, then
-        copied into the pool beside its target and renamed over it.
+        copied in beside its target and renamed over it.
         ``os.replace`` is atomic within a filesystem, so a cron preprocess
         reading this script concurrently sees either the old content or
         the new one — never the truncated middle that a plain copy onto a
@@ -374,7 +385,7 @@ class ToolBatchService:
             write_batch_file(staged, content)
             scan_batch_dir_or_raise(stage, name)
             target.parent.mkdir(parents=True, exist_ok=True)
-            # Land in the pool directory first: os.replace cannot be
+            # Land in the target directory first: os.replace cannot be
             # atomic across filesystems, and the temp dir may well be on
             # a different one.
             handoff = target.parent / f".{target.name}.tmp"
@@ -387,16 +398,14 @@ class ToolBatchService:
     def _read_info(self, path: Path, name: str) -> ToolBatchInfo:
         return build_batch_info(name, read_batch_content(path), path)
 
-    @staticmethod
-    def _pool_names() -> set[str]:
-        return {path.stem for path in iter_batch_files(get_tool_batch_dir())}
+    def _existing_names(self) -> set[str]:
+        return {path.stem for path in iter_batch_files(self._root)}
 
     @staticmethod
     def _safe_read(path: Path) -> ToolBatchInfo | None:
-        """Read one pool file, logging and skipping the ones that fail.
+        """Read one file, logging and skipping the ones that fail.
 
-        One malformed script in the pool must not blank out the whole
-        list in the UI.
+        One malformed script must not blank out the whole list in the UI.
         """
         try:
             content = read_batch_content(path)

@@ -11,8 +11,7 @@ from .models import (
     CreateCronTemplateRequest,
     CronTemplateInfo,
     CronTemplatePayload,
-    InstallTemplateBatchesRequest,
-    InstallTemplateSkillsRequest,
+    TemplateBatchScriptInfo,
     UpdateCronTemplateRequest,
 )
 from .service import CronTemplateService
@@ -27,8 +26,7 @@ __all__ = [
     "CronTemplateInfo",
     "CronTemplatePayload",
     "CronTemplateService",
-    "InstallTemplateBatchesRequest",
-    "InstallTemplateSkillsRequest",
+    "TemplateBatchScriptInfo",
     "UpdateCronTemplateRequest",
     "get_builtin_cron_template_dir",
     "get_cron_template_dir",

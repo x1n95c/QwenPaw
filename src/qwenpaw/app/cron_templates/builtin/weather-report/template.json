@@ -1,5 +1,4 @@
 {
-  "batch_entry": "batch/weather.json",
   "form": {
     "cronCustom": "30 7 * * *",
     "cronType": "custom",
@@ -16,7 +15,7 @@
     "enabled": true,
     "name": "",
     "request": {
-      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"调用 run_tool_batch(file_path=\\\"{{batch_entry}}\\\", args={\\\"city\\\": \\\"\\\"}) 取当地天气（city 留空表示按 IP 自动定位，想固定城市就填城市名），然后按 weather-report skill 的格式播报：天气、温度区间、降水时段、风力，以及最多两条穿衣/带伞建议。\"\n      }\n    ]\n  }\n]",
+      "input": "[\n  {\n    \"role\": \"user\",\n    \"content\": [\n      {\n        \"type\": \"text\",\n        \"text\": \"上面已经给出了 wttr.in 返回的当地天气 JSON（预处理已经取好，不要再调用 run_tool_batch 或任何取数工具）。请按 weather-report skill 的格式播报：天气、温度区间、降水时段、风力，以及最多两条穿衣/带伞建议。如果预处理告知取数失败，就如实说明拿不到天气，不要编造数据。\"\n      }\n    ]\n  }\n]",
       "session_id": "",
       "user_id": ""
     },
@@ -32,7 +31,27 @@
     },
     "scheduleType": "cron",
     "task_type": "agent",
-    "text": ""
+    "text": "",
+    "preprocess": {
+      "enabled": true,
+      "steps": [
+        {
+          "script": "weather",
+          "args": {
+            "city": ""
+          }
+        }
+      ],
+      "last_only": true,
+      "on_failure": "continue",
+      "timeout_seconds": 120
+    },
+    "skills": [
+      {
+        "name": "weather-report",
+        "template": "weather-report"
+      }
+    ]
   },
   "job": {
     "enabled": true,
@@ -42,7 +61,13 @@
       "cron": "30 7 * * *",
       "type": "cron"
     },
-    "task_type": "agent"
+    "task_type": "agent",
+    "skills": [
+      {
+        "name": "weather-report",
+        "template": "weather-report"
+      }
+    ]
   },
   "schema_version": "cron-template.v1"
 }

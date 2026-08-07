@@ -2,8 +2,11 @@ import { describe, expect, it } from "vitest";
 import dayjs from "dayjs";
 import type { CronTemplateInfo } from "../../../../api/types";
 import {
+  baseScriptName,
+  declaredPreprocessScripts,
   hasUnresolvedPlaceholder,
   hydrateFormValues,
+  remapPreprocessScripts,
   substitutePlaceholders,
   toTemplateDefinition,
   toTemplateDefinitions,
@@ -343,5 +346,94 @@ describe("i18n keys", () => {
     const def = toTemplateDefinition(makeInfo());
     expect(def.titleKey).toBe("");
     expect(templateTitle(def, (k) => k)).toBe("每日简报");
+  });
+});
+
+describe("baseScriptName", () => {
+  it("turns a package-relative path into the installed script name", () => {
+    expect(baseScriptName("batch/weather.json")).toBe("weather");
+    expect(baseScriptName("batch/sub/scan-unix.JSON")).toBe("scan-unix");
+  });
+
+  it("passes a bare name through", () => {
+    expect(baseScriptName("weather")).toBe("weather");
+  });
+});
+
+describe("declaredPreprocessScripts", () => {
+  it("lists the scripts a template's preprocess names", () => {
+    expect(
+      declaredPreprocessScripts({
+        preprocess: {
+          enabled: true,
+          steps: [{ script: "weather" }, { script: "batch/other.json" }],
+        },
+      }),
+    ).toEqual(["weather", "other"]);
+  });
+
+  it("is empty when the template declares no preprocess", () => {
+    // This is what keeps a package's agent-chosen scripts (workspace-usage
+    // ships a unix and a windows variant) from being copied into the job.
+    expect(declaredPreprocessScripts({})).toEqual([]);
+    expect(declaredPreprocessScripts({ preprocess: {} })).toEqual([]);
+    expect(
+      declaredPreprocessScripts({ preprocess: { enabled: false, steps: [] } }),
+    ).toEqual([]);
+  });
+
+  it("skips blank and non-string entries", () => {
+    expect(
+      declaredPreprocessScripts({
+        preprocess: { steps: [{ script: "  " }, {}, null, { script: 5 }] },
+      }),
+    ).toEqual([]);
+  });
+});
+
+describe("remapPreprocessScripts", () => {
+  const values = {
+    name: "x",
+    preprocess: {
+      enabled: true,
+      steps: [
+        { script: "weather", args: { city: "北京" } },
+        { script: "other" },
+      ],
+    },
+  };
+
+  it("rewrites declared names to the ones that landed", () => {
+    // The server renames on collision, so the form has to follow it or the
+    // chain names a script the job does not have.
+    const out = remapPreprocessScripts(values, { weather: "weather-2" });
+    expect(out.preprocess).toEqual({
+      enabled: true,
+      steps: [
+        { script: "weather-2", args: { city: "北京" } },
+        { script: "other" },
+      ],
+    });
+  });
+
+  it("leaves the args and every other field untouched", () => {
+    const out = remapPreprocessScripts(values, { weather: "weather-2" });
+    expect(out.name).toBe("x");
+    expect(
+      (out.preprocess as { steps: { args?: unknown }[] }).steps[0].args,
+    ).toEqual({ city: "北京" });
+  });
+
+  it("does not mutate its input", () => {
+    remapPreprocessScripts(values, { weather: "weather-2" });
+    expect(values.preprocess.steps[0].script).toBe("weather");
+  });
+
+  it("passes values with no preprocess through unchanged", () => {
+    const plain = { name: "x" };
+    expect(remapPreprocessScripts(plain, { a: "b" })).toBe(plain);
+    expect(remapPreprocessScripts({ preprocess: 5 }, {})).toEqual({
+      preprocess: 5,
+    });
   });
 });

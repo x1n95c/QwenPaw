@@ -11,20 +11,17 @@ import pytest
 from qwenpaw.app.cron_templates import store
 from qwenpaw.app.cron_templates.models import (
     CreateCronTemplateRequest,
-    InstallTemplateBatchesRequest,
-    InstallTemplateSkillsRequest,
     UpdateCronTemplateRequest,
 )
 from qwenpaw.app.cron_templates.service import CronTemplateService
-from qwenpaw.app.tool_batches.models import CreateToolBatchRequest
 from qwenpaw.exceptions import CronTemplateConflictError, CronTemplateError
 
 from .conftest import BATCH_JSON, SKILL_DOC, make_zip, valid_zip_entries
 
 
 @pytest.fixture
-def service(working_dir: Path) -> CronTemplateService:
-    return CronTemplateService()
+def service(workspace: Path) -> CronTemplateService:
+    return CronTemplateService(workspace)
 
 
 def make_request(
@@ -73,11 +70,15 @@ def test_create_writes_full_package(service: CronTemplateService):
 def test_create_generates_readable_docs(service: CronTemplateService):
     info = service.create_template(
         make_request(
-            batch_files={"collect": BATCH_JSON}, skills={"s": SKILL_DOC}
+            batch_files={"collect": BATCH_JSON, "notify": BATCH_JSON},
+            skills={"s": SKILL_DOC},
         ),
     )
-    # The generated body should point at what shipped in the package.
+    # The generated body should point at what shipped in the package —
+    # every script, not just the one the chain happens to name, or the
+    # docs understate what the package carries.
     assert "batch/collect.json" in info.content
+    assert "batch/notify.json" in info.content
     assert "skills/s/" in info.content
     assert "每天 09:00" in info.content
 
@@ -123,11 +124,55 @@ def test_create_rejects_invalid_batch(service: CronTemplateService):
         service.create_template(make_request(batch_files={"bad": "{oops"}))
 
 
+def test_create_packages_scripts_no_preprocess_names(
+    service: CronTemplateService,
+):
+    """A package may ship scripts nothing in it declares.
+
+    Saving a job as a template packages every script the job owns, not
+    only the ones its preprocess chain names — the same reason applying a
+    template copies every bundled file. Nothing may require an entry, and
+    nothing may require the form to mention the scripts at all.
+    """
+    info = service.create_template(
+        make_request(
+            batch_files={"scan-unix": BATCH_JSON, "scan-windows": BATCH_JSON},
+            form={"scheduleType": "cron"},
+        ),
+    )
+    assert info.batch_files == [
+        "batch/scan-unix.json",
+        "batch/scan-windows.json",
+    ]
+    assert info.payload.batch_entry is None
+    assert info.batch_entry_path == ""
+
+
+def test_create_rejects_batch_entry_pointing_nowhere(
+    service: CronTemplateService,
+):
+    """The guard the save-as-template entry rule is written against.
+
+    Only the update path was covered. The console omits ``batch_entry``
+    unless the declared script is actually among the packaged files, and
+    this is what makes that caution necessary rather than superstition.
+    """
+    with pytest.raises(CronTemplateError):
+        service.create_template(
+            make_request(
+                batch_files={"collect": BATCH_JSON},
+                batch_entry="batch/gone.json",
+            ),
+        )
+
+
 def test_failed_create_leaves_no_partial_dir(service: CronTemplateService):
     """Staged writes mean a rejected package leaves nothing behind."""
     with pytest.raises(CronTemplateError):
         service.create_template(make_request(batch_files={"bad": "{oops"}))
-    assert not (store.get_cron_template_dir() / "daily-brief").exists()
+    assert not (
+        store.get_cron_template_dir(service._ws) / "daily-brief"
+    ).exists()
     assert service.list_templates(include_builtin=False) == []
 
 
@@ -285,6 +330,72 @@ def test_list_can_hide_builtins(service: CronTemplateService):
     assert service.list_templates(include_builtin=False) == []
 
 
+# ---------------------------------------------------------------------------
+# list_batch_scripts — what the job form's script picker reads
+# ---------------------------------------------------------------------------
+
+
+def test_list_batch_scripts_describes_shipped_scripts(
+    service: CronTemplateService,
+):
+    by_ref = {s.ref: s for s in service.list_batch_scripts()}
+    weather = by_ref["weather-report/batch/weather.json"]
+    assert weather.template == "weather-report"
+    assert weather.template_source == "builtin"
+    assert weather.file_path == "batch/weather.json"
+    assert weather.file_name == "weather.json"
+    # Derived by the pool's own describer, so a packaged script and a pool
+    # script render through identical fields.
+    assert weather.arg_names == ["city"]
+    assert weather.action_count == 1
+    assert weather.preview_actions
+    # None of the shipped scripts carry one, which makes the picker's
+    # "fall back to <title>/<file>" tooltip the common case, not the edge.
+    assert weather.description == ""
+
+
+def test_list_batch_scripts_leaves_the_title_unresolved(
+    service: CronTemplateService,
+):
+    """Rendering it here would emit the key for i18n-keyed packages."""
+    by_template = {s.template: s for s in service.list_batch_scripts()}
+    weather = by_template["weather-report"]
+    assert weather.template_title or weather.template_title_key
+
+
+def test_list_batch_scripts_skips_a_broken_file(
+    service: CronTemplateService,
+):
+    """One unparseable script must not blank out the whole picker."""
+    service.create_template(make_request(batch_files={"ok": BATCH_JSON}))
+    package = store.get_cron_template_dir(service._ws) / "daily-brief"
+    (package / "batch" / "broken.json").write_text("{oops", encoding="utf-8")
+
+    refs = {s.ref for s in service.list_batch_scripts()}
+    assert "daily-brief/batch/ok.json" in refs
+    assert "daily-brief/batch/broken.json" not in refs
+
+
+def test_list_batch_scripts_lets_a_user_package_shadow_a_builtin(
+    service: CronTemplateService,
+):
+    """Same precedence the runtime resolver applies, so refs agree."""
+    service.create_template(
+        make_request(name="weather-report", batch_files={"mine": BATCH_JSON}),
+    )
+    scripts = [
+        s
+        for s in service.list_batch_scripts()
+        if s.template == "weather-report"
+    ]
+    assert [s.file_name for s in scripts] == ["mine.json"]
+    assert scripts[0].template_source == "user"
+
+
+def test_list_batch_scripts_can_hide_builtins(service: CronTemplateService):
+    assert service.list_batch_scripts(include_builtin=False) == []
+
+
 def test_list_puts_user_templates_first(service: CronTemplateService):
     service.create_template(make_request())
     listed = service.list_templates()
@@ -295,7 +406,7 @@ def test_list_puts_user_templates_first(service: CronTemplateService):
 def test_list_skips_malformed_package(service: CronTemplateService):
     """One broken package must not blank out the whole list."""
     service.create_template(make_request())
-    broken = store.get_cron_template_dir() / "broken"
+    broken = store.get_cron_template_dir(service._ws) / "broken"
     broken.mkdir()
     (broken / "TEMPLATE.md").write_text("---\nname: broken\n---\n", "utf-8")
     # No template.json -> unreadable.
@@ -558,7 +669,10 @@ def test_delete_removes_package(service: CronTemplateService):
     service.create_template(make_request())
     assert service.delete_template("daily-brief") is True
     assert service.list_templates(include_builtin=False) == []
-    assert "daily-brief" not in store.read_template_manifest()["templates"]
+    assert (
+        "daily-brief"
+        not in store.read_template_manifest(service._ws)["templates"]
+    )
 
 
 def test_delete_missing_returns_false(service: CronTemplateService):
@@ -683,212 +797,7 @@ def test_export_builtin_works(service: CronTemplateService):
 
 def test_imported_package_records_origin(service: CronTemplateService):
     service.import_from_zip(make_zip(valid_zip_entries()))
-    entry = store.read_template_manifest()["templates"]["sample-template"]
+    entry = store.read_template_manifest(service._ws)["templates"][
+        "sample-template"
+    ]
     assert entry["installed_from"] == "upload"
-
-
-# ---------------------------------------------------------------------------
-# Bundled skills
-# ---------------------------------------------------------------------------
-
-
-def test_install_skills_into_pool(service: CronTemplateService):
-    from qwenpaw.agents.skill_system import get_skill_pool_dir
-
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    result = service.install_skills(
-        "daily-brief",
-        InstallTemplateSkillsRequest(target="pool"),
-    )
-    assert result["installed"] == ["brief-writer"]
-    assert (get_skill_pool_dir() / "brief-writer" / "SKILL.md").is_file()
-
-
-def test_install_skills_is_idempotent(service: CronTemplateService):
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    body = InstallTemplateSkillsRequest(target="pool")
-    service.install_skills("daily-brief", body)
-    again = service.install_skills("daily-brief", body)
-    assert again == {
-        "installed": [],
-        "skipped": ["brief-writer"],
-        "target": "pool",
-    }
-
-
-def test_install_skills_overwrite(service: CronTemplateService):
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    service.install_skills("daily-brief", InstallTemplateSkillsRequest())
-    again = service.install_skills(
-        "daily-brief",
-        InstallTemplateSkillsRequest(overwrite=True),
-    )
-    assert again["installed"] == ["brief-writer"]
-
-
-def test_install_skills_without_bundle_raises(service: CronTemplateService):
-    service.create_template(make_request())
-    with pytest.raises(CronTemplateError, match="does not bundle any skills"):
-        service.install_skills("daily-brief", InstallTemplateSkillsRequest())
-
-
-def test_install_unknown_skill_raises(service: CronTemplateService):
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    with pytest.raises(CronTemplateError, match="does not bundle skill"):
-        service.install_skills(
-            "daily-brief",
-            InstallTemplateSkillsRequest(skills=["ghost"]),
-        )
-
-
-def test_install_into_workspace_requires_dir(service: CronTemplateService):
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    with pytest.raises(CronTemplateError, match="workspace_dir is required"):
-        service.install_skills(
-            "daily-brief",
-            InstallTemplateSkillsRequest(target="workspace"),
-        )
-
-
-def test_install_into_workspace_and_enable(
-    service: CronTemplateService,
-    tmp_path: Path,
-):
-    from qwenpaw.agents.skill_system.store import (
-        get_workspace_skill_manifest_path,
-        read_skill_manifest,
-    )
-
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
-    service.create_template(make_request(skills={"brief-writer": SKILL_DOC}))
-    result = service.install_skills(
-        "daily-brief",
-        InstallTemplateSkillsRequest(target="workspace", enable=True),
-        workspace_dir=workspace,
-    )
-    assert result["installed"] == ["brief-writer"]
-    assert (workspace / "skills" / "brief-writer" / "SKILL.md").is_file()
-    assert get_workspace_skill_manifest_path(workspace).is_file()
-    entry = read_skill_manifest(workspace)["skills"]["brief-writer"]
-    assert entry["enabled"] is True
-
-
-def test_install_skills_from_builtin_package(service: CronTemplateService):
-    """Builtins ship a skill; installing from them must work unforked."""
-    result = service.install_skills(
-        "weather-report",
-        InstallTemplateSkillsRequest(target="pool"),
-    )
-    assert result["installed"] == ["weather-report"]
-
-
-# ---------------------------------------------------------------------------
-# Bundled batches (install into the tool-batch pool)
-# ---------------------------------------------------------------------------
-
-
-def test_install_batches_copies_into_pool(service: CronTemplateService):
-    """Scripts are copied into the pool, keeping their base names."""
-    from qwenpaw.app.tool_batches.store import get_tool_batch_dir
-
-    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
-    result = service.install_batches(
-        "daily-brief",
-        InstallTemplateBatchesRequest(),
-    )
-    assert result == {"imported": ["collect"], "conflicts": []}
-    pool_file = get_tool_batch_dir() / "collect.json"
-    assert pool_file.is_file()
-    assert json.loads(pool_file.read_text(encoding="utf-8"))["actions"]
-
-
-def test_install_batches_conflict_writes_nothing(
-    service: CronTemplateService,
-):
-    from qwenpaw.app.tool_batches.service import ToolBatchService
-
-    batches = ToolBatchService()
-    service.create_template(
-        make_request(
-            batch_files={"collect": BATCH_JSON, "extra": BATCH_JSON},
-        ),
-    )
-    batches.create_batch(
-        CreateToolBatchRequest(
-            name="collect",
-            content=[{"tool_name": "x", "arguments": {}}],
-        ),
-    )
-    result = service.install_batches(
-        "daily-brief",
-        InstallTemplateBatchesRequest(),
-    )
-    assert result["imported"] == []
-    assert result["conflicts"][0]["name"] == "collect"
-    assert result["conflicts"][0]["file_name"] == "batch/collect.json"
-    assert result["conflicts"][0]["suggested_name"] == "collect-2"
-    # All-or-nothing: the clean "extra" must not land either.
-    assert {b.name for b in batches.list_batches()} == {"collect"}
-
-
-def test_install_batches_overwrite(service: CronTemplateService):
-    from qwenpaw.app.tool_batches.service import ToolBatchService
-
-    batches = ToolBatchService()
-    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
-    service.install_batches("daily-brief", InstallTemplateBatchesRequest())
-    again = service.install_batches(
-        "daily-brief",
-        InstallTemplateBatchesRequest(overwrite=True),
-    )
-    assert again == {"imported": ["collect"], "conflicts": []}
-    assert len(batches.list_batches()) == 1
-
-
-def test_install_batches_rename_map(service: CronTemplateService):
-    from qwenpaw.app.tool_batches.service import ToolBatchService
-
-    batches = ToolBatchService()
-    service.create_template(make_request(batch_files={"collect": BATCH_JSON}))
-    service.install_batches("daily-brief", InstallTemplateBatchesRequest())
-    again = service.install_batches(
-        "daily-brief",
-        InstallTemplateBatchesRequest(rename_map={"collect": "collect-v2"}),
-    )
-    assert again["imported"] == ["collect-v2"]
-    assert {b.name for b in batches.list_batches()} == {
-        "collect",
-        "collect-v2",
-    }
-
-
-def test_install_batches_without_bundle_raises(
-    service: CronTemplateService,
-):
-    service.create_template(make_request())
-    with pytest.raises(CronTemplateError, match="does not bundle any batch"):
-        service.install_batches("daily-brief", InstallTemplateBatchesRequest())
-
-
-def test_install_batches_unknown_template_raises(
-    service: CronTemplateService,
-):
-    with pytest.raises(CronTemplateError, match="not found"):
-        service.install_batches("ghost", InstallTemplateBatchesRequest())
-
-
-def test_install_batches_from_builtin_package(
-    service: CronTemplateService,
-):
-    """Builtins ship batch scripts; installing from them works unforked."""
-    from qwenpaw.app.tool_batches.service import ToolBatchService
-
-    result = service.install_batches(
-        "workspace-usage",
-        InstallTemplateBatchesRequest(),
-    )
-    assert sorted(result["imported"]) == ["scan-unix", "scan-windows"]
-    assert result["conflicts"] == []
-    names = {b.name for b in ToolBatchService().list_batches()}
-    assert {"scan-unix", "scan-windows"} <= names

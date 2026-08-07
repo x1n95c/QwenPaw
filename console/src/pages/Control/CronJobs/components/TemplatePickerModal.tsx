@@ -8,9 +8,7 @@ import {
   ImportOutlined,
 } from "@ant-design/icons";
 import { useTranslation } from "react-i18next";
-import api from "../../../../api";
 import type { CronTemplateInfo } from "../../../../api/types";
-import { useAppMessage } from "../../../../hooks/useAppMessage";
 import type { CronTemplateCategory, CronTemplateDefinition } from "./templates";
 import {
   templateDescription,
@@ -23,14 +21,28 @@ import {
 } from "./packageTemplates";
 import { EditTemplateModal } from "./EditTemplateModal";
 import { TemplateDetailDrawer } from "./TemplateDetailDrawer";
-import { useCronTemplates } from "./useCronTemplates";
+import type { UseCronTemplatesResult } from "./useCronTemplates";
 import styles from "../index.module.less";
 
 interface TemplatePickerModalProps {
   open: boolean;
   timezone: string;
   onCancel: () => void;
-  onUseTemplate: (templateValues: Record<string, unknown>) => void;
+  /**
+   * Hand the chosen template up. The template itself travels alongside its
+   * form values because the page mints the job id and is therefore the only
+   * place that can copy the package's bundled scripts into the right job.
+   */
+  onUseTemplate: (
+    templateValues: Record<string, unknown>,
+    template: CronTemplateDefinition,
+  ) => void;
+  /**
+   * Shared with "save as template". One instance for the page, or saving a
+   * template would not appear here until the next reload — the two hooks
+   * would hold separate copies of the list.
+   */
+  cronTemplates: UseCronTemplatesResult;
 }
 
 const ZIP_ACCEPT = ".zip,application/zip,application/x-zip-compressed";
@@ -40,9 +52,9 @@ export function TemplatePickerModal({
   timezone,
   onCancel,
   onUseTemplate,
+  cronTemplates,
 }: TemplatePickerModalProps) {
   const { t } = useTranslation();
-  const { message } = useAppMessage();
   const [category, setCategory] = useState<CronTemplateCategory>("cron");
   const [detailName, setDetailName] = useState<string | null>(null);
   const [editing, setEditing] = useState<CronTemplateInfo | null>(null);
@@ -55,8 +67,7 @@ export function TemplatePickerModal({
     deleteTemplate,
     updateTemplate,
     forkTemplate,
-    installSkills,
-  } = useCronTemplates();
+  } = cronTemplates;
 
   const allTemplates = useMemo(
     () => toTemplateDefinitions(packages),
@@ -73,31 +84,23 @@ export function TemplatePickerModal({
     { label: t("cronJobs.scheduleTypeOnce"), value: "once" },
   ];
 
-  const handleUseTemplate = async (template: CronTemplateDefinition) => {
-    // Templates bundle their batch scripts: deploy them into the pool
-    // first so the job's preprocess script resolves without a separate
-    // import step. A conflict only means a script with the same name is
-    // already in the pool, which is exactly what the job references —
-    // so proceed; only a hard failure gets a warning.
-    if (template.batchFiles.length > 0 && template.packageName) {
-      try {
-        await api.installCronTemplateBatches(template.packageName, {});
-      } catch (error) {
-        const status = error instanceof Error ? error.message : String(error);
-        if (!/^409\b/.test(status)) {
-          message.warning(t("cronJobs.templateInstallBatchesFailed"));
-        }
-      }
-    }
+  const handleUseTemplate = (template: CronTemplateDefinition) => {
+    // Bundled scripts are *not* installed here any more: they are copied
+    // into the new job's own directory, and only the page knows that job's
+    // id. See `handleUseTemplate` in the page.
     const templateValues = template.toFormValues(timezone);
-    onUseTemplate({
-      ...templateValues,
-      name: templateTitle(template, t),
-      text:
-        templateValues.task_type === "agent"
-          ? ""
-          : (templateValues.text as string) || templateDescription(template, t),
-    });
+    onUseTemplate(
+      {
+        ...templateValues,
+        name: templateTitle(template, t),
+        text:
+          templateValues.task_type === "agent"
+            ? ""
+            : (templateValues.text as string) ||
+              templateDescription(template, t),
+      },
+      template,
+    );
   };
 
   /** Use a template straight from the detail drawer's footer button. */
@@ -249,14 +252,6 @@ export function TemplatePickerModal({
                     onClick={() => exportTemplate(template.packageName)}
                   />
                 </Tooltip>
-                {template.skills.length ? (
-                  <Button
-                    loading={busy}
-                    onClick={() => installSkills(template.packageName)}
-                  >
-                    {t("cronJobs.templateInstallSkills")}
-                  </Button>
-                ) : null}
                 <Tooltip
                   title={
                     isBuiltin

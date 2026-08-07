@@ -123,15 +123,32 @@ export interface CronTemplateFileContent {
   content: string;
 }
 
-export interface InstallTemplateSkillsRequest {
-  skills?: string[];
-  target?: "pool" | "workspace";
-  enable?: boolean;
-  overwrite?: boolean;
-}
-
-export interface InstallTemplateSkillsResult {
-  installed: string[];
-  skipped: string[];
-  target: string;
+/**
+ * One `batch/*.json` script bundled inside a template package.
+ *
+ * A preprocess step can reference one of these directly by its `ref`
+ * instead of picking from the flat pool, which is what keeps a script
+ * visibly attached to the task it came with.
+ *
+ * `template_title` / `template_title_key` arrive unresolved on purpose:
+ * packages that ship with QwenPaw carry an i18n key, so the title has to
+ * be resolved key-first on the client (see `templateTitle` in
+ * `pages/Control/CronJobs/components/templates.ts`).
+ */
+export interface TemplateBatchScriptInfo {
+  /** What a step stores, e.g. `weather-report/batch/weather.json`. */
+  ref: string;
+  /** Package directory name — the stable identity, not the title. */
+  template: string;
+  template_title: string;
+  template_title_key: string;
+  template_source: "user" | "builtin";
+  /** Package-relative path, e.g. `batch/collect.json`. */
+  file_path: string;
+  file_name: string;
+  description: string;
+  arg_names: string[];
+  action_count: number;
+  preview_actions: unknown[];
+  updated_at: string;
 }

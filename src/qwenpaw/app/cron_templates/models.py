@@ -47,6 +47,11 @@ MANIFEST_SCHEMA_VERSION = "cron-template-manifest.v1"
 METADATA_NAMESPACES = ("qwenpaw", "openclaw", "clawdbot")
 
 TemplateCategory = Literal["cron", "once"]
+#: Where a template package lives. ``"user"`` means *this workspace's own*
+#: (``<workspace_dir>/cron_templates``) — the name predates templates moving
+#: out of a single global pool and is kept because it is written into every
+#: manifest entry and read by the console. ``"builtin"`` ships with the
+#: application and is read-only.
 TemplateSource = Literal["user", "builtin"]
 
 #: Tags the frontend knows how to render. Unknown tags are preserved and
@@ -123,6 +128,40 @@ class CronTemplateInfo(BaseModel):
     updated_at: str = ""
 
 
+class TemplateBatchScriptInfo(BaseModel):
+    """One ``batch/*.json`` script bundled inside a template package.
+
+    Listed so a cron job's preprocess can reference a packaged script
+    directly (``<template>/batch/<file>.json``) instead of only being able
+    to pick from the flat pool — the association a template's own scripts
+    have with their template is otherwise lost the moment
+    ``install-batches`` copies them out.
+
+    The display fields deliberately mirror ``ToolBatchInfo`` so a client
+    can render pool scripts and packaged scripts through the same code.
+    """
+
+    #: What a preprocess step stores, e.g. ``weather-report/batch/x.json``.
+    ref: str
+    #: Package directory name — the stable identity. Not the title.
+    template: str
+    #: Title literal and its i18n key, resolved key-first by the client.
+    #: Rendering the title here would emit the untranslated literal for
+    #: every builtin that ships ``metadata.title_key``.
+    template_title: str = ""
+    template_title_key: str = ""
+    template_source: TemplateSource = "user"
+    #: Package-relative path, e.g. ``batch/collect.json``.
+    file_path: str
+    #: Just the file name, for the ``<title>/<file>`` display form.
+    file_name: str
+    description: str = ""
+    arg_names: list[str] = Field(default_factory=list)
+    action_count: int = 0
+    preview_actions: list[Any] = Field(default_factory=list)
+    updated_at: str = ""
+
+
 class CronTemplateFrontmatter(BaseModel):
     """Display metadata parsed out of ``TEMPLATE.md``."""
 
@@ -196,31 +235,6 @@ class UpdateCronTemplateRequest(BaseModel):
     remove_batch_files: list[str] = Field(default_factory=list)
 
 
-class InstallTemplateSkillsRequest(BaseModel):
-    """Install skills bundled inside a template package."""
-
-    #: Subset of the package's bundled skills; empty means all of them.
-    skills: list[str] = Field(default_factory=list)
-    target: Literal["pool", "workspace"] = "pool"
-    #: Only meaningful for ``target="workspace"``.
-    enable: bool = False
-    overwrite: bool = False
-
-
-class InstallTemplateBatchesRequest(BaseModel):
-    """Copy a template package's ``batch/*.json`` scripts into the pool.
-
-    The scripts are copied (keeping their base names), never referenced
-    in place — a job pointing at a file inside a template package would
-    break the moment the package is updated, forked or deleted.
-    """
-
-    overwrite: bool = False
-    #: ``{"old": "new"}`` pool-name renames, same semantics as the
-    #: tool-batches ``upload`` endpoint.
-    rename_map: dict[str, str] = Field(default_factory=dict)
-
-
 __all__ = [
     "KNOWN_TEMPLATE_TAGS",
     "MANIFEST_SCHEMA_VERSION",
@@ -234,8 +248,7 @@ __all__ = [
     "CronTemplateFrontmatter",
     "CronTemplateInfo",
     "CronTemplatePayload",
-    "InstallTemplateBatchesRequest",
-    "InstallTemplateSkillsRequest",
+    "TemplateBatchScriptInfo",
     "TemplateCategory",
     "TemplateSource",
     "UpdateCronTemplateRequest",

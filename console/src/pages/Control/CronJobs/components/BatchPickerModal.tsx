@@ -17,7 +17,7 @@ interface BatchPickerModalProps {
 }
 
 /**
- * Manage the shared batch-script pool: edit or delete existing scripts.
+ * Manage the scripts one job owns: edit or delete existing ones.
  *
  * Creating and importing scripts lives in the preprocess section itself
  * (the 新建 / 导入 buttons), so this modal stays a pure manager.

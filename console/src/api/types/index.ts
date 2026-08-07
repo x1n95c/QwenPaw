@@ -6,6 +6,7 @@ export * from "./channel";
 export * from "./heartbeat";
 export * from "./chat";
 export * from "./cronjob";
+export * from "./cronSkill";
 export * from "./cronTemplate";
 export * from "./toolBatch";
 export * from "./env";

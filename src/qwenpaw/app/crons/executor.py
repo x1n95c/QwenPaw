@@ -14,9 +14,11 @@ from ..inbox_trace_store import (
 )
 from .models import CronJobSpec
 from .preprocess import (
-    inject_preprocess_block,
+    build_prompt_block,
     run_preprocess,
 )
+from .prompt_blocks import prepend_text_blocks
+from .skill_prompt import build_skill_prompt_block
 from ...security.tool_guard.execution_level import ToolExecutionLevel
 from ...schemas import RunStatus
 
@@ -207,14 +209,26 @@ class CronExecutor:
         assert job.request is not None
         req: Dict[str, Any] = job.request.model_dump(mode="json")
 
-        if preprocess is not None:
-            # Into the user prompt, not the agent's context: this is the
-            # data the task was created to act on, and it has to survive
-            # into session history and the trace like any other user input.
-            req["input"] = inject_preprocess_block(
-                req.get("input"),
-                preprocess,
-            )
+        # Into the user prompt, not the agent's context: this is the data
+        # the task was created to act on, and it has to survive into
+        # session history and the trace like any other user input.
+        #
+        # One call with the blocks already ordered, rather than one call
+        # per block: each prepend goes in front of whatever is there, so
+        # two calls would silently invert them. The order is the contract —
+        # skill instructions, then the data they are to be applied to, then
+        # the request itself.
+        skill_block = build_skill_prompt_block(
+            job,
+            getattr(self._workspace, "workspace_dir", None),
+        )
+        preprocess_block = (
+            build_prompt_block(preprocess) if preprocess is not None else ""
+        )
+        req["input"] = prepend_text_blocks(
+            req.get("input"),
+            [skill_block, preprocess_block],
+        )
 
         req["channel"] = target_channel
         req["user_id"] = target_user_id or "cron"

@@ -6,10 +6,7 @@ import type {
   CronTemplateFileContent,
   CronTemplateImportResult,
   CronTemplateInfo,
-  InstallTemplateBatchesRequest,
-  InstallTemplateBatchesResult,
-  InstallTemplateSkillsRequest,
-  InstallTemplateSkillsResult,
+  TemplateBatchScriptInfo,
   UpdateCronTemplateRequest,
 } from "../types";
 
@@ -94,6 +91,18 @@ export const cronTemplateApi = {
   getCronTemplate: (name: string) =>
     request<CronTemplateInfo>(`/cron-templates/${encodeURIComponent(name)}`),
 
+  /**
+   * Every batch script bundled across template packages, in one request.
+   *
+   * Its own resource rather than a field on the template list: that list
+   * already carries every package's full doc body, and per-script metadata
+   * would mean opening and parsing every `batch/*.json` on each call.
+   */
+  listCronTemplateBatchScripts: (includeBuiltin = true) =>
+    request<TemplateBatchScriptInfo[]>(
+      `/cron-template-batches?include_builtin=${includeBuiltin}`,
+    ),
+
   createCronTemplate: (body: CreateCronTemplateRequest) =>
     request<CronTemplateInfo>("/cron-templates", {
       method: "POST",
@@ -124,29 +133,6 @@ export const cronTemplateApi = {
         .split("/")
         .map(encodeURIComponent)
         .join("/")}`,
-    ),
-
-  installCronTemplateSkills: (
-    name: string,
-    body: InstallTemplateSkillsRequest = {},
-  ) =>
-    request<InstallTemplateSkillsResult>(
-      `/cron-templates/${encodeURIComponent(name)}/install-skills`,
-      { method: "POST", body: JSON.stringify(body) },
-    ),
-
-  /**
-   * Copy the package's bundled batch/*.json scripts into the shared
-   * script pool, so jobs can reference them by name without depending
-   * on the package staying installed.
-   */
-  installCronTemplateBatches: (
-    name: string,
-    body: InstallTemplateBatchesRequest = {},
-  ) =>
-    request<InstallTemplateBatchesResult>(
-      `/cron-templates/${encodeURIComponent(name)}/install-batches`,
-      { method: "POST", body: JSON.stringify(body) },
     ),
 
   uploadCronTemplateZip: uploadTemplateZip,

@@ -16,8 +16,10 @@ from .mcp import router as mcp_router
 from .mcp_oauth import router as mcp_oauth_router
 from .tools import router as tools_router
 from ..crons.api import router as cron_router
+from ..crons.batches_api import router as cron_batches_router
+from ..crons.skills_api import router as cron_skills_router
+from ..cron_templates.api import batch_script_router as template_batch_router
 from ..cron_templates.api import router as cron_template_router
-from ..tool_batches.api import router as tool_batch_router
 from ..chats.api import router as runner_router
 from .console import router as console_router
 from .fork import router as fork_router
@@ -45,7 +47,10 @@ router.include_router(config_router)
 router.include_router(console_router)
 router.include_router(fork_router)
 router.include_router(cron_router)
+router.include_router(cron_batches_router)
+router.include_router(cron_skills_router)
 router.include_router(cron_template_router)
+router.include_router(template_batch_router)
 router.include_router(local_models_router)
 router.include_router(mcp_oauth_router)
 router.include_router(mcp_router)
@@ -55,7 +60,6 @@ router.include_router(runner_router)
 router.include_router(market_router)
 router.include_router(skills_router)
 router.include_router(skills_stream_router)
-router.include_router(tool_batch_router)
 router.include_router(tools_router)
 router.include_router(workspace_router)
 router.include_router(envs_router)

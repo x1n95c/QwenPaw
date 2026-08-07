@@ -15,7 +15,14 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+)
 from fastapi import File as FileParam
 from fastapi.responses import JSONResponse, Response
 
@@ -24,22 +31,69 @@ from ...exceptions import (
     CronTemplateConflictError,
     CronTemplateError,
     SkillScanError,
-    ToolBatchError,
 )
 from ...utils.http import content_disposition_attachment
-from ..utils import check_upload_size, schedule_agent_reload
+from ..utils import check_upload_size
 from .models import (
     CreateCronTemplateRequest,
     CronTemplateInfo,
-    InstallTemplateBatchesRequest,
-    InstallTemplateSkillsRequest,
+    TemplateBatchScriptInfo,
     UpdateCronTemplateRequest,
 )
 from .service import CronTemplateService
 
 logger = logging.getLogger(__name__)
 
+
+async def _workspace_dir_for_request(request: Request) -> Path:
+    from ..agent_context import get_agent_for_request
+
+    workspace = await get_agent_for_request(request)
+    return Path(workspace.workspace_dir)
+
+
+async def get_template_service(request: Request) -> CronTemplateService:
+    """Build the service for the request's workspace.
+
+    Templates are per workspace, so every endpoint needs one bound to the
+    active agent. A dependency rather than a line in each handler: one
+    place to get the resolution right, and FastAPI injects the ``Request``
+    so the handlers need not carry it themselves.
+    """
+    return CronTemplateService(await _workspace_dir_for_request(request))
+
+
 router = APIRouter(prefix="/cron-templates", tags=["cron-templates"])
+
+#: Batch scripts bundled inside template packages, listed across all of
+#: them. Its own prefix rather than a static sibling under
+#: ``/cron-templates``: such a sibling only works while it is declared
+#: before ``GET /{name}``, which is a trap for whoever reorders the routes.
+batch_script_router = APIRouter(
+    prefix="/cron-template-batches",
+    tags=["cron-templates"],
+)
+
+
+@batch_script_router.get("", response_model=list[TemplateBatchScriptInfo])
+async def list_template_batch_scripts(
+    include_builtin: bool = Query(
+        default=True,
+        description="Include scripts bundled with builtin templates",
+    ),
+    service: CronTemplateService = Depends(get_template_service),
+) -> list[TemplateBatchScriptInfo]:
+    """List every ``batch/*.json`` bundled across template packages.
+
+    A cron preprocess copies one of these into the job that will run it, so
+    the console needs them all with their describing metadata in one
+    request.
+    """
+    return await asyncio.to_thread(
+        service.list_batch_scripts,
+        include_builtin=include_builtin,
+    )
+
 
 _ALLOWED_ZIP_TYPES = {
     "application/zip",
@@ -94,13 +148,6 @@ def _not_found(exc: CronTemplateError) -> HTTPException:
     return HTTPException(status_code=status, detail=message)
 
 
-async def _workspace_dir_for_request(request: Request) -> Path:
-    from ..agent_context import get_agent_for_request
-
-    workspace = await get_agent_for_request(request)
-    return Path(workspace.workspace_dir)
-
-
 # ---------------------------------------------------------------------------
 # Read
 # ---------------------------------------------------------------------------
@@ -112,29 +159,35 @@ async def list_templates(
         default=True,
         description="Include packaged builtin template folders",
     ),
+    service: CronTemplateService = Depends(get_template_service),
 ) -> list[CronTemplateInfo]:
     return await asyncio.to_thread(
-        CronTemplateService().list_templates,
+        service.list_templates,
         include_builtin=include_builtin,
     )
 
 
 @router.get("/{name}", response_model=CronTemplateInfo)
-async def get_template(name: str) -> CronTemplateInfo:
+async def get_template(
+    name: str,
+    service: CronTemplateService = Depends(get_template_service),
+) -> CronTemplateInfo:
     try:
-        return await asyncio.to_thread(
-            CronTemplateService().get_template, name
-        )
+        return await asyncio.to_thread(service.get_template, name)
     except CronTemplateError as exc:
         raise _not_found(exc) from exc
 
 
 @router.get("/{name}/files/{file_path:path}")
-async def read_template_file(name: str, file_path: str) -> dict[str, Any]:
+async def read_template_file(
+    name: str,
+    file_path: str,
+    service: CronTemplateService = Depends(get_template_service),
+) -> dict[str, Any]:
     """Read one text file from a package (batch JSON preview, docs)."""
     try:
         content = await asyncio.to_thread(
-            CronTemplateService().read_package_file,
+            service.read_package_file,
             name,
             file_path,
         )
@@ -144,7 +197,10 @@ async def read_template_file(name: str, file_path: str) -> dict[str, Any]:
 
 
 @router.get("/{name}/export")
-async def export_template(name: str) -> Response:
+async def export_template(
+    name: str,
+    service: CronTemplateService = Depends(get_template_service),
+) -> Response:
     """Download a template package as a zip.
 
     The archive is rooted at ``<name>/`` so the downloaded file can be fed
@@ -152,7 +208,7 @@ async def export_template(name: str) -> Response:
     """
     try:
         filename, blob = await asyncio.to_thread(
-            CronTemplateService().export_to_zip,
+            service.export_to_zip,
             name,
         )
     except CronTemplateError as exc:
@@ -175,10 +231,11 @@ async def export_template(name: str) -> Response:
 @router.post("", response_model=CronTemplateInfo)
 async def create_template(
     body: CreateCronTemplateRequest,
+    service: CronTemplateService = Depends(get_template_service),
 ) -> CronTemplateInfo:
     try:
         return await asyncio.to_thread(
-            CronTemplateService().create_template,
+            service.create_template,
             body,
         )
     except SkillScanError as exc:
@@ -196,6 +253,7 @@ async def create_template(
 async def update_template(
     name: str,
     body: UpdateCronTemplateRequest,
+    service: CronTemplateService = Depends(get_template_service),
 ) -> CronTemplateInfo:
     """Patch an existing pool template.
 
@@ -204,7 +262,7 @@ async def update_template(
     """
     try:
         return await asyncio.to_thread(
-            CronTemplateService().update_template,
+            service.update_template,
             name,
             body,
         )
@@ -215,10 +273,13 @@ async def update_template(
 
 
 @router.delete("/{name}")
-async def delete_template(name: str) -> dict[str, Any]:
+async def delete_template(
+    name: str,
+    service: CronTemplateService = Depends(get_template_service),
+) -> dict[str, Any]:
     try:
         deleted = await asyncio.to_thread(
-            CronTemplateService().delete_template,
+            service.delete_template,
             name,
         )
     except CronTemplateError as exc:
@@ -232,11 +293,14 @@ async def delete_template(name: str) -> dict[str, Any]:
 
 
 @router.post("/{name}/fork", response_model=CronTemplateInfo)
-async def fork_builtin_template(name: str) -> CronTemplateInfo:
+async def fork_builtin_template(
+    name: str,
+    service: CronTemplateService = Depends(get_template_service),
+) -> CronTemplateInfo:
     """Copy a packaged builtin into the pool so it can be edited."""
     try:
         return await asyncio.to_thread(
-            CronTemplateService().fork_builtin,
+            service.fork_builtin,
             name,
         )
     except CronTemplateConflictError as exc:
@@ -251,6 +315,7 @@ async def upload_template_zip(
     target_name: str = "",
     rename_map: str = "",
     overwrite: bool = False,
+    service: CronTemplateService = Depends(get_template_service),
 ) -> dict[str, Any]:
     """Import template packages from an uploaded zip.
 
@@ -275,7 +340,7 @@ async def upload_template_zip(
             )
     try:
         result = await asyncio.to_thread(
-            CronTemplateService().import_from_zip,
+            service.import_from_zip,
             data,
             target_name=target_name,
             rename_map=parsed_rename,
@@ -291,69 +356,3 @@ async def upload_template_zip(
     if result.get("conflicts"):
         raise HTTPException(status_code=409, detail=result)
     return result
-
-
-@router.post("/{name}/install-skills")
-async def install_template_skills(
-    name: str,
-    request: Request,
-    body: InstallTemplateSkillsRequest,
-) -> dict[str, Any]:
-    """Install skills bundled in a template into the pool or a workspace."""
-    workspace_dir: Path | None = None
-    if body.target == "workspace":
-        workspace_dir = await _workspace_dir_for_request(request)
-    try:
-        result = await asyncio.to_thread(
-            CronTemplateService().install_skills,
-            name,
-            body,
-            workspace_dir,
-        )
-    except SkillScanError as exc:
-        return _scan_error_response(exc)  # type: ignore[return-value]
-    except CronTemplateError as exc:
-        raise _not_found(exc) from exc
-    if body.target == "workspace" and body.enable and result.get("installed"):
-        from ..agent_context import get_agent_for_request
-
-        workspace = await get_agent_for_request(request)
-        schedule_agent_reload(request, workspace.agent_id)
-    return result
-
-
-@router.post("/{name}/install-batches")
-async def install_template_batches(
-    name: str,
-    body: InstallTemplateBatchesRequest,
-) -> dict[str, Any]:
-    """Copy a template package's ``batch/*.json`` scripts into the pool.
-
-    Scripts are copied (base names kept) through the same
-    validate + scan + conflict pipeline as ``POST /tool-batches/upload``,
-    so jobs only ever resolve scripts from the one pool directory.
-    """
-    try:
-        result = await asyncio.to_thread(
-            CronTemplateService().install_batches,
-            name,
-            body,
-        )
-    except SkillScanError as exc:
-        return _scan_error_response(exc)  # type: ignore[return-value]
-    except CronTemplateError as exc:
-        raise _not_found(exc) from exc
-    except ToolBatchError as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=exc.message or str(exc),
-        ) from exc
-    if result.get("conflicts"):
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "message": "Batch install has conflicts",
-                "conflicts": result["conflicts"],
-            },
-        )
-    return {"installed": result["imported"], "conflicts": []}

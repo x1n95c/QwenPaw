@@ -32,6 +32,9 @@ from ...config.config import (
 from ...config.utils import load_config, save_config
 from ...agents.utils import copy_workspace_md_files, normalize_agent_language
 from ...agents.skill_system import SkillPoolService, get_workspace_skills_dir
+from ..crons.models import JobsFile
+from ..cron_templates.store import get_cron_template_dir
+from ..crons.script_paths import CRON_JOBS_DIRNAME
 from ...harnesses.registry import ProviderCatalogItem, get_provider
 from ..agent_startup import AgentStartupStatus
 from ..multi_agent_manager import MultiAgentManager
@@ -40,6 +43,11 @@ from ...constant import WORKING_DIR
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+#: Version a freshly scaffolded ``jobs.json`` is stamped with. Read from
+#: the model so it cannot fall behind: a lower number makes every new agent
+#: re-run ``migrate_final_mode_to_stream`` on its first load.
+JOBS_FILE_VERSION = JobsFile().version
 
 
 class AgentSummary(BaseModel):
@@ -629,6 +637,26 @@ def _copy_selected_workspace_files(
         src_jobs = source_workspace / "jobs.json"
         if src_jobs.is_file():
             shutil.copy2(src_jobs, workspace_dir / "jobs.json")
+        # The scripts those jobs run have to come too. `jobs.json` is
+        # copied with its uuids intact, so the directory names line up;
+        # without this the copied agent's jobs look fine in the UI and
+        # fail at 3 a.m. with "script not found".
+        src_scripts = source_workspace / CRON_JOBS_DIRNAME
+        if src_scripts.is_dir():
+            shutil.copytree(
+                src_scripts,
+                workspace_dir / CRON_JOBS_DIRNAME,
+                dirs_exist_ok=True,
+            )
+        # And the templates, which are per workspace now: a copied agent
+        # that cannot see the templates it was built from is a surprise.
+        src_templates = get_cron_template_dir(source_workspace)
+        if src_templates.is_dir():
+            shutil.copytree(
+                src_templates,
+                get_cron_template_dir(workspace_dir),
+                dirs_exist_ok=True,
+            )
 
 
 @router.post(
@@ -998,6 +1026,12 @@ def _initialize_agent_workspace(
 
     (workspace_dir / "sessions").mkdir(exist_ok=True)
     (workspace_dir / "memory").mkdir(exist_ok=True)
+    # One directory per cron job, each holding that job's own batch
+    # scripts. Created up front so the tree looks the same whether or not
+    # a job has been made yet.
+    (workspace_dir / CRON_JOBS_DIRNAME).mkdir(exist_ok=True)
+    # Cron templates are per workspace too.
+    get_cron_template_dir(workspace_dir).mkdir(exist_ok=True)
     if create_skills_dir:
         get_workspace_skills_dir(workspace_dir).mkdir(exist_ok=True)
 
@@ -1019,7 +1053,10 @@ def _initialize_agent_workspace(
         if not jobs_file.exists():
             with open(jobs_file, "w", encoding="utf-8") as file:
                 json.dump(
-                    {"version": 1, "jobs": []},
+                    # Must match `JobsFile.version`, or every new agent
+                    # re-runs `migrate_final_mode_to_stream` (which gates on
+                    # `< 2`) the first time its jobs are loaded.
+                    {"version": JOBS_FILE_VERSION, "jobs": []},
                     file,
                     ensure_ascii=False,
                     indent=2,

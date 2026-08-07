@@ -501,9 +501,17 @@
 
 /* The enable switch is a plain Form.Item; everything below appears only
    once it is on, so a job without a preprocess shows a single row. */
+
+/* The rule down the left is what says "all of this belongs to 启用预处理".
+   Without it the script list, the script buttons and the advanced toggle sit
+   at the drawer's own label margin and read as four unrelated fields, so
+   there is no visible boundary where the preprocess block ends. */
 .preprocessBody {
   display: flex;
   flex-direction: column;
+  border-left: 2px solid #ececec;
+  padding-left: 12px;
+  margin: -4px 0 20px 2px;
 }
 
 .preprocessSteps {
@@ -546,6 +554,25 @@
   min-width: 0;
 }
 
+// Footer inside the script dropdown holding the "show other tasks'
+// scripts" toggle. Set off from the option list so it does not read as
+// one more selectable row.
+.preprocessScriptExpander {
+  border-top: 1px solid var(--qwenpaw-color-border, rgba(0, 0, 0, 0.06));
+  padding: 4px 8px;
+
+  button {
+    padding-inline: 0;
+  }
+}
+
+.preprocessScriptEmpty {
+  color: var(--qwenpaw-color-text-tertiary, rgba(0, 0, 0, 0.45));
+  font-size: 12px;
+  padding: 8px 12px;
+  text-align: center;
+}
+
 .preprocessStepArgs {
   display: flex;
   flex-direction: column;
@@ -567,23 +594,67 @@
 }
 
 /* Pool-level actions, below the list they do not belong to any row of. */
-.preprocessPoolActions {
+// Below the step list: "add another step" acts on the chain and sits on
+// the left; "manage scripts" is the only control here that reaches outside
+// this job, so it is pushed to the opposite end.
+.preprocessChainActions {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
   gap: 8px;
-  margin-bottom: 16px;
+  margin-top: 4px;
 }
 
 // The design system sets antd's prefixCls to "qwenpaw" (App.tsx passes
 // prefix/prefixCls), so antd internals are `.qwenpaw-*`. A `.ant-*`
 // selector here silently matches nothing.
+//
+// This one must also undo the design system's own Collapse stylesheet,
+// which hardcodes `background-color`, `border` and `border-radius` on
+// `.qwenpaw-collapse` plus a 32x32 expand icon — that is a global rule, so
+// the `ghost` prop does nothing against it. Left as a card, this toggle was
+// indistinguishable from `.batchStepPreview` below (same component, same
+// grey rounded bar, same chevron) and read as another step preview rather
+// than as settings for the block above it. `&:global(...)` puts two classes
+// on one element so it wins regardless of injection order.
 .preprocessAdvanced {
+  &:global(.qwenpaw-collapse) {
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    border-top: 1px solid #f0f0f0;
+  }
+
+  :global(.qwenpaw-collapse-item) {
+    border-bottom: none !important;
+  }
+
   :global(.qwenpaw-collapse-header) {
-    padding: 0 0 8px !important;
+    padding: 8px 0 !important;
     align-items: center !important;
+    color: rgba(20, 20, 19, 0.55) !important;
+    font-size: 12px;
+  }
+
+  // The design system pads the icon out to 32x32, which is what made the
+  // header as tall as a content row.
+  :global(.qwenpaw-collapse-expand-icon) {
+    width: 16px !important;
+    height: 16px !important;
+    margin-right: 4px !important;
+  }
+
+  :global(.qwenpaw-collapse-arrow) {
+    font-size: 11px !important;
+  }
+
+  :global(.qwenpaw-collapse-content) {
+    background: transparent !important;
+    border-top: none !important;
   }
 
   :global(.qwenpaw-collapse-content-box) {
-    padding: 0 !important;
+    padding: 4px 0 0 !important;
   }
 }
 

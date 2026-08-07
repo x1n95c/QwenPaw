@@ -5,6 +5,7 @@ export { TemplateDetailDrawer } from "./TemplateDetailDrawer";
 export { EditTemplateModal } from "./EditTemplateModal";
 export { SaveAsTemplateModal } from "./SaveAsTemplateModal";
 export { PreprocessSection } from "./PreprocessSection";
+export { SkillSection } from "./SkillSection";
 export { BatchPickerModal } from "./BatchPickerModal";
 export { BatchEditorModal } from "./BatchEditorModal";
 export { BatchStepPreview } from "./BatchStepPreview";

@@ -195,6 +195,19 @@ DEFAULT_PREPROCESS_MAX_EXECUTION_STEPS = 500
 #: later scripts get starved. Ten is well past any real collection recipe.
 MAX_PREPROCESS_SCRIPTS = 10
 
+#: How many skills one job may attach. Lower than the preprocess cap and
+#: for a different reason: that one bounds wall-clock, this one bounds the
+#: context window. Every attached skill's full ``SKILL.md`` body is
+#: prepended to the prompt on *every* fire, so five is already a lot of
+#: standing instruction text to pay for on a schedule.
+MAX_CRON_SKILLS = 5
+
+#: Per-skill ceiling on the injected body. A count cap alone is not enough:
+#: one oversized ``SKILL.md`` blows the request regardless of how few are
+#: attached. Over budget is reported to the model as unavailable rather than
+#: truncated — see ``skill_prompt.build_skill_prompt_block``.
+MAX_SKILL_BODY_CHARS = 64 * 1024
+
 
 class PreprocessStepSpec(BaseModel):
     """One batch script in the preprocess chain.
@@ -204,7 +217,10 @@ class PreprocessStepSpec(BaseModel):
     collision silently feed one script the other's value.
     """
 
-    #: Script name in the shared batch pool, with or without ``.json``.
+    #: Name of a script this job owns, in
+    #: ``<workspace_dir>/cron_jobs/<job_id>/batch/`` (with or without
+    #: ``.json``). Scripts are not shared: a template's or another job's
+    #: script reaches this job by being copied in, never by reference.
     #: Mutually exclusive with ``actions``.
     script: Optional[str] = None
     #: Inline actions, for a one-off not worth pooling.
@@ -332,6 +348,67 @@ class PreprocessSpec(BaseModel):
         return self
 
 
+class CronJobSkillRef(BaseModel):
+    """A skill this job runs with, addressed rather than installed.
+
+    A cron job does not need a skill to be a standing capability — it needs
+    that one block of instructions in front of one prompt. So nothing is
+    copied and nothing is enabled: the ref names a directory, and the
+    trigger path reads ``SKILL.md`` out of it and prepends the body.
+
+    Two roots, and ``template`` is the discriminator between them:
+
+    * ``template is None`` — a skill installed in this workspace, under
+      ``<workspace_dir>/skills/<name>/``.
+    * ``template`` set — a skill bundled inside that template package,
+      under ``<package_dir>/skills/<name>/``. Never installed; the package
+      is read in place.
+
+    Named by fields rather than a packed ``"<template>/<name>"`` string
+    because the two cases are two different filesystem roots, and a packed
+    form would need a sentinel prefix to say which.
+    """
+
+    #: Skill directory name. Identity is the directory everywhere in the
+    #: skill system; frontmatter ``name`` is only a display label.
+    name: str
+    #: Template package that bundles the skill, or ``None`` for an
+    #: installed workspace skill.
+    template: Optional[str] = None
+
+    @property
+    def source(self) -> Literal["workspace", "template"]:
+        """Which root resolves this ref."""
+        return "template" if self.template else "workspace"
+
+    @model_validator(mode="after")
+    def _validate_name(self) -> "CronJobSkillRef":
+        # Mirrors `skill_system.store.normalize_skill_dir_name` rather than
+        # importing it, for the same reason MAX_PREPROCESS_STEPS is
+        # re-declared above: that module pulls in the whole skill stack and
+        # this one is loaded every time `jobs.json` is read.
+        # `test_models.py` asserts the two agree.
+        #
+        # Deliberately short. `jobs.json` is validated as one document, so
+        # a raise here takes *every* job in the file down with it — and
+        # these values can only come from a hand-edit or an attack, never
+        # from the console. Existence is not checked at all; resolution is
+        # fail-closed at run time, matching how preprocess scripts behave.
+        name = (self.name or "").strip()
+        if not name:
+            raise ValueError("skill ref name cannot be empty")
+        if "\x00" in name:
+            raise ValueError("skill ref name cannot contain NUL bytes")
+        if name in {".", ".."}:
+            raise ValueError(f"invalid skill ref name: {name}")
+        if "/" in name or "\\" in name:
+            raise ValueError("skill ref name cannot contain path separators")
+        self.name = name
+        template = (self.template or "").strip()
+        self.template = template or None
+        return self
+
+
 class CronJobRequest(BaseModel):
     """Passthrough payload to workspace.stream_query(request=...).
 
@@ -365,12 +442,55 @@ class CronJobSpec(BaseModel):
     #: types; part of the task definition rather than a runtime knob, hence
     #: top-level and not inside ``runtime``.
     preprocess: Optional[PreprocessSpec] = None
+    #: Skills whose instructions are prepended to the agent prompt on every
+    #: fire. Part of the task definition for the same reason
+    #: ``preprocess`` is, hence top-level and not inside ``runtime``.
+    #:
+    #: No ``enabled`` flag: an empty list already means off, and a flag
+    #: would create a "configured but silently ignored" state. Inert for
+    #: ``task_type="text"`` (no model runs) — see ``has_skills``.
+    skills: list[CronJobSkillRef] = Field(default_factory=list)
+    #: Free-form, never read by the runtime. Keys in use:
+    #:
+    #: * ``from_template`` — package this job was created from. Provenance
+    #:   only: the console's skill picker leads with that package's own
+    #:   skills. Absent for a job written from scratch.
     meta: Dict[str, Any] = Field(default_factory=dict)
 
     @property
     def has_preprocess(self) -> bool:
         """Whether a preprocess batch will actually run."""
         return self.preprocess is not None and self.preprocess.enabled
+
+    @property
+    def has_skills(self) -> bool:
+        """Whether skill instructions will actually reach a prompt.
+
+        False for a text job even when skills are attached: that path never
+        builds a request, so there is nothing to prepend to.
+        """
+        return self.task_type == "agent" and bool(self.skills)
+
+    @model_validator(mode="after")
+    def _validate_skills(self) -> "CronJobSpec":
+        # Deduped rather than rejected: injecting the same body twice can
+        # never be what someone meant, and failing the whole file over it
+        # would be worse. Stable, first occurrence wins.
+        seen: set[tuple[str, Optional[str]]] = set()
+        unique: list[CronJobSkillRef] = []
+        for ref in self.skills:
+            key = (ref.name, ref.template)
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(ref)
+        if len(unique) > MAX_CRON_SKILLS:
+            raise ValueError(
+                f"job attaches {len(unique)} skills; "
+                f"maximum is {MAX_CRON_SKILLS}",
+            )
+        self.skills = unique
+        return self
 
     @model_validator(mode="after")
     def _validate_task_type_fields(self) -> "CronJobSpec":
@@ -389,6 +509,10 @@ class CronJobSpec(BaseModel):
                     "silent delivery is only supported for agent tasks",
                 )
             self.request = None
+            # `skills` is deliberately NOT cleared here. Unlike `request`,
+            # which would contradict a text task, attached skills are
+            # merely inert — and clearing them would lose the selection
+            # every time someone toggles task_type in the drawer.
         elif self.task_type == "agent":
             if self.request is None:
                 raise ValueError("task_type is agent but request is missing")

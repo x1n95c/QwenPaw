@@ -37,6 +37,15 @@ import {
 import { expandDottedArgKeys } from "./components/batchValidation";
 import { parseCron, serializeCron } from "./components/parseCron";
 import { jobToFormValues } from "./components/jobToTemplate";
+import {
+  declaredPreprocessScripts,
+  remapPreprocessScripts,
+} from "./components/packageTemplates";
+import { copyTemplateScripts } from "./components/templateScripts";
+import { resolveTemplateSkills } from "./components/templateSkills";
+import type { CronTemplateDefinition } from "./components/templates";
+import { useCronTemplates } from "./components/useCronTemplates";
+import { useAppMessage } from "../../../hooks/useAppMessage";
 import { PageHeader } from "@/components/PageHeader";
 import styles from "./index.module.less";
 
@@ -64,6 +73,11 @@ dayjs.extend(timezone);
 
 function CronJobsPage() {
   const { t } = useTranslation();
+  const { message } = useAppMessage();
+  // One instance for the page: the picker and "save as template" both read
+  // it, and two separate hooks would each hold their own list — saving a
+  // template would then not show up in the picker until a reload.
+  const cronTemplates = useCronTemplates();
   const {
     jobs,
     loading,
@@ -75,6 +89,16 @@ function CronJobsPage() {
   } = useCronJobs();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [editingJob, setEditingJob] = useState<CronJob | null>(null);
+  /**
+   * The id of the job the drawer is editing.
+   *
+   * Minted here rather than by the server, because the preprocess block
+   * writes batch scripts to `cron_jobs/<jobId>/batch/` while the drawer is
+   * still open — a server-generated id would arrive too late. `POST
+   * /cron/jobs` honours it and rejects one that is already taken; an
+   * abandoned drawer leaves a directory the cron manager reaps at start.
+   */
+  const [drawerJobId, setDrawerJobId] = useState<string>("");
   const [saving, setSaving] = useState(false);
   const [templateModalOpen, setTemplateModalOpen] = useState(false);
   const [saveTemplateOpen, setSaveTemplateOpen] = useState(false);
@@ -149,6 +173,7 @@ function CronJobsPage() {
 
   const handleCreate = () => {
     setEditingJob(null);
+    setDrawerJobId(crypto.randomUUID());
     form.resetFields();
     form.setFieldsValue({
       ...DEFAULT_FORM_VALUES,
@@ -164,17 +189,87 @@ function CronJobsPage() {
     setTemplateModalOpen(true);
   };
 
-  const handleUseTemplate = (templateValues: Record<string, unknown>) => {
+  const handleUseTemplate = async (
+    templateValues: Record<string, unknown>,
+    template?: CronTemplateDefinition,
+  ) => {
     setTemplateModalOpen(false);
     setEditingJob(null);
+    const jobId = crypto.randomUUID();
     form.resetFields();
+
+    // Every bundled script is copied into the new job's own directory, and
+    // this is the only place that can do it: the job id is minted here, and
+    // a script has to belong to a job to resolve at all. Copying only the
+    // ones the preprocess chain names was the "我的脚本 is empty" bug — a
+    // package may ship scripts for the *agent* to pick between at run time,
+    // and the user should still find them under their own job.
+    let landed: Record<string, string> = {};
+    if (template?.packageName && template.batchFiles.length > 0) {
+      // The picker is already closed and the drawer is not open yet, so
+      // without this the screen is blank for the whole copy — which is now
+      // one scanned write per bundled file, not one in total.
+      const done = message.loading(t("cronJobs.templateCopyingScripts"), 0);
+      try {
+        const result = await copyTemplateScripts({
+          template,
+          declared: declaredPreprocessScripts(templateValues),
+          copy: (body) => api.copyJobBatch(jobId, body),
+        });
+        landed = result.landed;
+        // One message per outcome, not per file. A declared script that
+        // failed leaves the chain broken; an extra that failed does not, so
+        // they must not read the same.
+        if (result.failed.declared.length > 0) {
+          message.error(
+            t("cronJobs.templateCopyScriptsFailed", {
+              names: result.failed.declared.join(", "),
+            }),
+          );
+        }
+        if (result.failed.extra.length > 0) {
+          message.warning(
+            t("cronJobs.templateCopyExtraScriptsFailed", {
+              count: result.failed.extra.length,
+            }),
+          );
+        }
+      } finally {
+        done();
+      }
+    }
+    // Unconditional: with no preprocess block this returns the same object.
+    const values = remapPreprocessScripts(templateValues, landed);
+
+    // Bundled skills are *referenced*, not installed: the job holds a ref
+    // and the trigger path reads SKILL.md out of the package in place. So
+    // nothing is written to the workspace here and nothing has to be
+    // enabled — a template whose prompt says "follow the X skill" works
+    // straight away, and the user is free to un-pick it in the drawer.
+    const skills = resolveTemplateSkills(templateValues, template);
+
+    // Published only now, deliberately. `useToolBatches(jobId)` re-lists as
+    // soon as the id changes, so announcing it before the copy finished
+    // would list an empty directory and flash "script not found" on a chain
+    // that is about to be perfectly valid.
+    setDrawerJobId(jobId);
     form.setFieldsValue({
       ...DEFAULT_FORM_VALUES,
       schedule: {
         ...DEFAULT_FORM_VALUES.schedule,
         timezone: userTimezoneRef.current,
       },
-      ...templateValues,
+      ...values,
+      // After the spread: a package that declares no skills must still
+      // clear whatever the previously opened job left in the field.
+      skills,
+      // Provenance, so the skill picker can lead with this package's own
+      // skills instead of burying them behind the expander. Recorded on the
+      // job rather than held as drawer state so it survives a later edit.
+      meta: {
+        ...(values.meta as Record<string, unknown> | undefined),
+        from_template: template?.packageName,
+      },
     });
     setDrawerOpen(true);
   };
@@ -219,6 +314,7 @@ function CronJobsPage() {
 
   const handleEdit = (job: CronJob) => {
     setEditingJob(job);
+    setDrawerJobId(job.id || "");
     // Shared with the "save as template" flow so a template built from a job
     // reproduces exactly what editing that job shows. The cast is needed
     // because the drawer carries UI-only fields (scheduleType, cronType,
@@ -418,7 +514,9 @@ function CronJobsPage() {
       if (editingJob) {
         success = await updateJob(editingJob.id, processedValues);
       } else {
-        success = await createJob(processedValues);
+        // The id the drawer already wrote scripts under, so the saved job
+        // owns them rather than pointing at a directory nobody claims.
+        success = await createJob({ ...processedValues, id: drawerJobId });
       }
     } finally {
       setSaving(false);
@@ -869,6 +967,7 @@ function CronJobsPage() {
       <JobDrawer
         open={drawerOpen}
         editingJob={editingJob}
+        jobId={drawerJobId}
         form={form}
         saving={saving}
         targetItems={targetItems}
@@ -884,6 +983,7 @@ function CronJobsPage() {
         timezone={userTimezoneRef.current}
         onCancel={() => setTemplateModalOpen(false)}
         onUseTemplate={handleUseTemplate}
+        cronTemplates={cronTemplates}
       />
 
       <SaveAsTemplateModal
@@ -893,6 +993,7 @@ function CronJobsPage() {
           setSaveTemplateOpen(false);
           setTemplateSourceJob(null);
         }}
+        cronTemplates={cronTemplates}
       />
 
       <Modal

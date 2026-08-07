@@ -180,7 +180,7 @@ export function extractActions(content: unknown): unknown[] | null {
 }
 
 /**
- * Validate parsed batch content before saving to the pool.
+ * Validate parsed batch content before saving it into a job.
  *
  * Pure and side-effect free so the editor can re-run it on every save and
  * tests can pin the semantics without touching the backend.

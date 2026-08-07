@@ -19,15 +19,28 @@ SAMPLE_ACTIONS = [
 
 SAMPLE_BATCH = {"actions": SAMPLE_ACTIONS, "description": "示例脚本"}
 
+#: Stand-in for the cron job that owns the scripts under test.
+JOB_ID = "3f4a1c2e-0000-4000-8000-000000000001"
+
+
+@pytest.fixture
+def batch_root(tmp_path: Path) -> Path:
+    """One cron job's own scripts directory.
+
+    ``ToolBatchService`` is root-agnostic, so these tests exercise it
+    against a real per-job path rather than a global pool.
+    """
+    root = tmp_path / "ws" / "cron_jobs" / JOB_ID / "batch"
+    root.mkdir(parents=True)
+    return root
+
 
 @pytest.fixture
 def working_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point WORKING_DIR at a temp dir.
 
-    ``store.get_tool_batch_dir`` delegates to the preprocess runner's
-    ``get_batch_pool_dir``, which imports WORKING_DIR lazily inside the
-    function, so patching the module attribute is enough — no need to
-    reload anything.
+    Still needed by the security scanner's policy lookups; the scripts
+    themselves live under `batch_root`, not here.
     """
     from qwenpaw import constant
 

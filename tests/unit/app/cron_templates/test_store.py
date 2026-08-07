@@ -262,6 +262,135 @@ def test_validate_rejects_skill_without_skill_md(package_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Bundled batch scripts get the pool's save-time gate
+#
+# A preprocess step can reference `<template>/batch/<file>.json` directly,
+# which runs it unattended with no model in the loop — so "parses and is a
+# list" is not enough. These pin the checks a pool script already gets.
+# ---------------------------------------------------------------------------
+
+
+def _write_batch(package_dir: Path, content: object) -> None:
+    (package_dir / "batch" / "go.json").write_text(
+        json.dumps(content),
+        encoding="utf-8",
+    )
+
+
+def test_validate_rejects_nested_run_tool_batch_in_a_package(
+    package_dir: Path,
+):
+    _write_batch(
+        package_dir,
+        [{"tool_name": "run_tool_batch", "arguments": {"file_path": "x"}}],
+    )
+    with pytest.raises(CronTemplateError, match="nested batches"):
+        store.validate_template_package(package_dir)
+
+
+def test_validate_rejects_a_package_batch_with_too_many_steps(
+    package_dir: Path,
+):
+    from qwenpaw.app.tool_batches.store import MAX_BATCH_STEPS
+
+    _write_batch(
+        package_dir,
+        [{"tool_name": "x"} for _ in range(MAX_BATCH_STEPS + 1)],
+    )
+    with pytest.raises(CronTemplateError, match="Too many steps"):
+        store.validate_template_package(package_dir)
+
+
+def test_validate_rejects_an_oversized_package_batch(package_dir: Path):
+    """Padding past the scanner's 5 MB skip must not be a way in."""
+    from qwenpaw.app.tool_batches.store import MAX_BATCH_FILE_BYTES
+
+    _write_batch(
+        package_dir,
+        [{"tool_name": "x", "arguments": {"pad": "a" * MAX_BATCH_FILE_BYTES}}],
+    )
+    with pytest.raises(CronTemplateError, match="too large"):
+        store.validate_template_package(package_dir)
+
+
+def test_validate_names_the_offending_batch_file(package_dir: Path):
+    _write_batch(package_dir, [{"arguments": {}}])
+    with pytest.raises(CronTemplateError, match="batch/go.json"):
+        store.validate_template_package(package_dir)
+
+
+def test_every_shipped_builtin_passes_the_gate():
+    """The gate is only worth having if the packages we ship clear it."""
+    builtin_root = store.get_builtin_cron_template_dir()
+    packages = list(store.iter_template_dirs(builtin_root))
+    assert packages, "no builtin templates found"
+    for package in packages:
+        store.validate_template_package(package, package.name)
+
+
+def test_scan_sees_a_shell_payload_inside_a_packaged_batch(
+    package_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The regression test for the hole this feature had to close.
+
+    No shipped scanner rule lists `json` in its `file_types`, so a template
+    package's `batch/*.json` was read and matched against nothing at all.
+    """
+    payload = "chmod 777 /etc/passwd"
+    seen: dict[str, str] = {}
+
+    def _fake_scan(dir_path: Path, skill_name: str = "", **_kwargs):
+        for path in sorted(dir_path.rglob("*")):
+            if path.is_file():
+                seen[path.name] = path.read_text(encoding="utf-8")
+        return None
+
+    monkeypatch.setattr(store, "scan_skill_directory", _fake_scan)
+    (package_dir / "batch" / "sub").mkdir()
+    (package_dir / "batch" / "sub" / "deep.json").write_text(
+        json.dumps(
+            [
+                {
+                    "tool_name": "execute_shell_command",
+                    "arguments": {"command": payload},
+                },
+            ],
+        ),
+        encoding="utf-8",
+    )
+
+    store.scan_template_dir_or_raise(package_dir, "sample-template")
+
+    shell = [
+        name
+        for name, body in seen.items()
+        if name.endswith(".sh") and payload in body
+    ]
+    assert shell, f"payload never reached the scanner as shell: {sorted(seen)}"
+
+
+def test_scan_surrogate_never_stays_in_the_package(
+    package_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Templates copy the whole staged dir, so a leftover would ship."""
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("scanner exploded")
+
+    before = sorted(p.name for p in package_dir.iterdir())
+    monkeypatch.setattr(store, "scan_skill_directory", lambda *a, **k: None)
+    store.scan_template_dir_or_raise(package_dir, "sample-template")
+    assert sorted(p.name for p in package_dir.iterdir()) == before
+
+    monkeypatch.setattr(store, "scan_skill_directory", _boom)
+    with pytest.raises(RuntimeError):
+        store.scan_template_dir_or_raise(package_dir, "sample-template")
+    assert sorted(p.name for p in package_dir.iterdir()) == before
+
+
+# ---------------------------------------------------------------------------
 # Write
 # ---------------------------------------------------------------------------
 
@@ -404,42 +533,42 @@ def test_pack_then_extract_round_trip(package_dir: Path):
 
 
 def test_reconcile_adds_manually_copied_package(
-    working_dir: Path,
+    workspace: Path,
     package_dir: Path,
 ):
-    """A directory dropped into the pool by hand must show up."""
-    pool = store.ensure_template_pool_initialized()
+    """A directory dropped in by hand must show up."""
+    pool = store.ensure_template_pool_initialized(workspace)
     store.copy_template_dir(package_dir, pool / "sample-template")
 
-    manifest = store.reconcile_template_manifest()
+    manifest = store.reconcile_template_manifest(workspace)
     entry = manifest["templates"]["sample-template"]
     assert entry["description"] == "示例模板"
     assert entry["category"] == "cron"
     assert entry["tags"] == ["personal", "reminder"]
 
 
-def test_reconcile_drops_vanished_package(
-    working_dir: Path, package_dir: Path
-):
-    pool = store.ensure_template_pool_initialized()
+def test_reconcile_drops_vanished_package(workspace: Path, package_dir: Path):
+    pool = store.ensure_template_pool_initialized(workspace)
     store.copy_template_dir(package_dir, pool / "sample-template")
-    store.reconcile_template_manifest()
+    store.reconcile_template_manifest(workspace)
 
     __import__("shutil").rmtree(pool / "sample-template")
-    manifest = store.reconcile_template_manifest()
+    manifest = store.reconcile_template_manifest(workspace)
     assert "sample-template" not in manifest["templates"]
 
 
-def test_record_origin_and_forget(working_dir: Path):
-    store.ensure_template_pool_initialized()
-    store.record_template_origin("x", "upload")
+def test_record_origin_and_forget(workspace: Path):
+    store.ensure_template_pool_initialized(workspace)
+    store.record_template_origin("x", "upload", workspace)
     assert (
-        store.read_template_manifest()["templates"]["x"]["installed_from"]
+        store.read_template_manifest(workspace)["templates"]["x"][
+            "installed_from"
+        ]
         == "upload"
     )
-    store.forget_template("x")
-    assert "x" not in store.read_template_manifest()["templates"]
+    store.forget_template("x", workspace)
+    assert "x" not in store.read_template_manifest(workspace)["templates"]
 
 
-def test_suggest_conflict_name_skips_taken(working_dir: Path):
+def test_suggest_conflict_name_skips_taken(workspace: Path):
     assert store.suggest_conflict_name("a", {"a-2", "a-3"}) == "a-4"

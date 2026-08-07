@@ -418,11 +418,16 @@ def test_suggest_conflict_name_skips_taken():
     assert store.suggest_conflict_name("a", {"a-2", "a-3"}) == "a-4"
 
 
-def test_suggest_conflict_name_scans_pool_when_unset(working_dir: Path):
-    pool = store.ensure_batch_pool_initialized()
-    store.write_batch_file(pool / "a.json", [])
-    store.write_batch_file(pool / "a-2.json", [])
-    assert store.suggest_conflict_name("a") == "a-3"
+def test_suggest_conflict_name_requires_the_taken_set():
+    """It used to default to scanning the one global pool.
+
+    With scripts scoped to a job there is no directory it could sensibly
+    default to, so a caller that forgets the set must fail loudly rather
+    than get suggestions computed against the wrong (or the dead legacy)
+    directory.
+    """
+    with pytest.raises(TypeError):
+        store.suggest_conflict_name("a")  # type: ignore[call-arg]
 
 
 def test_build_import_conflict_shape():
@@ -560,6 +565,50 @@ def test_scan_skips_the_surrogate_when_there_is_no_command(
     (tmp_path / "ok.json").write_text(json.dumps(content), encoding="utf-8")
     store.scan_batch_dir_or_raise(tmp_path, "ok")
     assert staged == ["ok.json"]
+
+
+def test_scan_surrogate_steps_aside_for_a_real_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A package's own `_batch_commands.sh` must survive the scan.
+
+    Pool imports only copy `.json` out of the staging dir, so a clobber
+    there would be invisible — but a template package has its whole staged
+    directory copied to the target, and the surrogate is unlinked in a
+    `finally`. Overwriting would make the file vanish from the import.
+    """
+    seen: dict[str, str] = {}
+
+    def _fake_scan(dir_path: Path, skill_name: str = "", **_kwargs):
+        for path in sorted(dir_path.iterdir()):
+            seen[path.name] = path.read_text(encoding="utf-8")
+        return None
+
+    monkeypatch.setattr(store, "scan_skill_directory", _fake_scan)
+    mine = tmp_path / "_batch_commands.sh"
+    mine.write_text("echo mine\n", encoding="utf-8")
+    (tmp_path / "ok.json").write_text(
+        json.dumps(
+            [{"tool_name": "sh", "arguments": {"command": SHELL_PAYLOAD}}],
+        ),
+        encoding="utf-8",
+    )
+
+    store.scan_batch_dir_or_raise(tmp_path, "ok")
+
+    assert mine.read_text(encoding="utf-8") == "echo mine\n"
+    # The payload still reached the scanner, under a name of its own.
+    staged = [
+        name
+        for name, body in seen.items()
+        if name.endswith(".sh") and SHELL_PAYLOAD in body
+    ]
+    assert staged and staged != ["_batch_commands.sh"]
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "_batch_commands.sh",
+        "ok.json",
+    ]
 
 
 def test_read_rejects_deeply_nested_json_without_a_crash(tmp_path: Path):

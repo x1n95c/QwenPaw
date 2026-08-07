@@ -31,7 +31,13 @@
     },
     "scheduleType": "cron",
     "task_type": "agent",
-    "text": ""
+    "text": "",
+    "skills": [
+      {
+        "name": "disk-usage-advisor",
+        "template": "workspace-usage"
+      }
+    ]
   },
   "job": {
     "enabled": true,
@@ -41,7 +47,13 @@
       "cron": "0 8 * * *",
       "type": "cron"
     },
-    "task_type": "agent"
+    "task_type": "agent",
+    "skills": [
+      {
+        "name": "disk-usage-advisor",
+        "template": "workspace-usage"
+      }
+    ]
   },
   "schema_version": "cron-template.v1"
 }

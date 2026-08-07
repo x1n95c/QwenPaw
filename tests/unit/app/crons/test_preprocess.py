@@ -17,25 +17,39 @@ from typing import Any
 import pytest
 
 from qwenpaw.app.crons import preprocess as pre
-from qwenpaw.app.crons.models import PreprocessSpec
+from qwenpaw.app.crons.models import PreprocessSpec, PreprocessStepSpec
 from tests.unit.app.conftest import make_cron_job_spec
 
 
 # ---------------------------------------------------------------------------
-# resolve_batch_script
+# Script resolution
+#
+# One path only: a script belongs to the job that runs it. The shared pool
+# and the `<template>/batch/x.json` reference form are both gone — a
+# template's script reaches a job by being copied in.
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def pool(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    directory = tmp_path / "tool_batches"
-    directory.mkdir()
-    monkeypatch.setattr(pre, "get_batch_pool_dir", lambda: directory)
-    return directory
+def workspace(tmp_path: Path) -> Path:
+    root = tmp_path / "ws"
+    root.mkdir()
+    return root
 
 
-def write_script(pool: Path, name: str, actions: list[dict]) -> Path:
-    path = pool / name
+#: `make_cron_job_spec` mints this by default, so the scripts the run
+#: tests write have to live under it.
+JOB_ID = "job-1"
+
+
+def write_script(workspace: Path, name: str, actions: list[dict]) -> Path:
+    """Put a script in JOB_ID's own directory."""
+    from qwenpaw.app.crons.script_paths import job_scripts_dir
+
+    directory = job_scripts_dir(workspace, JOB_ID)
+    assert directory is not None
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / name
     path.write_text(
         json.dumps({"actions": actions}, ensure_ascii=False),
         encoding="utf-8",
@@ -43,29 +57,62 @@ def write_script(pool: Path, name: str, actions: list[dict]) -> Path:
     return path
 
 
-def test_resolves_a_pool_script(pool: Path):
-    write_script(pool, "collect.json", [{"tool_name": "a"}])
-    assert pre.resolve_batch_script("collect") == pool / "collect.json"
-    assert pre.resolve_batch_script("collect.json") == pool / "collect.json"
+def test_resolves_one_of_the_jobs_own_scripts(workspace: Path):
+    path = write_script(workspace, "collect.json", [{"tool_name": "a"}])
+    step = PreprocessStepSpec(script="collect")
+    assert (
+        pre._resolve_step_path(
+            step,
+            workspace / "stage",
+            0,
+            workspace_dir=workspace,
+            job_id=JOB_ID,
+        )
+        == path
+    )
 
 
-def test_missing_script_resolves_to_none(pool: Path):
-    assert pre.resolve_batch_script("ghost") is None
+def test_a_missing_script_names_the_job_not_a_pool(workspace: Path):
+    """The message is the user's only diagnostic; pointing at a global
+    location they cannot find is worse than useless."""
+    message = pre._resolve_step_path(
+        PreprocessStepSpec(script="ghost"),
+        workspace / "stage",
+        0,
+        workspace_dir=workspace,
+        job_id=JOB_ID,
+    )
+    assert isinstance(message, str)
+    assert "this job's scripts" in message
 
 
-@pytest.mark.parametrize(
-    "name",
-    ["../escape", "sub/dir", "a\\b", "", "   ", ".", ".."],
-)
-def test_refuses_to_leave_the_pool(pool: Path, name: str):
-    """A job spec must not be able to point the runner at any file."""
-    assert pre.resolve_batch_script(name) is None
+def test_a_template_reference_no_longer_resolves(workspace: Path):
+    """Left over from before scripts moved under their job.
+
+    Templates hand a script to a job by *copy* now, so a stored reference
+    is stale data — it must fail loudly rather than reach into a package.
+    """
+    message = pre._resolve_step_path(
+        PreprocessStepSpec(script="weather-report/batch/weather.json"),
+        workspace / "stage",
+        0,
+        workspace_dir=workspace,
+        job_id=JOB_ID,
+    )
+    assert isinstance(message, str)
 
 
-def test_traversal_cannot_reach_a_real_file_outside(pool: Path):
-    outside = pool.parent / "secret.json"
-    outside.write_text("[]", encoding="utf-8")
-    assert pre.resolve_batch_script("../secret") is None
+def test_resolution_without_a_job_fails_closed(workspace: Path):
+    """A script cannot be resolved at all without knowing whose it is."""
+    message = pre._resolve_step_path(
+        PreprocessStepSpec(script="collect"),
+        workspace / "stage",
+        0,
+        workspace_dir=workspace,
+        job_id=None,
+    )
+    assert isinstance(message, str)
+    assert "without a job" in message
 
 
 # ---------------------------------------------------------------------------
@@ -105,9 +152,52 @@ def test_skips_control_flow_steps():
     assert pre.render_user_text(payload) == "real"
 
 
+def test_structured_tool_output_is_readable_not_an_envelope_dump():
+    """The regression this rendering was rewritten for.
+
+    A tool that emits JSON has it merged flat into the step result, so there
+    is no `text` key to quote. The old fallback dumped the whole envelope —
+    `ok`/`total`/`completed` and all — on one line, which is what a weather
+    job actually sent its user.
+    """
+    payload = {
+        "ok": True,
+        "total": 1,
+        "completed": 1,
+        "last_step_result": {
+            "step": 0,
+            "tool_name": "execute_shell_command",
+            "current_condition": [{"temp_C": "34"}],
+        },
+    }
+    out = pre.render_user_text(payload)
+    assert "current_condition" in out
+    # The envelope is bookkeeping, not something a person asked for.
+    assert '"completed"' not in out
+    assert '"tool_name"' not in out
+    assert "\n" in out, "must be pretty-printed"
+
+
+def test_user_text_is_capped_far_below_the_prompt_budget():
+    """A channel message is read by a person, not skimmed by a model."""
+    payload = {
+        "ok": True,
+        "last_step_result": {
+            "step": 0,
+            "tool_name": "execute_shell_command",
+            "rows": [{"n": i, "pad": "x" * 40} for i in range(500)],
+        },
+    }
+    out = pre.render_user_text(payload)
+    assert len(out) < pre.MAX_USER_TEXT_CHARS + 100
+    assert "truncated" in out
+
+
 def test_renders_a_structured_value():
     payload = {"ok": True, "last_step_result": {"value": {"n": 1}}}
-    assert pre.render_user_text(payload) == '{"n": 1}'
+    # Pretty-printed: this goes to a person in a chat message, and a
+    # single-line dump of anything real is unreadable.
+    assert pre.render_user_text(payload) == '{\n  "n": 1\n}'
 
 
 def test_appends_a_notice_when_not_ok():
@@ -140,7 +230,11 @@ def test_tolerates_a_non_dict_payload():
 
 
 # ---------------------------------------------------------------------------
-# inject_preprocess_block
+# build_prompt_block
+#
+# Getting the rendered block *into* the message is `prompt_blocks`, tested
+# in `test_prompt_blocks.py`: that shape handling is shared with the skill
+# block, so it is asserted with plain sentinels and no preprocess at all.
 # ---------------------------------------------------------------------------
 
 
@@ -175,91 +269,33 @@ def make_result(
     )
 
 
-def last_user_text(messages: list[dict]) -> str:
-    user = [m for m in messages if m.get("role") == "user"][-1]
-    return "".join(
-        block["text"] for block in user["content"] if block.get("text")
-    )
-
-
-def test_appends_to_the_existing_last_user_message():
-    """A second consecutive user turn is rejected by some formatters."""
-    messages = [
-        {"role": "user", "content": [{"type": "text", "text": "ask"}]},
-    ]
-    out = pre.inject_preprocess_block(messages, make_result())
-
-    assert len(out) == 1
-    assert out[0]["role"] == "user"
-    assert len(out[0]["content"]) == 2
-    assert "ask" in last_user_text(out)
-    assert "<preprocess_result>" in last_user_text(out)
-
-
-def test_does_not_mutate_the_input_list():
-    messages = [
-        {"role": "user", "content": [{"type": "text", "text": "ask"}]},
-    ]
-    pre.inject_preprocess_block(messages, make_result())
-    assert len(messages[0]["content"]) == 1
-
-
-def test_wraps_a_bare_string_input():
-    """The console's drawer can produce this via JSON.parse('"hi"')."""
-    out = pre.inject_preprocess_block("hi", make_result())
-    assert out[0]["role"] == "user"
-    assert "hi" in last_user_text(out)
-    assert "<preprocess_result>" in last_user_text(out)
-
-
-@pytest.mark.parametrize("empty", [None, [], ""])
-def test_synthesizes_a_message_when_input_is_empty(empty: Any):
-    out = pre.inject_preprocess_block(empty, make_result())
-    assert out[0]["role"] == "user"
-    assert "<preprocess_result>" in last_user_text(out)
-
-
-def test_targets_the_last_user_turn_not_the_first():
-    messages = [
-        {"role": "user", "content": [{"type": "text", "text": "first"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "reply"}]},
-        {"role": "user", "content": [{"type": "text", "text": "second"}]},
-    ]
-    out = pre.inject_preprocess_block(messages, make_result())
-    assert "<preprocess_result>" not in json.dumps(out[0])
-    assert "<preprocess_result>" in json.dumps(out[2])
-
-
-def test_adds_a_turn_when_there_is_no_user_message():
-    messages = [
-        {"role": "assistant", "content": [{"type": "text", "text": "hi"}]},
-    ]
-    out = pre.inject_preprocess_block(messages, make_result())
-    assert out[-1]["role"] == "user"
-    assert "<preprocess_result>" in last_user_text(out)
-
-
-def test_handles_string_content_on_a_user_message():
-    messages = [{"role": "user", "content": "plain string"}]
-    out = pre.inject_preprocess_block(messages, make_result())
-    assert "plain string" in last_user_text(out)
-
-
 # ---------------------------------------------------------------------------
 # build_prompt_block wording — both instructions are load-bearing
 # ---------------------------------------------------------------------------
 
 
 def test_success_block_tells_the_model_not_to_rerun():
+    """A script that succeeded must not be repeated.
+
+    The scripts are real files the model can see and `run_tool_batch` is in
+    its toolkit, so a helpful model will absolutely re-issue the call unless
+    told plainly not to.
+    """
     block = pre.build_prompt_block(make_result(ok=True))
-    assert "ALREADY RUN" in block
-    assert "do not call run_tool_batch again" in block
+    assert "succeeded" in block
+    assert "do not run them again" in block
 
 
-def test_failure_block_forbids_retry_and_invention():
+def test_failure_block_allows_a_retry_but_forbids_invention():
+    """A *failed* collection is the one case where retrying is right.
+
+    Blanket "never retry" wording made a transient curl failure permanent
+    for that run; the model is given the exact call instead. What it must
+    still not do is fill the gap with plausible numbers.
+    """
     block = pre.build_prompt_block(make_result(ok=False))
     assert "FAILED" in block
-    assert "Do not retry" in block
+    assert "may re-run" in block
     assert "do not invent" in block
     assert "boom" in block
 
@@ -280,11 +316,42 @@ def test_mixed_block_states_both_outcomes():
         ),
     )
     assert "1 of them FAILED" in block
-    assert "do not call run_tool_batch again" in block
+    # Both halves of the instruction, because both apply at once.
+    assert "Do not re-run the ones that succeeded" in block
+    assert "may re-run a failed script" in block
     assert "do not invent" in block
     # Each script is identified, so the model can tell them apart.
     assert "[1/2] good" in block
     assert "[2/2] bad" in block
+
+
+def test_call_text_shows_the_absolute_path_not_the_short_name():
+    """The model is shown a call it could re-issue.
+
+    `run_tool_batch` requires an absolute path, so printing the step's short
+    name made the example uncopyable — a retry with it fails on "Batch file
+    not found".
+    """
+    from pathlib import Path as _Path
+
+    text = pre._render_call_text(
+        PreprocessSpec(script="weather"),
+        PreprocessStepSpec(script="weather", args={"city": "杭州"}),
+        "weather",
+        _Path("/ws/cron_jobs/abc/batch/weather.json"),
+    )
+    assert '"file_path": "/ws/cron_jobs/abc/batch/weather.json"' in text
+    assert '"city": "杭州"' in text
+
+
+def test_call_text_falls_back_to_the_label_without_a_path():
+    """A script that never resolved has no path to print."""
+    text = pre._render_call_text(
+        PreprocessSpec(script="ghost"),
+        PreprocessStepSpec(script="ghost"),
+        "ghost",
+    )
+    assert '"file_path": "ghost"' in text
 
 
 def test_single_script_block_omits_the_index_prefix():
@@ -333,11 +400,11 @@ def stub_toolkit(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.mark.asyncio
-async def test_returns_none_without_a_preprocess(tmp_path: Path):
+async def test_returns_none_without_a_preprocess(workspace: Path):
     job = make_cron_job_spec()
     assert (
         await pre.run_preprocess(
-            workspace=FakeWorkspace(tmp_path),
+            workspace=FakeWorkspace(workspace),
             job=job,
             session_id="s",
             user_id="u",
@@ -354,7 +421,7 @@ async def test_returns_none_when_disabled(tmp_path: Path):
     )
     assert (
         await pre.run_preprocess(
-            workspace=FakeWorkspace(tmp_path),
+            workspace=FakeWorkspace(workspace),
             job=job,
             session_id="s",
             user_id="u",
@@ -367,11 +434,11 @@ async def test_returns_none_when_disabled(tmp_path: Path):
 @pytest.mark.asyncio
 async def test_missing_script_reports_instead_of_raising(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
 ):
     job = make_cron_job_spec(preprocess={"script": "ghost"})
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -385,9 +452,9 @@ async def test_missing_script_reports_instead_of_raising(
 
 
 @pytest.mark.asyncio
-async def test_runs_a_pool_script(tmp_path: Path, pool: Path, stub_toolkit):
+async def test_runs_a_pool_script(workspace: Path, stub_toolkit):
     write_script(
-        pool,
+        workspace,
         "collect.json",
         [
             {
@@ -399,7 +466,7 @@ async def test_runs_a_pool_script(tmp_path: Path, pool: Path, stub_toolkit):
     job = make_cron_job_spec(preprocess={"script": "collect"})
 
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -416,6 +483,43 @@ async def test_runs_a_pool_script(tmp_path: Path, pool: Path, stub_toolkit):
 
 
 @pytest.mark.asyncio
+async def test_a_missing_script_fails_only_its_own_step(
+    tmp_path: Path,
+    workspace: Path,
+    stub_toolkit,
+):
+    """A deleted script must not take the rest of the chain with it."""
+    write_script(
+        workspace,
+        "collect.json",
+        [{"tool_name": "execute_shell_command", "arguments": {}}],
+    )
+    job = make_cron_job_spec(
+        preprocess={
+            "steps": [
+                {"script": "gone"},
+                {"script": "collect"},
+            ],
+        },
+    )
+
+    result = await pre.run_preprocess(
+        workspace=FakeWorkspace(workspace),
+        job=job,
+        session_id="s",
+        user_id="u",
+        channel="console",
+    )
+
+    assert result is not None
+    assert [step.ok for step in result.steps] == [False, True]
+    assert "this job's scripts" in result.error
+    assert [c["tool_name"] for c in stub_toolkit] == [
+        "execute_shell_command",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_runs_inline_actions(tmp_path: Path, stub_toolkit):
     job = make_cron_job_spec(
         preprocess={
@@ -425,7 +529,7 @@ async def test_runs_inline_actions(tmp_path: Path, stub_toolkit):
         },
     )
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -457,7 +561,7 @@ async def test_args_are_substituted_for_inline_actions(
         },
     )
     await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -469,11 +573,11 @@ async def test_args_are_substituted_for_inline_actions(
 @pytest.mark.asyncio
 async def test_args_are_substituted_for_pool_scripts(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
     write_script(
-        pool,
+        workspace,
         "collect.json",
         [
             {
@@ -486,7 +590,7 @@ async def test_args_are_substituted_for_pool_scripts(
         preprocess={"script": "collect", "args": {"path": "/tmp"}},
     )
     await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -498,7 +602,7 @@ async def test_args_are_substituted_for_pool_scripts(
 @pytest.mark.asyncio
 async def test_a_failing_step_is_reported_not_raised(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     from qwenpaw.runtime.builder import AgentBuilder
@@ -516,11 +620,13 @@ async def test_a_failing_step_is_reported_not_raised(
 
     monkeypatch.setattr(rtb, "_call_tool", _boom)
 
-    write_script(pool, "collect.json", [{"tool_name": "a", "arguments": {}}])
+    write_script(
+        workspace, "collect.json", [{"tool_name": "a", "arguments": {}}]
+    )
     job = make_cron_job_spec(preprocess={"script": "collect"})
 
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -541,7 +647,7 @@ def _async_value(value: Any):
 @pytest.mark.asyncio
 async def test_timeout_cancels_the_batch(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """A hung step must not hold the job's concurrency slot."""
@@ -565,14 +671,16 @@ async def test_timeout_cancels_the_batch(
 
     monkeypatch.setattr(rtb, "_call_tool", _hang)
 
-    write_script(pool, "collect.json", [{"tool_name": "a", "arguments": {}}])
+    write_script(
+        workspace, "collect.json", [{"tool_name": "a", "arguments": {}}]
+    )
     job = make_cron_job_spec(
         preprocess={"script": "collect", "timeout_seconds": 1},
     )
 
     result = await asyncio.wait_for(
         pre.run_preprocess(
-            workspace=FakeWorkspace(tmp_path),
+            workspace=FakeWorkspace(workspace),
             job=job,
             session_id="s",
             user_id="u",
@@ -590,7 +698,7 @@ async def test_timeout_cancels_the_batch(
 @pytest.mark.asyncio
 async def test_toolkit_build_failure_is_reported(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     from qwenpaw.runtime.builder import AgentBuilder
@@ -604,11 +712,11 @@ async def test_toolkit_build_failure_is_reported(
         _explode,
         raising=False,
     )
-    write_script(pool, "collect.json", [{"tool_name": "a"}])
+    write_script(workspace, "collect.json", [{"tool_name": "a"}])
     job = make_cron_job_spec(preprocess={"script": "collect"})
 
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -622,18 +730,20 @@ async def test_toolkit_build_failure_is_reported(
 @pytest.mark.asyncio
 async def test_context_is_restored_after_a_run(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
     """The preprocess toolkit must not outlive the preprocess."""
     from qwenpaw.config.context import get_current_toolkit
 
-    write_script(pool, "collect.json", [{"tool_name": "a", "arguments": {}}])
+    write_script(
+        workspace, "collect.json", [{"tool_name": "a", "arguments": {}}]
+    )
     job = make_cron_job_spec(preprocess={"script": "collect"})
 
     before = get_current_toolkit()
     await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -643,11 +753,13 @@ async def test_context_is_restored_after_a_run(
 
 
 @pytest.mark.asyncio
-async def test_records_a_duration(tmp_path: Path, pool: Path, stub_toolkit):
-    write_script(pool, "collect.json", [{"tool_name": "a", "arguments": {}}])
+async def test_records_a_duration(workspace: Path, stub_toolkit):
+    write_script(
+        workspace, "collect.json", [{"tool_name": "a", "arguments": {}}]
+    )
     job = make_cron_job_spec(preprocess={"script": "collect"})
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -673,16 +785,16 @@ def test_spec_defaults_are_carried_into_the_call_text():
 @pytest.mark.asyncio
 async def test_runs_several_scripts_in_order(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
     write_script(
-        pool,
+        workspace,
         "first.json",
         [{"tool_name": "tool_a", "arguments": {"v": "${args.x}"}}],
     )
     write_script(
-        pool, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
+        workspace, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
     )
     job = make_cron_job_spec(
         preprocess={
@@ -694,7 +806,7 @@ async def test_runs_several_scripts_in_order(
     )
 
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -711,12 +823,12 @@ async def test_runs_several_scripts_in_order(
 @pytest.mark.asyncio
 async def test_a_failing_script_does_not_stop_the_rest(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
     """ "Continue and report" has to hold per script, not just per chain."""
     write_script(
-        pool, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
+        workspace, "second.json", [{"tool_name": "tool_b", "arguments": {}}]
     )
     job = make_cron_job_spec(
         preprocess={
@@ -725,7 +837,7 @@ async def test_a_failing_script_does_not_stop_the_rest(
     )
 
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -746,16 +858,16 @@ async def test_a_failing_script_does_not_stop_the_rest(
 @pytest.mark.asyncio
 async def test_chain_user_text_labels_each_script(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
-    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
-    write_script(pool, "b.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(workspace, "a.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(workspace, "b.json", [{"tool_name": "t", "arguments": {}}])
     job = make_cron_job_spec(
         preprocess={"steps": [{"script": "a"}, {"script": "b"}]},
     )
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -769,14 +881,14 @@ async def test_chain_user_text_labels_each_script(
 @pytest.mark.asyncio
 async def test_single_script_user_text_has_no_label(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     stub_toolkit,
 ):
     """The label would be noise in what is often the whole message body."""
-    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(workspace, "a.json", [{"tool_name": "t", "arguments": {}}])
     job = make_cron_job_spec(preprocess={"script": "a"})
     result = await pre.run_preprocess(
-        workspace=FakeWorkspace(tmp_path),
+        workspace=FakeWorkspace(workspace),
         job=job,
         session_id="s",
         user_id="u",
@@ -789,7 +901,7 @@ async def test_single_script_user_text_has_no_label(
 @pytest.mark.asyncio
 async def test_budget_is_shared_across_the_chain(
     tmp_path: Path,
-    pool: Path,
+    workspace: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     """timeout_seconds bounds the chain, not each script.
@@ -812,8 +924,8 @@ async def test_budget_is_shared_across_the_chain(
 
     monkeypatch.setattr(rtb, "_call_tool", _hang)
 
-    write_script(pool, "a.json", [{"tool_name": "t", "arguments": {}}])
-    write_script(pool, "b.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(workspace, "a.json", [{"tool_name": "t", "arguments": {}}])
+    write_script(workspace, "b.json", [{"tool_name": "t", "arguments": {}}])
     job = make_cron_job_spec(
         preprocess={
             "steps": [{"script": "a"}, {"script": "b"}],
@@ -823,7 +935,7 @@ async def test_budget_is_shared_across_the_chain(
 
     result = await asyncio.wait_for(
         pre.run_preprocess(
-            workspace=FakeWorkspace(tmp_path),
+            workspace=FakeWorkspace(workspace),
             job=job,
             session_id="s",
             user_id="u",

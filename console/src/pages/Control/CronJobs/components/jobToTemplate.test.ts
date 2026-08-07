@@ -196,4 +196,159 @@ describe("buildCreateTemplateRequest", () => {
     });
     expect(body.title).toBe("每日简报");
   });
+
+  const REF_JOB = makeJob({
+    preprocess: {
+      enabled: true,
+      steps: [
+        { script: "weather", args: { city: "北京" } },
+        { script: "collect" },
+      ],
+    },
+  } as Partial<CronJobSpecOutput>);
+
+  function stepsOf(half: unknown): unknown[] {
+    const preprocess = (half as { preprocess?: { steps?: unknown[] } })
+      .preprocess;
+    return preprocess?.steps ?? [];
+  }
+
+  it("names the same scripts in BOTH halves of the package", () => {
+    // `form` goes through normalizePreprocessValue and `job` is a raw
+    // spread. They are allowed to differ in shape — form fills in `args` —
+    // but never in which scripts the chain runs, or the package's two
+    // halves would disagree about what it needs.
+    const body = buildCreateTemplateRequest(REF_JOB, OPTIONS);
+    expect(stepsOf(body.form)).toEqual([
+      { script: "weather", args: { city: "北京" } },
+      { script: "collect", args: {} },
+    ]);
+    expect(stepsOf(body.job)).toEqual([
+      { script: "weather", args: { city: "北京" } },
+      { script: "collect" },
+    ]);
+  });
+
+  it("does not mutate the job it was handed", () => {
+    buildCreateTemplateRequest(REF_JOB, {
+      ...OPTIONS,
+      batchFiles: { "weather.json": "[]" },
+      batchEntry: "batch/weather.json",
+    });
+    expect(REF_JOB.preprocess?.steps?.[0].script).toBe("weather");
+    expect(REF_JOB.preprocess?.steps?.[1].args).toBeUndefined();
+  });
+});
+
+describe("skill refs across the template round trip", () => {
+  it("always emits skills, so editing job B cannot inherit job A's", () => {
+    // The drawer form is not reset between jobs, so an absent field would
+    // leave the previous selection on screen.
+    expect(jobToFormValues(makeJob()).skills).toEqual([]);
+  });
+
+  it("carries refs into the form values", () => {
+    const values = jobToFormValues(
+      makeJob({
+        skills: [{ name: "advisor" }, { name: "b", template: "pkg" }],
+      }),
+    );
+
+    expect(values.skills).toEqual([
+      { name: "advisor" },
+      { name: "b", template: "pkg" },
+    ]);
+  });
+
+  it("normalizes junk out of a hand-edited spec", () => {
+    const values = jobToFormValues(
+      makeJob({
+        skills: [{ name: "  a  " }, { name: "" }] as never,
+      }),
+    );
+
+    expect(values.skills).toEqual([{ name: "a" }]);
+  });
+
+  it("packages refs into the job spec half", () => {
+    const spec = jobToTemplateSpec(
+      makeJob({ skills: [{ name: "b", template: "pkg" }] }),
+    );
+
+    expect(spec.skills).toEqual([{ name: "b", template: "pkg" }]);
+  });
+
+  it("omits skills from the spec half when there are none", () => {
+    expect(jobToTemplateSpec(makeJob())).not.toHaveProperty("skills");
+  });
+
+  it("does not alias the job's own ref objects", () => {
+    // The caller keeps using the job it passed in; a shared object would
+    // let a later edit of the template mutate the live job.
+    const job = makeJob({ skills: [{ name: "b", template: "pkg" }] });
+    const spec = jobToTemplateSpec(job);
+
+    expect((spec.skills as unknown[])[0]).not.toBe(job.skills![0]);
+  });
+
+  it("keeps a template-qualified ref in the form half", () => {
+    // The importer may not have that package. Kept anyway: an unresolvable
+    // ref degrades into a note in the prompt at run time, whereas
+    // stripping it would silently discard what the author chose.
+    const form = jobToTemplateForm(
+      makeJob({ skills: [{ name: "b", template: "workspace-usage" }] }),
+    );
+
+    expect(form.skills).toEqual([{ name: "b", template: "workspace-usage" }]);
+  });
+
+  it("puts refs in both halves of a create request", () => {
+    const request = buildCreateTemplateRequest(
+      makeJob({ skills: [{ name: "advisor" }] }),
+      {
+        name: "pkg",
+        title: "T",
+        description: "",
+        frequency: "",
+        emoji: "",
+        tags: [],
+        includeDispatchTarget: false,
+      },
+    );
+
+    expect(request.form.skills).toEqual([{ name: "advisor" }]);
+    expect(request.job?.skills).toEqual([{ name: "advisor" }]);
+  });
+});
+
+describe("provenance does not travel into a template", () => {
+  it("strips meta from the form half", () => {
+    // A job derived from `weather-report` and saved as `my-thing` would
+    // otherwise ship a package claiming `weather-report` provenance, and
+    // every job created from it would lead its skill picker with the wrong
+    // package.
+    const form = jobToTemplateForm(
+      makeJob({ meta: { from_template: "weather-report" } } as never),
+    );
+
+    expect(form).not.toHaveProperty("meta");
+  });
+
+  it("never put meta in the job half to begin with", () => {
+    const spec = jobToTemplateSpec(
+      makeJob({ meta: { from_template: "weather-report" } } as never),
+    );
+
+    expect(spec).not.toHaveProperty("meta");
+  });
+
+  it("keeps meta when merely editing a job", () => {
+    // `jobToFormValues` feeds the edit drawer, where provenance must survive
+    // — that is what lets a re-opened job still lead with its own package.
+    const values = jobToFormValues(
+      makeJob({ meta: { from_template: "weather-report" } } as never),
+    );
+
+    expect(values.meta).toEqual({ from_template: "weather-report" });
+  });
 });

@@ -541,6 +541,21 @@ class Workspace:
                 f"Skill pool initialization failed (non-fatal): {e}",
             )
 
+        # Same shape, and non-fatal for the same reason: if the copies cannot
+        # be written, template resolution falls back to the packaged
+        # directory and everything still works — just with the install-tree
+        # paths this exists to get rid of.
+        from ..cron_templates.store import (
+            ensure_builtin_templates_materialized,
+        )
+
+        try:
+            ensure_builtin_templates_materialized()
+        except Exception as e:
+            logger.warning(
+                f"Builtin cron templates not materialized (non-fatal): {e}",
+            )
+
         try:
             # 1. Load agent configuration
             self._config = load_agent_config(self.agent_id)

@@ -101,7 +101,6 @@ def test_template_group_is_registered():
         "update",
         "delete",
         "fork",
-        "install-skills",
     ):
         assert command in result.output
 
@@ -263,36 +262,6 @@ def test_import_conflict_suggests_rename_flag(fake_client, tmp_path: Path):
     )
     assert result.exit_code != 0
     assert "--rename-to tpl-2" in result.output
-
-
-def test_install_skills_sends_payload(fake_client):
-    client = fake_client(
-        FakeResponse(
-            payload={"installed": ["s"], "skipped": [], "target": "pool"}
-        ),
-    )
-    result = CliRunner().invoke(
-        cron_group,
-        [
-            "template",
-            "install-skills",
-            "tpl",
-            "--skill",
-            "s",
-            "--target",
-            "workspace",
-            "--enable",
-            "--overwrite",
-            *BASE,
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    assert client.calls[0]["json"] == {
-        "skills": ["s"],
-        "target": "workspace",
-        "enable": True,
-        "overwrite": True,
-    }
 
 
 def test_update_sends_only_given_fields(fake_client):

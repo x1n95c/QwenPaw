@@ -226,40 +226,6 @@ export function useCronTemplates() {
     [fetchTemplates, message, t],
   );
 
-  const installSkills = useCallback(
-    async (name: string) => {
-      setBusy(true);
-      try {
-        const result = await api.installCronTemplateSkills(name, {
-          target: "pool",
-        });
-        if (result.installed.length) {
-          message.success(
-            t("cronJobs.templateSkillsInstalled", {
-              names: result.installed.join(", "),
-            }),
-          );
-        } else {
-          message.info(
-            t("cronJobs.templateSkillsAlreadyInstalled", {
-              names: result.skipped.join(", "),
-            }),
-          );
-        }
-        return true;
-      } catch (error) {
-        console.error("Failed to install template skills", error);
-        message.error(
-          describeError(error, t("cronJobs.templateSkillsInstallFailed")),
-        );
-        return false;
-      } finally {
-        setBusy(false);
-      }
-    },
-    [message, t],
-  );
-
   return {
     templates,
     loading,
@@ -271,6 +237,8 @@ export function useCronTemplates() {
     createTemplate,
     updateTemplate,
     forkTemplate,
-    installSkills,
   };
 }
+
+/** The shape `useCronTemplates` returns, so callers can take it as a prop. */
+export type UseCronTemplatesResult = ReturnType<typeof useCronTemplates>;

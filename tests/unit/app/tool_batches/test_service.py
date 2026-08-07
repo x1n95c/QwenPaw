@@ -26,8 +26,8 @@ from .conftest import SAMPLE_ACTIONS, SAMPLE_BATCH, batch_json, make_zip
 
 
 @pytest.fixture
-def service(working_dir: Path) -> ToolBatchService:
-    return ToolBatchService()
+def service(batch_root: Path) -> ToolBatchService:
+    return ToolBatchService(batch_root)
 
 
 def make_request(
@@ -82,7 +82,7 @@ def test_create_writes_pool_file(service: ToolBatchService):
     assert info.arg_names == ["greeting"]
     assert info.action_count == 1
     assert info.updated_at
-    assert (store.get_tool_batch_dir() / "daily-collect.json").is_file()
+    assert (service.root / "daily-collect.json").is_file()
 
 
 def test_create_normalizes_name(service: ToolBatchService):
@@ -164,7 +164,7 @@ def test_create_rejects_over_max_steps(service: ToolBatchService):
 def test_failed_create_leaves_no_file(service: ToolBatchService):
     with pytest.raises(ToolBatchError):
         service.create_batch(make_request(content={"steps": []}))
-    assert not (store.get_tool_batch_dir() / "daily-collect.json").exists()
+    assert not (service.root / "daily-collect.json").exists()
     assert service.list_batches() == []
 
 
@@ -192,7 +192,7 @@ def test_write_lands_via_rename_not_truncation(
     either the old content or the new one.
     """
     service.create_batch(make_request(name="collect"))
-    target = store.get_tool_batch_dir() / "collect.json"
+    target = service.root / "collect.json"
     original = target.read_text(encoding="utf-8")
 
     replaced: list[tuple[str, str]] = []
@@ -217,7 +217,7 @@ def test_write_lands_via_rename_not_truncation(
     assert replaced[0][1] == str(target)
     assert "read_file" in target.read_text(encoding="utf-8")
     # No stray handoff file left in the pool.
-    assert sorted(p.name for p in store.get_tool_batch_dir().iterdir()) == [
+    assert sorted(p.name for p in service.root.iterdir()) == [
         "collect.json",
     ]
 
@@ -236,7 +236,7 @@ def test_list_returns_pool_scripts_sorted(service: ToolBatchService):
 def test_list_skips_malformed_file(service: ToolBatchService):
     """One broken script must not blank out the whole list."""
     service.create_batch(make_request(name="good"))
-    (store.get_tool_batch_dir() / "broken.json").write_text(
+    (service.root / "broken.json").write_text(
         "{oops",
         encoding="utf-8",
     )
@@ -258,7 +258,7 @@ def test_get_missing_raises(service: ToolBatchService):
 
 def test_manually_dropped_file_is_listed(service: ToolBatchService):
     """The filesystem is the source of truth; no manifest to update."""
-    pool = store.get_tool_batch_dir()
+    pool = service.root
     store.write_batch_file(pool / "manual.json", SAMPLE_BATCH)
     assert [b.name for b in service.list_batches()] == ["manual"]
 

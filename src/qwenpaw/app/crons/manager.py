@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Dict, Literal, Optional, Union
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -34,6 +36,11 @@ from .heartbeat import (
 )
 from .models import CronExecutionRecord, CronJobSpec, CronJobState
 from .repo.base import BaseJobRepository
+from .script_paths import (
+    is_safe_job_id,
+    iter_job_script_dirs,
+    job_scripts_dir,
+)
 from ...api_action import ManagerBase, api_action
 
 HEARTBEAT_JOB_ID = "_heartbeat"
@@ -44,6 +51,39 @@ DREAM_MISFIRE_GRACE_SECONDS = 600
 # cron time so installations using the default schedule do not start at once.
 DREAM_JITTER_MAX_SECONDS = 60
 INTERNAL_JOB_IDS = frozenset({HEARTBEAT_JOB_ID, DREAM_JOB_ID})
+
+
+def validate_job_id_for_write(job_id: Optional[str]) -> None:
+    """Gate a job id on the way in. Raises ``ValueError`` when unusable.
+
+    A job id names a directory now
+    (``<workspace_dir>/cron_jobs/<job_id>/batch/``), so it is attacker
+    reachable through three surfaces at once: ``POST /cron/jobs``, the
+    auto-registered ``POST /crons/jobs`` (see the ``api_action`` on
+    :meth:`CronManager.create_or_replace_job`), and the ``cron-create``
+    slash command. All three funnel through that one method, which is why
+    the check lives there rather than in any one router.
+
+    ``None`` is allowed — the caller mints one. Otherwise the bar is
+    "usable as a directory name, and not one of ours": that is the whole
+    security requirement. It is deliberately **not** "must be a canonical
+    uuid", even though every id we mint is one. Requiring uuid would add
+    nothing a traversal-safe check does not already give, while breaking
+    ``POST /crons/jobs`` and ``cron-create`` for anyone who passes a
+    readable id — a capability those surfaces have always had.
+
+    Note this is not the only line of defence: ``script_paths`` re-checks
+    independently and fails closed, because a spec loaded from
+    ``jobs.json`` never passes through here.
+    """
+    if job_id is None:
+        return
+    if job_id in INTERNAL_JOB_IDS:
+        raise ValueError(f"job id is reserved: {job_id}")
+    if not is_safe_job_id(job_id):
+        raise ValueError(f"unsafe job id: {job_id!r}")
+
+
 CRON_HISTORY_LIMIT = 50
 # Periodic self-contained keepalive so the asyncio event loop keeps ticking
 # even with no external traffic. APScheduler's AsyncIOScheduler processes
@@ -100,6 +140,7 @@ class CronManager(ManagerBase):
                 job.id for job in jobs_file.jobs if job.id is not None
             }
             await self._repo.prune_orphan_history(valid_job_ids)
+            await self._prune_orphan_job_scripts(valid_job_ids)
 
             self._register_scheduler_listeners()
             self._scheduler.start()
@@ -247,6 +288,14 @@ class CronManager(ManagerBase):
         slash_command="cron-create",
     )
     async def create_or_replace_job(self, spec: CronJobSpec) -> None:
+        """Upsert a job. This is the single write boundary for job ids.
+
+        Three surfaces reach here — ``POST /cron/jobs``, the
+        auto-registered ``POST /crons/jobs``, and the ``cron-create``
+        slash command — and the id becomes a directory name, so the gate
+        belongs here rather than in any one router.
+        """
+        validate_job_id_for_write(spec.id)
         async with self._lock:
             await self._repo.upsert_job(spec)
             if self._started:
@@ -266,7 +315,68 @@ class CronManager(ManagerBase):
             self._history.pop(job_id, None)
             await self._repo.delete_history(job_id)
             self._rt.pop(job_id, None)
+            self._delete_job_scripts(job_id)
             return await self._repo.delete_job(job_id)
+
+    def _delete_job_scripts(self, job_id: str) -> None:
+        """Remove a job's own batch scripts along with the job.
+
+        Scripts belong to the job, so leaving them behind would accumulate
+        directories no UI can reach. Mirrors ``_repo.delete_history``
+        above. Best-effort: a failure here must not stop the deletion the
+        user asked for.
+        """
+        directory = self._job_scripts_dir(job_id)
+        if directory is None:
+            return
+        try:
+            shutil.rmtree(directory.parent, ignore_errors=True)
+        except OSError as exc:  # pragma: no cover - rmtree already lenient
+            logger.warning(
+                "could not remove scripts for job %s: %s",
+                job_id,
+                exc,
+            )
+
+    def _job_scripts_dir(self, job_id: str) -> Optional[Path]:
+        workspace_dir = getattr(self._workspace, "workspace_dir", None)
+        if not workspace_dir:
+            return None
+        return job_scripts_dir(workspace_dir, job_id)
+
+    async def _prune_orphan_job_scripts(
+        self,
+        valid_job_ids: set[str],
+    ) -> None:
+        """Drop script directories whose job no longer exists.
+
+        Catches the create-drawer case: the console mints a job id when the
+        drawer opens and writes scripts under it, so abandoning the drawer
+        without saving leaves a directory with no job.
+
+        ``INTERNAL_JOB_IDS`` is unioned in because ``_heartbeat`` and
+        ``_dream`` are synthesized rather than stored in ``jobs.json``, so
+        they never appear in *valid_job_ids* — reaping on that set alone
+        would delete their directories on every boot. (``prune_orphan_history``
+        above has exactly that bug today; not fixing it here, but do not
+        copy it.)
+
+        Runs only at start, where no drawer can be open. Deliberately not on
+        a timer: that would delete an open drawer's scripts out from under
+        the user.
+        """
+        workspace_dir = getattr(self._workspace, "workspace_dir", None)
+        if not workspace_dir:
+            return
+        keep = set(valid_job_ids) | INTERNAL_JOB_IDS
+        for found_id, scripts_dir in iter_job_script_dirs(workspace_dir):
+            if found_id in keep:
+                continue
+            shutil.rmtree(scripts_dir.parent, ignore_errors=True)
+            logger.info(
+                "removed orphan cron job scripts: job_id=%s",
+                found_id,
+            )
 
     async def pause_job(self, job_id: str) -> None:
         async with self._lock:

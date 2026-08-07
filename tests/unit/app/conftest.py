@@ -129,6 +129,7 @@ def make_cron_job_spec(
     text: Optional[str] = None,
     enabled: bool = True,
     preprocess: Optional[dict] = None,
+    skills: Optional[list[dict]] = None,
 ) -> CronJobSpec:
     target = make_dispatch_target(user_id=user_id, session_id=session_id)
     dispatch = DispatchSpec(target=target)
@@ -154,6 +155,8 @@ def make_cron_job_spec(
         kwargs["request"] = CronJobRequest(input="ping")
     if preprocess is not None:
         kwargs["preprocess"] = preprocess
+    if skills is not None:
+        kwargs["skills"] = skills
 
     return CronJobSpec(**kwargs)
 

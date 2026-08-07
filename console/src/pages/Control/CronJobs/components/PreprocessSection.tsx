@@ -22,6 +22,9 @@ import { Alert } from "antd";
 import type { FormInstance } from "antd";
 import { useTranslation } from "react-i18next";
 import type {
+  CronSkillInfo,
+  JobToolBatches,
+  TemplateBatchScriptInfo,
   ToolBatchImportCandidate,
   ToolBatchInfo,
 } from "../../../../api/types";
@@ -29,6 +32,14 @@ import { useAppMessage } from "../../../../hooks/useAppMessage";
 import { BatchEditorModal, type BatchEditorTarget } from "./BatchEditorModal";
 import { BatchPickerModal } from "./BatchPickerModal";
 import { BatchStepPreview } from "./BatchStepPreview";
+import {
+  buildScriptOptions,
+  findScript,
+  type ScriptSelectOption,
+} from "./scriptOptions";
+import { useCronSkills } from "./useCronSkills";
+import { useTemplateBatchScripts } from "./useTemplateBatchScripts";
+import { useWorkspaceJobBatches } from "./useWorkspaceJobBatches";
 import { useToolBatches } from "./useToolBatches";
 import {
   PREPROCESS_DEFAULTS,
@@ -39,9 +50,11 @@ import styles from "../index.module.less";
 
 interface PreprocessSectionProps {
   form: FormInstance;
+  /** The job that owns these scripts. See `JobDrawerProps.jobId`. */
+  jobId: string;
 }
 
-/** Files accepted by the 导入脚本 button. */
+/** Files accepted by a row's import button. */
 const UPLOAD_ACCEPT =
   ".json,.zip,application/json,application/zip,application/x-zip-compressed";
 
@@ -50,8 +63,28 @@ const MAX_STEPS = 10;
 
 interface StepsEditorProps {
   batches: ToolBatchInfo[];
+  templateScripts: TemplateBatchScriptInfo[];
+  /** Other cron jobs' scripts, browse-only: picking one copies it in. */
+  jobScripts: JobToolBatches[];
+  /** Skills that carry batch JSON, browse-only: picking one copies it in. */
+  skillScripts: CronSkillInfo[];
   loading: boolean;
-  onEditScript: (name: string) => void;
+  /** Open the editor for the script selected in row `index`. */
+  onEditScript: (index: number, script: string) => void;
+  /** Author a new script and land it in row `index`. */
+  onCreateScript: (index: number) => void;
+  /** Import a script file and land it in row `index`. */
+  onImportScript: (index: number) => void;
+  /** Open the script manager. Acts outside this chain. */
+  onManageScripts: () => void;
+  /**
+   * Copy a foreign script into this job and put the resulting local name in
+   * row `index`. The source descriptor is transient and never stored.
+   */
+  onAdoptScript: (
+    index: number,
+    source: NonNullable<ScriptSelectOption["copySource"]>,
+  ) => Promise<void>;
   value?: PreprocessStepFormValue[];
   onChange?: (value: PreprocessStepFormValue[]) => void;
 }
@@ -67,12 +100,23 @@ interface StepsEditorProps {
  */
 function StepsEditor({
   batches,
+  templateScripts,
+  jobScripts,
+  skillScripts,
   loading,
   onEditScript,
+  onCreateScript,
+  onImportScript,
+  onManageScripts,
+  onAdoptScript,
   value,
   onChange,
 }: StepsEditorProps) {
   const { t } = useTranslation();
+  // Reveal the template groups. Kept outside the form value: it is a view
+  // state of the picker, not part of the job.
+  const [expanded, setExpanded] = useState(false);
+  const [searchValue, setSearchValue] = useState("");
   // Always render at least one row: an empty list would leave the user
   // with nothing to click after enabling the block.
   const steps = value?.length ? value : [emptyPreprocessStep()];
@@ -84,17 +128,29 @@ function StepsEditor({
     patch: Partial<PreprocessStepFormValue>,
   ) => emit(steps.map((s, i) => (i === index ? { ...s, ...patch } : s)));
 
-  const options = batches.map((batch) => ({
-    label: batch.description
-      ? `${batch.name} — ${batch.description}`
-      : batch.name,
-    value: batch.name,
-  }));
+  const { groups, templateCount } = buildScriptOptions({
+    ownScripts: batches,
+    templateScripts,
+    jobScripts,
+    skillScripts,
+    t,
+    // A search must reach into the collapsed groups. Without this, typing
+    // "weather" filters this job's own scripts to nothing and renders "no
+    // data" while the match sits one hidden group away — the feature would be invisible to
+    // anyone who types instead of scrolls.
+    expanded: expanded || Boolean(searchValue.trim()),
+    labels: {
+      own: t("cronJobs.preprocess.scriptGroupPool"),
+      template: t("cronJobs.preprocess.scriptGroupTemplatePrefix"),
+      job: t("cronJobs.preprocess.scriptGroupJobPrefix"),
+      skill: t("cronJobs.preprocess.scriptGroupSkillPrefix"),
+    },
+  });
 
   return (
     <div className={styles.preprocessSteps}>
       {steps.map((step, index) => {
-        const selected = batches.find((b) => b.name === step.script);
+        const selected = findScript(step.script, batches);
         const missing = Boolean(step.script) && !loading && !selected;
         return (
           <div key={index} className={styles.preprocessStep}>
@@ -109,58 +165,137 @@ function StepsEditor({
                 loading={loading}
                 className={styles.preprocessStepSelect}
                 placeholder={t("cronJobs.preprocess.scriptPlaceholder")}
-                options={options}
+                options={groups}
                 value={step.script || undefined}
-                onChange={(next) =>
+                onChange={(next, option) => {
+                  setSearchValue("");
+                  const picked = option as unknown as
+                    | ScriptSelectOption
+                    | undefined;
+                  if (picked?.copySource) {
+                    // A foreign script — from a template or another job —
+                    // is copied in, never referenced: the step must end up
+                    // holding a name that exists in *this* job's directory.
+                    // The server decides the final name (it may already be
+                    // taken), so the row is filled from its answer rather
+                    // than from `next`.
+                    void onAdoptScript(index, picked.copySource);
+                    return;
+                  }
                   // Fresh script → fresh placeholder set; never carry the
                   // previous script's keys across.
-                  replaceStep(index, { script: next || "", args: {} })
-                }
+                  replaceStep(index, { script: next || "", args: {} });
+                }}
+                onSearch={setSearchValue}
+                // The search box is uncontrolled — antd clears it itself on
+                // select and on close, and replicating those rules here
+                // would only drift. This mirror exists to decide whether
+                // the template groups are revealed, so it has to be reset
+                // at the same two moments or the next row opens filtered.
+                onOpenChange={(open) => {
+                  if (!open) setSearchValue("");
+                }}
+                // antd infers the callback parameter from `options`, which
+                // here is the *group* type — it has no way to say "a leaf
+                // of a grouped list". Both callbacks only ever receive
+                // leaves, so narrowing is the honest thing to do.
                 filterOption={(input, option) =>
-                  (option?.label?.toString() || "")
-                    .toLowerCase()
-                    .includes(input.toLowerCase())
+                  (
+                    (option as unknown as ScriptSelectOption | undefined)
+                      ?.searchText || ""
+                  ).includes(input.toLowerCase())
+                }
+                // The description belongs on hover, not inline: the rows
+                // stay scannable, and the option's own `title` is blanked
+                // so this is the only tooltip that fires.
+                optionRender={(option) => {
+                  const data = option.data as unknown as ScriptSelectOption;
+                  return (
+                    <Tooltip
+                      title={data.tooltip}
+                      placement="right"
+                      mouseEnterDelay={0.4}
+                    >
+                      <div>{data.label}</div>
+                    </Tooltip>
+                  );
+                }}
+                popupRender={(menu) => (
+                  <>
+                    {menu}
+                    {/* preventDefault on mousedown, or the Select blurs and
+                        the dropdown closes before onClick ever fires. */}
+                    <div
+                      className={styles.preprocessScriptExpander}
+                      onMouseDown={(event) => event.preventDefault()}
+                    >
+                      <Button
+                        type="link"
+                        size="small"
+                        onClick={() => setExpanded((prev) => !prev)}
+                      >
+                        {expanded
+                          ? t("cronJobs.preprocess.scriptGroupTemplatesHide")
+                          : t("cronJobs.preprocess.scriptGroupTemplates", {
+                              count: templateCount,
+                            })}
+                      </Button>
+                    </div>
+                  </>
+                )}
+                // A job with no scripts of its own would otherwise render
+                // antd's bare "no data" above the expander, hiding that
+                // there is more behind it.
+                notFoundContent={
+                  <div className={styles.preprocessScriptEmpty}>
+                    {t("cronJobs.preprocess.scriptNoMatch")}
+                  </div>
                 }
               />
+              {/* The first button is what this row needs *next*: an empty
+                  row needs a script written, a filled one needs it
+                  changed. One slot, two jobs, so the row never shows a
+                  button that does nothing. */}
               <Tooltip
                 title={
                   step.script
                     ? t("cronJobs.preprocess.editCurrentScriptTooltip")
-                    : t("cronJobs.preprocess.editCurrentScriptDisabled")
+                    : t("cronJobs.preprocess.newScriptTooltip")
                 }
               >
                 <Button
-                  icon={<EditOutlined />}
-                  disabled={!step.script}
-                  onClick={() => step.script && onEditScript(step.script)}
+                  icon={step.script ? <EditOutlined /> : <PlusOutlined />}
+                  onClick={() =>
+                    step.script
+                      ? onEditScript(index, step.script)
+                      : onCreateScript(index)
+                  }
+                />
+              </Tooltip>
+              <Tooltip title={t("cronJobs.preprocess.importScriptTooltip")}>
+                <Button
+                  icon={<ImportOutlined />}
+                  onClick={() => onImportScript(index)}
                 />
               </Tooltip>
               <Tooltip
                 title={
-                  steps.length >= MAX_STEPS
-                    ? t("cronJobs.preprocess.addStepMax", { max: MAX_STEPS })
-                    : t("cronJobs.preprocess.addStepTooltip")
+                  steps.length > 1
+                    ? t("cronJobs.preprocess.removeStepTooltip")
+                    : t("cronJobs.preprocess.clearStepTooltip")
                 }
               >
                 <Button
-                  icon={<PlusOutlined />}
-                  disabled={steps.length >= MAX_STEPS}
-                  onClick={() =>
-                    emit([
-                      ...steps.slice(0, index + 1),
-                      emptyPreprocessStep(),
-                      ...steps.slice(index + 1),
-                    ])
-                  }
-                />
-              </Tooltip>
-              <Tooltip title={t("cronJobs.preprocess.removeStepTooltip")}>
-                <Button
                   icon={<DeleteOutlined />}
-                  // Removing the only row would leave nothing to click;
-                  // clearing the selection is what "no script" means.
-                  disabled={steps.length <= 1}
-                  onClick={() => emit(steps.filter((_, i) => i !== index))}
+                  // Never disabled. Dropping the last row would leave
+                  // nothing to click, so on a single row this clears the
+                  // selection instead — which is what "remove" means when
+                  // there is only one.
+                  onClick={() =>
+                    steps.length > 1
+                      ? emit(steps.filter((_, i) => i !== index))
+                      : replaceStep(index, { script: "", args: {} })
+                  }
                 />
               </Tooltip>
             </div>
@@ -215,6 +350,31 @@ function StepsEditor({
           </div>
         );
       })}
+
+      {/* Adding another step belongs below the list, not on a row: it acts
+          on the chain rather than on any one script. Managing the scripts sits
+          opposite it — same line, but it is the only thing here that
+          reaches outside this job. */}
+      <div className={styles.preprocessChainActions}>
+        <Tooltip
+          title={
+            steps.length >= MAX_STEPS
+              ? t("cronJobs.preprocess.addStepMax", { max: MAX_STEPS })
+              : t("cronJobs.preprocess.addStepTooltip")
+          }
+        >
+          <Button
+            icon={<PlusOutlined />}
+            disabled={steps.length >= MAX_STEPS}
+            onClick={() => emit([...steps, emptyPreprocessStep()])}
+          >
+            {t("cronJobs.preprocess.addStep")}
+          </Button>
+        </Tooltip>
+        <Button onClick={onManageScripts}>
+          {t("cronJobs.preprocess.manageScripts")}
+        </Button>
+      </div>
     </div>
   );
 }
@@ -227,15 +387,27 @@ function StepsEditor({
  * The enable switch is the only thing shown until it is on — a job without
  * a preprocess should not have to scroll past its settings.
  */
-export function PreprocessSection({ form }: PreprocessSectionProps) {
+export function PreprocessSection({ form, jobId }: PreprocessSectionProps) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
-  const toolBatches = useToolBatches();
+  const toolBatches = useToolBatches(jobId);
   const { batches, loading } = toolBatches;
+  const templateScripts = useTemplateBatchScripts();
+  // Other jobs' scripts, browse-only. Excludes this job, which is already
+  // listed as "my scripts".
+  const workspaceJobScripts = useWorkspaceJobBatches(jobId);
+  // Skills carry batch JSON of their own — the layout `make-skill` teaches
+  // agents to write. Same list the "use skill" picker renders; only the
+  // ones actually carrying a script produce a group.
+  const cronSkills = useCronSkills();
   const [pickerOpen, setPickerOpen] = useState(false);
   const [editorTarget, setEditorTarget] = useState<BatchEditorTarget | null>(
     null,
   );
+  // Which row the open editor should write its result back to. `null`
+  // means "the first empty row", which is what creating from the manager
+  // actions below wants.
+  const [editorRow, setEditorRow] = useState<number | null>(null);
   // A zip with several scripts needs a pick step before anything is
   // written; the server returns candidates and waits for `select`.
   const [pendingImport, setPendingImport] = useState<{
@@ -247,15 +419,58 @@ export function PreprocessSection({ form }: PreprocessSectionProps) {
 
   const enabled = Form.useWatch(["preprocess", "enabled"], form);
 
-  /** Put a newly created/imported script into the first empty row. */
-  const useScript = (name: string) => {
+  /**
+   * Point a row at a newly created / imported script.
+   *
+   * Named `assignScript`, not `useScript`: a `use` prefix makes eslint's
+   * `react-hooks/rules-of-hooks` treat it as a hook and reject every call
+   * from inside an event handler.
+   *
+   * Targets `editorRow` when one is set — copying a template script has to
+   * replace the row it was copied from, not land in some other blank one —
+   * and otherwise fills the first empty row.
+   */
+  const assignScript = (name: string) => {
     const steps: PreprocessStepFormValue[] =
       form.getFieldValue(["preprocess", "steps"]) || [];
-    const blank = steps.findIndex((step) => !step?.script);
     const next = steps.length ? [...steps] : [emptyPreprocessStep()];
-    const target = blank >= 0 ? blank : next.length;
+    let target = editorRow;
+    if (target === null || target < 0 || target >= next.length) {
+      const blank = next.findIndex((step) => !step?.script);
+      target = blank >= 0 ? blank : next.length;
+    }
     next[target] = { script: name, args: {} };
     form.setFieldValue(["preprocess", "steps"], next);
+    setEditorRow(null);
+  };
+
+  /**
+   * Copy a foreign script into this job and point a row at the result.
+   *
+   * The source descriptor is transient: it names a script in a template
+   * package or in another job, and is never stored. The server resolves it,
+   * writes a copy into this job's directory, and answers with the name that
+   * actually landed (which differs from the requested one when that was
+   * taken). Only that name reaches the form, so a step can never hold a
+   * value pointing outside the job that runs it.
+   */
+  const handleAdoptScript = async (
+    index: number,
+    source: NonNullable<ScriptSelectOption["copySource"]>,
+  ) => {
+    setEditorRow(index);
+    const landed = await toolBatches.copyBatch(source);
+    if (landed) assignScript(landed);
+    else setEditorRow(null);
+  };
+
+  /**
+   * The edit button on a step. Every script a step names belongs to this
+   * job, so editing is always in place.
+   */
+  const handleEditScript = (index: number, script: string) => {
+    setEditorRow(index);
+    setEditorTarget({ mode: "edit", name: script });
   };
 
   const handleUploadChange = async (
@@ -267,12 +482,12 @@ export function PreprocessSection({ form }: PreprocessSectionProps) {
     if (!file) return;
 
     if (file.name.toLowerCase().endsWith(".json")) {
-      // Single script: create it in the pool directly and select it.
+      // Single script: create it in this job directly and select it.
       try {
         const content = JSON.parse(await file.text());
         const name = file.name.replace(/\.json$/i, "");
         const ok = await toolBatches.createBatch({ name, content });
-        if (ok) useScript(name);
+        if (ok) assignScript(name);
       } catch (error) {
         message.error(
           error instanceof SyntaxError
@@ -338,34 +553,27 @@ export function PreprocessSection({ form }: PreprocessSectionProps) {
           >
             <StepsEditor
               batches={batches}
-              loading={loading}
-              onEditScript={(name) => setEditorTarget({ mode: "edit", name })}
+              templateScripts={templateScripts.scripts}
+              jobScripts={workspaceJobScripts.groups}
+              skillScripts={cronSkills.skills}
+              // Every list feeds the same picker, so the "script not found"
+              // warning must wait for all of them or it flashes on first
+              // paint.
+              loading={loading || templateScripts.loading || cronSkills.loading}
+              onEditScript={handleEditScript}
+              onCreateScript={(index) => {
+                setEditorRow(index);
+                setEditorTarget({ mode: "create" });
+              }}
+              onImportScript={(index) => {
+                setEditorRow(index);
+                uploadInputRef.current?.click();
+              }}
+              onManageScripts={() => setPickerOpen(true)}
+              onAdoptScript={handleAdoptScript}
             />
           </Form.Item>
 
-          {/* Pool-level actions sit below the list: they act on the shared
-              pool rather than on any one row. */}
-          <div className={styles.preprocessPoolActions}>
-            <Button onClick={() => setPickerOpen(true)}>
-              {t("cronJobs.preprocess.manageScripts")}
-            </Button>
-            <Tooltip title={t("cronJobs.preprocess.newScriptTooltip")}>
-              <Button
-                icon={<PlusOutlined />}
-                onClick={() => setEditorTarget({ mode: "create" })}
-              >
-                {t("cronJobs.preprocess.newScript")}
-              </Button>
-            </Tooltip>
-            <Tooltip title={t("cronJobs.preprocess.importScriptTooltip")}>
-              <Button
-                icon={<ImportOutlined />}
-                onClick={() => uploadInputRef.current?.click()}
-              >
-                {t("cronJobs.preprocess.importScript")}
-              </Button>
-            </Tooltip>
-          </div>
           <input
             ref={uploadInputRef}
             type="file"
@@ -434,7 +642,10 @@ export function PreprocessSection({ form }: PreprocessSectionProps) {
         open={pickerOpen}
         toolBatches={toolBatches}
         onCancel={() => setPickerOpen(false)}
-        onOpenEditor={setEditorTarget}
+        onOpenEditor={(target) => {
+          setEditorRow(null);
+          setEditorTarget(target);
+        }}
       />
 
       <Modal
@@ -506,8 +717,11 @@ export function PreprocessSection({ form }: PreprocessSectionProps) {
         open={editorTarget !== null}
         target={editorTarget}
         toolBatches={toolBatches}
-        onCancel={() => setEditorTarget(null)}
-        onSaved={useScript}
+        onCancel={() => {
+          setEditorTarget(null);
+          setEditorRow(null);
+        }}
+        onSaved={assignScript}
       />
     </>
   );

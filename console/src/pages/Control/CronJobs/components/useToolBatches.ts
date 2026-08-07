@@ -1,15 +1,21 @@
 /**
- * Load and mutate the backend batch-script pool.
+ * Load and mutate one cron job's own batch scripts.
  *
- * Same shape as useCronTemplates: the pool is shared state that outlives
- * any single job form, and both the preprocess section and the picker
- * need it even when the job table is still loading.
+ * Scripts belong to the job that runs them
+ * (`<workspace>/cron_jobs/<job_id>/batch/`), so every call is scoped by
+ * `jobId` and a job can only ever see its own. Reaching another job's or a
+ * template's script goes through `copyBatch`, which duplicates it — the two
+ * copies are then independent, which is the point.
+ *
+ * `jobId` is minted by the drawer when it opens, so this works before the
+ * job has ever been saved.
  */
 
 import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import api from "../../../../api";
 import type {
+  CopyToolBatchRequest,
   CreateToolBatchRequest,
   ToolBatchDetail,
   ToolBatchImportConflict,
@@ -99,9 +105,11 @@ export interface UseToolBatchesResult {
   deleteBatch: (name: string) => Promise<boolean>;
   createBatch: (body: CreateToolBatchRequest) => Promise<boolean>;
   updateBatch: (name: string, body: UpdateToolBatchRequest) => Promise<boolean>;
+  /** Duplicate a foreign script in; resolves to the name that landed. */
+  copyBatch: (body: CopyToolBatchRequest) => Promise<string | null>;
 }
 
-export function useToolBatches(): UseToolBatchesResult {
+export function useToolBatches(jobId: string): UseToolBatchesResult {
   const [batches, setBatches] = useState<ToolBatchInfo[]>([]);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -111,7 +119,7 @@ export function useToolBatches(): UseToolBatchesResult {
   const fetchBatches = useCallback(async () => {
     setLoading(true);
     try {
-      const data = await api.listToolBatches();
+      const data = await api.listJobBatches(jobId);
       setBatches(data || []);
     } catch (error) {
       console.error("Failed to load tool batches", error);
@@ -119,7 +127,7 @@ export function useToolBatches(): UseToolBatchesResult {
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [jobId]);
 
   useEffect(() => {
     fetchBatches();
@@ -130,7 +138,7 @@ export function useToolBatches(): UseToolBatchesResult {
     async (name: string): Promise<ToolBatchDetail | null> => {
       setBusy(true);
       try {
-        return await api.getToolBatch(name);
+        return await api.getJobBatch(jobId, name);
       } catch (error) {
         console.error("Failed to load tool batch", error);
         message.error(
@@ -141,7 +149,7 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [message, t],
+    [jobId, message, t],
   );
 
   /**
@@ -161,7 +169,7 @@ export function useToolBatches(): UseToolBatchesResult {
     ): Promise<ToolBatchImportResult | null> => {
       setBusy(true);
       try {
-        const result = await api.uploadToolBatchZip(file, {
+        const result = await api.uploadJobBatchZip(jobId, file, {
           select: options?.select,
           rename_map: options?.renameMap,
           overwrite: options?.overwrite,
@@ -187,14 +195,14 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [fetchBatches, message, t],
+    [fetchBatches, jobId, message, t],
   );
 
   const exportBatch = useCallback(
     async (name: string) => {
       setBusy(true);
       try {
-        const { blob, filename } = await api.downloadToolBatchZip(name);
+        const { blob, filename } = await api.downloadJobBatchZip(jobId, name);
         saveBlob(blob, filename);
         message.success(t("cronJobs.toolBatches.exported", { name }));
         return true;
@@ -208,14 +216,14 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [message, t],
+    [jobId, message, t],
   );
 
   const deleteBatch = useCallback(
     async (name: string) => {
       setBusy(true);
       try {
-        await api.deleteToolBatch(name);
+        await api.deleteJobBatch(jobId, name);
         message.success(t("cronJobs.toolBatches.deleted", { name }));
         await fetchBatches();
         return true;
@@ -229,14 +237,14 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [fetchBatches, message, t],
+    [fetchBatches, jobId, message, t],
   );
 
   const createBatch = useCallback(
     async (body: CreateToolBatchRequest) => {
       setBusy(true);
       try {
-        await api.createToolBatch(body);
+        await api.createJobBatch(jobId, body);
         message.success(t("cronJobs.toolBatches.saved", { name: body.name }));
         await fetchBatches();
         return true;
@@ -250,14 +258,14 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [fetchBatches, message, t],
+    [fetchBatches, jobId, message, t],
   );
 
   const updateBatch = useCallback(
     async (name: string, body: UpdateToolBatchRequest) => {
       setBusy(true);
       try {
-        await api.updateToolBatch(name, body);
+        await api.updateJobBatch(jobId, name, body);
         message.success(t("cronJobs.toolBatches.updated", { name }));
         await fetchBatches();
         return true;
@@ -271,7 +279,35 @@ export function useToolBatches(): UseToolBatchesResult {
         setBusy(false);
       }
     },
-    [fetchBatches, message, t],
+    [fetchBatches, jobId, message, t],
+  );
+
+  /**
+   * Duplicate another job's or a template's script into this job.
+   *
+   * Returns the name that actually landed — the server picks a free
+   * variant when the preferred one is taken — or `null` on failure. The
+   * caller writes the returned name into the step, so a foreign
+   * identifier never reaches the form.
+   */
+  const copyBatch = useCallback(
+    async (body: CopyToolBatchRequest): Promise<string | null> => {
+      setBusy(true);
+      try {
+        const info = await api.copyJobBatch(jobId, body);
+        await fetchBatches();
+        return info.name;
+      } catch (error) {
+        console.error("Failed to copy tool batch", error);
+        message.error(
+          describeError(error, t("cronJobs.toolBatches.copyFailed")),
+        );
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [fetchBatches, jobId, message, t],
   );
 
   return {
@@ -285,5 +321,6 @@ export function useToolBatches(): UseToolBatchesResult {
     deleteBatch,
     createBatch,
     updateBatch,
+    copyBatch,
   };
 }

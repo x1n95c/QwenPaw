@@ -104,14 +104,28 @@ async def create_job(
     spec: CronJobSpec,
     mgr: CronManager = Depends(get_cron_manager),
 ):
-    # server generates id; ignore client-provided spec.id
-    job_id = str(uuid.uuid4())
-    created = spec.model_copy(update={"id": job_id})
+    """Create a job, honouring a client-supplied id.
+
+    The console mints the uuid when the create drawer opens, because the
+    job's batch scripts are written to ``cron_jobs/<id>/batch/`` while the
+    drawer is still open — there is no later moment at which a
+    server-generated id could be handed back in time.
+
+    ``create_or_replace_job`` validates the id and rejects one that is
+    already taken, so this cannot be used to overwrite another job.
+    """
+    if spec.id is None:
+        spec = spec.model_copy(update={"id": str(uuid.uuid4())})
+    elif await mgr.get_job(spec.id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"job already exists: {spec.id}",
+        )
     try:
-        await mgr.create_or_replace_job(created)
+        await mgr.create_or_replace_job(spec)
     except (ConfigurationException, ValueError) as e:
         raise HTTPException(status_code=422, detail=str(e)) from e
-    return created
+    return spec
 
 
 @router.put("/jobs/{job_id}", response_model=CronJobSpec)

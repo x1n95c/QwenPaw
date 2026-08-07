@@ -12,7 +12,7 @@ import type {
   CreateCronTemplateRequest,
   CronJobSpecOutput,
 } from "../../../../api/types";
-import { normalizePreprocessValue } from "./constants";
+import { normalizePreprocessValue, normalizeSkillRefs } from "./constants";
 import { parseCron } from "./parseCron";
 
 type CronJob = CronJobSpecOutput;
@@ -35,6 +35,9 @@ export function jobToFormValues(job: CronJob): Record<string, unknown> {
     // reset before editing, so a job without the block must overwrite
     // whatever the previously edited job left behind.
     preprocess: normalizePreprocessValue(job.preprocess),
+    // Unconditional for the same reason — an empty array has to overwrite
+    // the previous job's selection, not inherit it.
+    skills: normalizeSkillRefs(job.skills),
   };
 
   if (job.schedule?.type === "once") {
@@ -83,6 +86,11 @@ export function jobToTemplateForm(
   // Identity belongs to the job, not the recipe.
   delete values.id;
   values.name = "";
+  // Including where *this* job came from: a job derived from
+  // `weather-report` and saved as `my-thing` would otherwise ship a package
+  // claiming `weather-report` provenance, and every job created from it
+  // would lead its skill picker with the wrong package.
+  delete values.meta;
 
   const runAt = values.onceRunAt;
   values.onceRunAt = dayjs.isDayjs(runAt)
@@ -141,8 +149,17 @@ export function jobToTemplateSpec(
     spec.request = { ...job.request, user_id: "", session_id: "" };
   }
   // A template is the job definition, so the preprocess block travels
-  // with it (the referenced script must exist in the target's pool).
+  // with it; the scripts it names ride along under `batch/` and are copied
+  // into whichever job the template is applied to.
   if (job.preprocess) spec.preprocess = { ...job.preprocess };
+  // Skill refs travel too, `template` qualifier included. That qualifier
+  // may name a package the importer does not have — kept anyway rather
+  // than stripped, because stripping silently discards what the author
+  // chose, whereas an unresolvable ref degrades into a note in the prompt
+  // at run time. Fail-soft beats fail-quiet.
+  if (job.skills?.length) {
+    spec.skills = job.skills.map((ref) => ({ ...ref }));
+  }
   if (job.save_result_to_inbox !== undefined) {
     spec.save_result_to_inbox = job.save_result_to_inbox;
   }
@@ -164,9 +181,12 @@ export interface SaveAsTemplateOptions {
   tags: string[];
   includeDispatchTarget: boolean;
   /**
-   * Batch scripts referenced by the job's preprocess, packaged under
-   * `batch/` so the template is self-contained (an importer installs
-   * them into its own pool via install-batches).
+   * Every script the job owns, packaged under `batch/` so the template is
+   * self-contained. Keys are `<name>.json`; applying the template copies
+   * each one into the target job's own directory.
+   *
+   * No rename map travels with these: the names come from a directory
+   * listing, so they are unique by construction.
    */
   batchFiles?: Record<string, string>;
   /** Package-relative entry, e.g. `batch/collect.json`. */

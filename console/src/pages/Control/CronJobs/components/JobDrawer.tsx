@@ -18,6 +18,7 @@ import type {
 } from "../../../../api/types";
 import { DEFAULT_FORM_VALUES } from "./constants";
 import { PreprocessSection } from "./PreprocessSection";
+import { SkillSection } from "./SkillSection";
 import { useTimezoneOptions } from "../../../../hooks/useTimezoneOptions";
 import styles from "../index.module.less";
 
@@ -27,6 +28,13 @@ type SelectOption = { value: string; label: string };
 interface JobDrawerProps {
   open: boolean;
   editingJob: CronJob | null;
+  /**
+   * The job the drawer is editing. Minted by the page when the drawer opens
+   * for a *new* job, because the preprocess block writes batch scripts to
+   * `cron_jobs/<jobId>/batch/` while the drawer is still open — there is no
+   * later moment at which a server-generated id could arrive in time.
+   */
+  jobId: string;
   form: FormInstance<CronJob>;
   saving: boolean;
   targetItems: CronDispatchTargetItem[];
@@ -40,6 +48,7 @@ interface JobDrawerProps {
 export function JobDrawer({
   open,
   editingJob,
+  jobId,
   form,
   saving,
   targetItems,
@@ -538,9 +547,11 @@ export function JobDrawer({
           </Select>
         </Form.Item>
 
-        {/* Between the task type and the message content: the batch
-            script collects data first, then the task body consumes it. */}
-        <PreprocessSection form={form} />
+        {/* Between the task type and the message content, in the order the
+            executor assembles the prompt: the skill's instructions, then
+            the data the batch script collects, then the task body. */}
+        <SkillSection />
+        <PreprocessSection form={form} jobId={jobId} />
 
         <Form.Item
           noStyle

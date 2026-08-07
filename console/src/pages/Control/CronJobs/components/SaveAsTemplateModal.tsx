@@ -5,13 +5,16 @@ import api from "../../../../api";
 import type { CronJobSpecOutput } from "../../../../api/types";
 import { useAppMessage } from "../../../../hooks/useAppMessage";
 import { buildCreateTemplateRequest } from "./jobToTemplate";
-import { useCronTemplates } from "./useCronTemplates";
+import { collectJobScripts } from "./saveAsTemplateScripts";
+import type { UseCronTemplatesResult } from "./useCronTemplates";
 
 interface SaveAsTemplateModalProps {
   open: boolean;
   job: CronJobSpecOutput | null;
   onCancel: () => void;
   onSaved?: () => void;
+  /** Shared with the picker; see `TemplatePickerModalProps`. */
+  cronTemplates: UseCronTemplatesResult;
 }
 
 interface FormValues {
@@ -40,11 +43,12 @@ export function SaveAsTemplateModal({
   job,
   onCancel,
   onSaved,
+  cronTemplates,
 }: SaveAsTemplateModalProps) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
   const [form] = Form.useForm<FormValues>();
-  const { createTemplate, busy } = useCronTemplates();
+  const { createTemplate, busy } = cronTemplates;
 
   useEffect(() => {
     if (!open || !job) return;
@@ -62,36 +66,29 @@ export function SaveAsTemplateModal({
   }, [open, job, form]);
 
   const handleOk = async () => {
-    if (!job) return;
+    // Without an id there is no scripts directory to read, and the request
+    // would come back 400 from the job-id gate rather than say anything
+    // useful.
+    if (!job?.id) return;
     const values = await form.validateFields();
 
-    // A template must be self-contained: every pool script the job's
-    // preprocess chain references is packaged under batch/ so an importer
-    // can install them. A missing script aborts the save — shipping a
-    // dangling reference defeats the point of packaging.
-    let batchFiles: Record<string, string> | undefined;
-    let batchEntry: string | undefined;
-    const scriptNames = (job.preprocess?.steps || [])
-      .map((step) => step.script?.trim())
-      .filter((name): name is string => Boolean(name));
-    if (job.preprocess?.enabled && scriptNames.length > 0) {
-      const collected: Record<string, string> = {};
-      for (const name of scriptNames) {
-        // Sequential on purpose: the first missing script should abort
-        // with its own name rather than race several failures.
-        try {
-          const detail = await api.getToolBatch(name);
-          collected[`${name}.json`] = JSON.stringify(detail.content, null, 2);
-        } catch {
-          message.error(t("cronJobs.saveAsTemplateBatchMissing", { name }));
-          return;
-        }
-      }
-      batchFiles = collected;
-      // The entry names the first script; the rest travel alongside and
-      // are installed together by install-batches.
-      batchEntry = `batch/${scriptNames[0]}.json`;
+    // A template packages every script the job owns, not only the ones its
+    // preprocess names — applying a template copies every bundled script
+    // into the new job, and the round trip has to be lossless in both
+    // directions.
+    const collected = await collectJobScripts({
+      jobId: job.id,
+      preprocess: job.preprocess,
+      list: (jobId) => api.listJobBatches(jobId),
+      get: (jobId, name) => api.getJobBatch(jobId, name),
+    });
+    if (!collected.ok) {
+      message.error(
+        t("cronJobs.saveAsTemplateBatchMissing", { name: collected.missing }),
+      );
+      return;
     }
+    const hasScripts = Object.keys(collected.batchFiles).length > 0;
 
     const ok = await createTemplate(
       buildCreateTemplateRequest(job, {
@@ -102,11 +99,24 @@ export function SaveAsTemplateModal({
         emoji: values.emoji?.trim() || "",
         tags: values.tags || [],
         includeDispatchTarget: Boolean(values.includeDispatchTarget),
-        batchFiles,
-        batchEntry,
+        batchFiles: hasScripts ? collected.batchFiles : undefined,
+        batchEntry: collected.batchEntry,
       }),
     );
     if (ok) {
+      // Say where it went. "Saved" alone leaves the user hunting: the
+      // picker is split by category, and a 日程任务 saved as a template is
+      // not under 循环任务 — looking there finds nothing and reads like the
+      // save silently failed.
+      message.success(
+        t("cronJobs.saveAsTemplateSaved", {
+          category: t(
+            job.schedule?.type === "once"
+              ? "cronJobs.scheduleTypeOnce"
+              : "cronJobs.scheduleTypeRecurring",
+          ),
+        }),
+      );
       onSaved?.();
       onCancel();
     }

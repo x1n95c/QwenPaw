@@ -5,6 +5,10 @@
  * array or an object `{actions: [...], description?}` — that cron jobs can
  * reference from their `preprocess.script` field. Same pool model as skill
  * packages and cron template packages.
+ *
+ * The pool is not the only source: a step may also address a script
+ * bundled inside a template package (`TemplateBatchScriptInfo` in
+ * `types/cronTemplate.ts`). Both render through the same fields.
  */
 
 export interface ToolBatchInfo {
@@ -34,6 +38,34 @@ export interface CreateToolBatchRequest {
 }
 
 /** Patch an existing script; omitted fields are left as-is. */
+/**
+ * Copy a script owned by another job or a template into this one.
+ *
+ * Exactly one source. Named by fields rather than a packed
+ * `template/path` string: nothing has to be parsed, and no foreign
+ * identifier exists that could accidentally be stored as a step's script.
+ */
+export interface CopyToolBatchRequest {
+  /** Source: another cron job in the same workspace. */
+  from_job_id?: string;
+  /** Source: a template package, by package name. */
+  from_template?: string;
+  /**
+   * File to copy: a bare script name for `from_job_id`, a package-relative
+   * path (e.g. `batch/weather.json`) for `from_template`.
+   */
+  file: string;
+  /** Preferred name. Taken when free; the response is authoritative. */
+  name?: string;
+}
+
+/** One cron job's scripts, for the cross-job browser. */
+export interface JobToolBatches {
+  job_id: string;
+  job_name: string;
+  batches: ToolBatchInfo[];
+}
+
 export interface UpdateToolBatchRequest {
   content?: unknown;
   description?: string;
@@ -69,14 +101,4 @@ export interface ToolBatchImportResult {
   imported: string[];
   candidates?: ToolBatchImportCandidate[];
   conflicts?: ToolBatchImportConflict[];
-}
-
-export interface InstallTemplateBatchesRequest {
-  overwrite?: boolean;
-  rename_map?: Record<string, string>;
-}
-
-export interface InstallTemplateBatchesResult {
-  installed: string[];
-  conflicts: ToolBatchImportConflict[];
 }

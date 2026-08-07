@@ -4,7 +4,6 @@ import { Alert } from "antd";
 import Editor from "@monaco-editor/react";
 import { useTranslation } from "react-i18next";
 import type { ToolBatchDetail } from "../../../../api/types";
-import api from "../../../../api";
 import {
   MAX_BATCH_STEPS,
   validateBatchContent,
@@ -16,6 +15,14 @@ import styles from "../index.module.less";
 export interface BatchEditorTarget {
   mode: "create" | "edit";
   name?: string;
+  /**
+   * Create mode only: start from this content instead of the example.
+   * Used when copying a foreign script in, where the user is editing a
+   * real script rather than authoring a new one.
+   */
+  initialContent?: unknown;
+  /** Create mode only: pre-fill the name field. */
+  suggestedName?: string;
 }
 
 interface BatchEditorModalProps {
@@ -101,7 +108,7 @@ export function BatchEditorModal({
   onSaved,
 }: BatchEditorModalProps) {
   const { t } = useTranslation();
-  const { createBatch, updateBatch, busy } = toolBatches;
+  const { createBatch, updateBatch, getBatch, busy } = toolBatches;
   const [name, setName] = useState("");
   const [contentText, setContentText] = useState("");
   const [nameError, setNameError] = useState<string | null>(null);
@@ -125,8 +132,16 @@ export function BatchEditorModal({
       return;
     }
     if (target.mode === "create") {
-      setName("");
-      setContentText(JSON.stringify(NEW_BATCH_EXAMPLE, null, 2));
+      setName(target.suggestedName || "");
+      setContentText(
+        JSON.stringify(
+          target.initialContent === undefined
+            ? NEW_BATCH_EXAMPLE
+            : target.initialContent,
+          null,
+          2,
+        ),
+      );
       setNameError(null);
       setContentIssues([]);
       setContentError(null);
@@ -134,11 +149,12 @@ export function BatchEditorModal({
       return;
     }
     // Edit mode: fetch the stored script (list rows have no content).
+    // Through the hook rather than `api` directly, so the job scoping lives
+    // in one place — a script only exists inside its own job now.
     let cancelled = false;
-    api
-      .getToolBatch(target.name || "")
+    getBatch(target.name || "")
       .then((d) => {
-        if (!cancelled) {
+        if (!cancelled && d) {
           setDetail(d);
           setName(d.name);
           setContentText(JSON.stringify(d.content, null, 2));
@@ -152,7 +168,7 @@ export function BatchEditorModal({
     return () => {
       cancelled = true;
     };
-  }, [open, target, t]);
+  }, [open, target, t, getBatch]);
 
   const handleNameChange = (value: string) => {
     setName(value);
@@ -270,9 +286,9 @@ export function BatchEditorModal({
             />
           </div>
           {/* Create mode pre-fills a runnable example, so say so. In edit
-              mode the content is the user's own script and the same line
-              would be a lie. */}
-          {mode === "create" ? (
+              mode — and when creating from a copied template script — the
+              content is a real script and the same line would be a lie. */}
+          {mode === "create" && target?.initialContent === undefined ? (
             <div className={styles.batchEditorFieldHint}>
               {t("cronJobs.toolBatches.editorExampleHint")}
             </div>

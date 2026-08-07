@@ -591,9 +591,11 @@ def _build_spec_from_cli(
     "--preprocess-script",
     default=None,
     help=(
-        "Batch script name from the tool-batch pool to run before every "
-        "fire. For 'text' tasks the collected result is delivered "
-        "directly; for 'agent' tasks it is injected into the prompt."
+        "Batch script to run before every fire, by name. The script must "
+        "belong to this job (see the job's scripts in the console); a "
+        "template's script gets copied in when the template is applied. "
+        "For 'text' tasks the collected result is delivered directly; for "
+        "'agent' tasks it is injected into the prompt."
     ),
 )
 @click.option(
@@ -999,8 +1001,8 @@ def _resolve_update_spec(
     "--preprocess-script",
     default=None,
     help=(
-        "Set the batch script (from the tool-batch pool) run before "
-        "every fire. Replaces any previously configured script."
+        "Set the batch script run before every fire, by name. The script "
+        "must belong to this job. Replaces any previously configured one."
     ),
 )
 @click.option(
@@ -1717,80 +1719,6 @@ def template_fork(
         )
         if r.status_code == 404:
             raise click.ClickException("Builtin template not found.")
-        if r.status_code >= 400:
-            raise click.ClickException(_template_error(r))
-        print_json(r.json())
-
-
-@template_group.command("install-skills")
-@click.argument("name", metavar="NAME")
-@click.option(
-    "--skill",
-    "skills",
-    multiple=True,
-    help=(
-        "Install only these bundled skills; repeatable. "
-        "Defaults to all skills in the package."
-    ),
-)
-@click.option(
-    "--target",
-    type=click.Choice(["pool", "workspace"], case_sensitive=False),
-    default="pool",
-    show_default=True,
-    help=(
-        "'pool' installs into the shared skill pool; 'workspace' "
-        "installs into the agent's own skills directory."
-    ),
-)
-@click.option(
-    "--enable/--no-enable",
-    default=False,
-    help="Enable the skills after a workspace install.",
-)
-@click.option(
-    "--overwrite",
-    is_flag=True,
-    default=False,
-    help="Replace skills that already exist at the target.",
-)
-@click.option(
-    "--base-url",
-    default=None,
-    help="Override the API base URL. Defaults to global --host/--port.",
-)
-@click.option(
-    "--agent-id",
-    default="default",
-    help="Agent ID (defaults to 'default')",
-)
-@click.pass_context
-def template_install_skills(
-    ctx: click.Context,
-    name: str,
-    skills: tuple[str, ...],
-    target: str,
-    enable: bool,
-    overwrite: bool,
-    base_url: Optional[str],
-    agent_id: str,
-) -> None:
-    """Install the skills bundled inside a template package."""
-    base_url = _base_url(ctx, base_url)
-    payload = {
-        "skills": list(skills),
-        "target": target,
-        "enable": enable,
-        "overwrite": overwrite,
-    }
-    with client(base_url) as c:
-        r = c.post(
-            f"/cron-templates/{name}/install-skills",
-            json=payload,
-            headers={"X-Agent-Id": agent_id},
-        )
-        if r.status_code == 404:
-            raise click.ClickException("Template not found.")
         if r.status_code >= 400:
             raise click.ClickException(_template_error(r))
         print_json(r.json())

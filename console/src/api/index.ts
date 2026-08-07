@@ -9,6 +9,7 @@ import { acpApi } from "./modules/acp";
 import { channelApi } from "./modules/channel";
 import { heartbeatApi } from "./modules/heartbeat";
 import { cronJobApi } from "./modules/cronjob";
+import { cronSkillApi } from "./modules/cronSkill";
 import { cronTemplateApi } from "./modules/cronTemplate";
 import { toolBatchApi } from "./modules/toolBatch";
 import { chatApi, sessionApi } from "./modules/chat";
@@ -49,6 +50,9 @@ export const api = {
 
   // Cron Job Templates (folder packages)
   ...cronTemplateApi,
+
+  // Skills a cron job can attach (installed + template-bundled)
+  ...cronSkillApi,
 
   // Tool Batch Scripts (script pool)
   ...toolBatchApi,

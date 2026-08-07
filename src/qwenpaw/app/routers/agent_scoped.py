@@ -78,8 +78,12 @@ def create_agent_scoped_router() -> APIRouter:
     from .mcp_oauth import router as mcp_oauth_router
     from .workspace import router as workspace_router
     from ..crons.api import router as cron_router
+    from ..crons.batches_api import router as cron_batches_router
+    from ..crons.skills_api import router as cron_skills_router
+    from ..cron_templates.api import (
+        batch_script_router as template_batch_router,
+    )
     from ..cron_templates.api import router as cron_template_router
-    from ..tool_batches.api import router as tool_batch_router
     from ..chats.api import router as chats_router
     from .console import router as console_router
     from .plugins import router as plugins_router
@@ -91,22 +95,25 @@ def create_agent_scoped_router() -> APIRouter:
     # /agents/{agentId}/agent-status -> agent_status_router
     # /agents/{agentId}/chats/* -> chats_router
     # /agents/{agentId}/config/* -> config_router (channels, heartbeat)
-    # /agents/{agentId}/cron/* -> cron_router
+    # /agents/{agentId}/cron/* -> cron_router (+ cron_batches_router)
+    # /agents/{agentId}/cron-skills -> cron_skills_router
     # /agents/{agentId}/cron-templates/* -> cron_template_router
+    # /agents/{agentId}/cron-template-batches -> template_batch_router
     # /agents/{agentId}/mcp/* -> mcp_router
     # /agents/{agentId}/skills/* -> skills_router
-    # /agents/{agentId}/tool-batches/* -> tool_batch_router
     # /agents/{agentId}/tools/* -> tools_router
     # /agents/{agentId}/workspace/* -> workspace_router
     router.include_router(agent_status_router)
     router.include_router(chats_router)
     router.include_router(config_router)
     router.include_router(cron_router)
+    router.include_router(cron_batches_router)
+    router.include_router(cron_skills_router)
     router.include_router(cron_template_router)
+    router.include_router(template_batch_router)
     router.include_router(mcp_oauth_router)
     router.include_router(mcp_router)
     router.include_router(skills_router)
-    router.include_router(tool_batch_router)
     router.include_router(tools_router)
     router.include_router(workspace_router)
     router.include_router(console_router)

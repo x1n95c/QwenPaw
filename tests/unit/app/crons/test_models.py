@@ -369,3 +369,117 @@ def test_preprocess_chain_survives_a_round_trip():
     assert [step.script for step in steps] == ["a", None]
     assert steps[0].args == {"x": "1"}
     assert steps[1].actions == [{"tool_name": "t"}]
+
+
+# ---------------------------------------------------------------------------
+# CronJobSkillRef / CronJobSpec.skills
+#
+# Skills are *referenced*, never installed: the ref names a directory and
+# the trigger path reads SKILL.md out of it. So the model's whole job is to
+# hold a name safely — resolution is fail-closed at run time.
+# ---------------------------------------------------------------------------
+
+
+def test_skill_ref_name_grammar_matches_the_skill_system():
+    """Guards the re-declared grammar.
+
+    ``models.py`` inlines ``normalize_skill_dir_name``'s rules instead of
+    importing it, to keep reading ``jobs.json`` from pulling in the whole
+    skill stack. That trade-off is only safe while the two agree — a drift
+    would let a job be saved that the resolver then refuses to resolve.
+    """
+    from qwenpaw.agents.skill_system.store import normalize_skill_dir_name
+    from qwenpaw.app.crons.models import CronJobSkillRef
+
+    rejected = ["", "   ", "a\x00b", ".", "..", "a/b", "a\\b"]
+    for name in rejected:
+        with pytest.raises(Exception):
+            normalize_skill_dir_name(name)
+        with pytest.raises(ValidationError):
+            CronJobSkillRef(name=name)
+
+    for name in ["advisor", "disk-usage-advisor", "天气", "a.b"]:
+        assert normalize_skill_dir_name(name) == name
+        assert CronJobSkillRef(name=name).name == name
+
+
+def test_skill_ref_source_names_the_root_that_resolves_it():
+    from qwenpaw.app.crons.models import CronJobSkillRef
+
+    assert CronJobSkillRef(name="a").source == "workspace"
+    assert CronJobSkillRef(name="a", template="pkg").source == "template"
+    # A blank template is not a template: it would otherwise send the
+    # resolver at `resolve_template_dir("")`.
+    assert CronJobSkillRef(name="a", template="  ").source == "workspace"
+    assert CronJobSkillRef(name="a", template="  ").template is None
+
+
+def test_skills_default_to_empty_so_old_jobs_still_load():
+    """`jobs.json` is validated as one document.
+
+    A required field, or a validator strict enough to reject what an older
+    build wrote, would take *every* job in the file down rather than just
+    the offending one.
+    """
+    spec = make_cron_job_spec()
+    assert spec.skills == []
+
+    dumped = spec.model_dump(mode="json")
+    del dumped["skills"]
+    assert CronJobSpec.model_validate(dumped).skills == []
+
+
+def test_skills_do_not_validate_existence():
+    """A deleted skill must not make jobs.json unparseable."""
+    spec = make_cron_job_spec(skills=[{"name": "does-not-exist"}])
+    assert spec.skills[0].name == "does-not-exist"
+
+
+def test_skills_survive_a_round_trip():
+    spec = make_cron_job_spec(
+        skills=[{"name": "advisor", "template": "workspace-usage"}],
+    )
+    restored = CronJobSpec.model_validate(spec.model_dump(mode="json"))
+    assert restored.skills[0].name == "advisor"
+    assert restored.skills[0].template == "workspace-usage"
+
+
+def test_duplicate_skill_refs_are_deduped_not_rejected():
+    """Injecting the same body twice can never be what someone meant, and
+    failing the whole file over it would be worse. First occurrence wins."""
+    spec = make_cron_job_spec(
+        skills=[
+            {"name": "a"},
+            {"name": "b"},
+            {"name": "a"},
+            {"name": "a", "template": "pkg"},
+        ],
+    )
+    assert [(r.name, r.template) for r in spec.skills] == [
+        ("a", None),
+        ("b", None),
+        ("a", "pkg"),
+    ]
+
+
+def test_too_many_skills_is_rejected():
+    from qwenpaw.app.crons.models import MAX_CRON_SKILLS
+
+    with pytest.raises(ValidationError, match="maximum is"):
+        make_cron_job_spec(
+            skills=[{"name": f"s{i}"} for i in range(MAX_CRON_SKILLS + 1)],
+        )
+
+
+def test_has_skills_is_false_for_a_text_job():
+    """That path never builds a request, so there is nothing to prepend to."""
+    job = make_cron_job_spec(
+        task_type="text",
+        text="Daily check",
+        skills=[{"name": "advisor"}],
+    )
+    assert job.has_skills is False
+    # Kept, not cleared: toggling task_type in the drawer must not silently
+    # discard the selection.
+    assert [ref.name for ref in job.skills] == ["advisor"]
+    assert make_cron_job_spec(skills=[{"name": "advisor"}]).has_skills is True

@@ -70,6 +70,18 @@ def working_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 
 @pytest.fixture
+def workspace(working_dir: Path) -> Path:
+    """An agent workspace. Templates live at ``<workspace>/cron_templates``.
+
+    Per workspace rather than global: `WORKING_DIR` is still patched because
+    packaged builtins and the legacy batch pool resolve against it.
+    """
+    root = working_dir / "workspaces" / "default"
+    root.mkdir(parents=True)
+    return root
+
+
+@pytest.fixture
 def package_dir(tmp_path: Path) -> Path:
     """A complete on-disk package: docs, payload, one batch, one skill."""
     root = tmp_path / "pkg" / "sample-template"

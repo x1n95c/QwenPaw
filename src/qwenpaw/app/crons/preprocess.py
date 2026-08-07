@@ -5,8 +5,10 @@ The batch runs before every fire, deterministically, with no model involved
 in deciding to run it — that decision is what a preprocess exists to remove.
 Where the result goes depends on the task type:
 
-* ``agent`` — :func:`inject_preprocess_block` appends the call and its
-  result to the user prompt, so the model starts holding the data.
+* ``agent`` — :func:`build_prompt_block` renders the call and its result,
+  and the executor puts that ahead of the task body so the model starts
+  holding the data. Getting it *into* the message is
+  ``prompt_blocks.prepend_text_blocks``, which the skill block shares.
 * ``text`` — the rendered prose is delivered to the user as the message
   body; no LLM is involved at any point.
 
@@ -28,13 +30,20 @@ from typing import Any, Literal, Optional
 from pydantic import BaseModel, Field
 
 from .models import CronJobSpec, PreprocessSpec, PreprocessStepSpec
+from .script_paths import resolve_job_script
 
 logger = logging.getLogger(__name__)
 
-#: Ceiling on the batch summary injected into a prompt or sent to a user.
-#: One ``execute_shell_command`` returning a large file would otherwise
-#: blow up the prompt (and the channel message) on every single tick.
+#: Ceiling on the batch summary injected into a prompt. One
+#: ``execute_shell_command`` returning a large file would otherwise blow up
+#: the prompt on every single tick.
 MAX_INJECTED_RESULT_CHARS = 8000
+
+#: Ceiling on what a ``text`` task sends to a person. Much lower than the
+#: prompt budget on purpose: a model can skim 8000 characters of JSON, a
+#: human reading a chat message cannot, and a channel will often refuse a
+#: message that long anyway.
+MAX_USER_TEXT_CHARS = 1500
 
 #: Control-flow pseudo-tools. They produce no output a human wants to read,
 #: so the prose renderer skips them.
@@ -124,60 +133,61 @@ class PreprocessResult(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def get_batch_pool_dir() -> Path:
-    """Directory holding shared batch scripts."""
-    from ...constant import WORKING_DIR
-
-    return Path(WORKING_DIR) / "tool_batches"
-
-
-def resolve_batch_script(name: str) -> Optional[Path]:
-    """Resolve a pool script name to a file, or ``None`` if absent.
-
-    Refuses anything with a path separator: a job spec must not be able to
-    point the runner at an arbitrary file on disk.
-    """
-    candidate = (name or "").strip()
-    if not candidate or "/" in candidate or "\\" in candidate:
-        return None
-    if candidate in {".", ".."}:
-        return None
-    if not candidate.endswith(".json"):
-        candidate = f"{candidate}.json"
-
-    pool = get_batch_pool_dir()
-    path = (pool / candidate).resolve()
-    if not path.is_relative_to(pool.resolve()):
-        return None
-    return path if path.is_file() else None
-
-
 # ---------------------------------------------------------------------------
 # Rendering
 # ---------------------------------------------------------------------------
 
 
-def _truncate(text: str) -> str:
-    if len(text) <= MAX_INJECTED_RESULT_CHARS:
+def _truncate(text: str, limit: int = MAX_INJECTED_RESULT_CHARS) -> str:
+    if len(text) <= limit:
         return text
-    omitted = len(text) - MAX_INJECTED_RESULT_CHARS
-    return (
-        text[:MAX_INJECTED_RESULT_CHARS]
-        + f"\n… [truncated, {omitted} chars omitted]"
-    )
+    omitted = len(text) - limit
+    return text[:limit] + f"\n… [truncated, {omitted} chars omitted]"
+
+
+#: Bookkeeping `run_tool_batch` adds to every step result. Not data the
+#: script produced, so it is stripped before the rest is shown to a person.
+_STEP_BOOKKEEPING_KEYS = frozenset({"step", "tool_name", "ok", "status"})
+
+
+def _step_payload_text(entry: dict[str, Any]) -> str:
+    """Render whatever a step actually returned, minus the bookkeeping.
+
+    A tool that emits JSON has it merged straight into the step result, so
+    there is no ``text`` key to quote — which is how a weather script ended
+    up sending a human the entire wttr.in envelope on one line. Strip the
+    keys ``run_tool_batch`` added and pretty-print the remainder.
+    """
+    data = {
+        key: value
+        for key, value in entry.items()
+        if key not in _STEP_BOOKKEEPING_KEYS
+    }
+    if not data:
+        return ""
+    # Kept as a mapping even when one key remains: that key is the script's
+    # own label for the data (`current_condition`, `rows`, …) and unwrapping
+    # it hands the reader an anonymous blob.
+    return json.dumps(data, ensure_ascii=False, indent=2, default=str)
 
 
 def _step_prose(entry: dict[str, Any]) -> str:
     """Best-effort human-readable text for one step result."""
     if entry.get("tool_name") in _CONTROL_FLOW_TOOLS:
         return ""
-    for key in ("text", "error"):
+    for key in ("text", "output", "stdout", "error"):
         value = entry.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
     if "value" in entry:
-        return json.dumps(entry["value"], ensure_ascii=False, default=str)
-    return ""
+        return json.dumps(
+            entry["value"],
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+    # No prose key: the tool returned structured data, merged in flat.
+    return _step_payload_text(entry)
 
 
 def render_user_text(payload: dict[str, Any]) -> str:
@@ -211,22 +221,37 @@ def render_user_text(payload: dict[str, Any]) -> str:
         )
 
     if not parts:
-        # Nothing quotable — hand over the summary rather than nothing.
-        return _truncate(json.dumps(payload, ensure_ascii=False, default=str))
-    return _truncate("\n\n".join(parts))
+        # Nothing quotable at all — hand over the summary rather than
+        # nothing, but pretty-printed and to the human-sized budget.
+        return _truncate(
+            json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+            MAX_USER_TEXT_CHARS,
+        )
+    return _truncate("\n\n".join(parts), MAX_USER_TEXT_CHARS)
 
 
 def _render_call_text(
     spec: PreprocessSpec,
     step: PreprocessStepSpec,
     script_label: str,
+    script_path: Optional[Path] = None,
 ) -> str:
-    """Describe the call that already happened, for the model."""
+    """Describe the call that already happened, for the model.
+
+    ``file_path`` is the **absolute** path the batch actually ran from, not
+    the step's short name: the model is being shown a call it could
+    re-issue, and ``run_tool_batch`` requires an absolute path
+    (``_load_batch_file``). Printing the short name made the example
+    uncopyable — a retry with it fails on "Batch file not found".
+
+    Falls back to the label only when the script never resolved, which is
+    exactly the case where there is no path to print.
+    """
     return json.dumps(
         {
             "tool_name": "run_tool_batch",
             "arguments": {
-                "file_path": script_label,
+                "file_path": str(script_path) if script_path else script_label,
                 "args": step.args,
                 "last_only": spec.last_only,
             },
@@ -256,25 +281,27 @@ def build_prompt_block(result: PreprocessResult) -> str:
     if failed == 0:
         header = (
             f"{total} data-collection script(s) were executed automatically "
-            "before this task.\n"
-            "They have ALREADY RUN — do not call run_tool_batch again."
+            "before this task, and all of them succeeded.\n"
+            "Their results are below. Since none of them reported an error, "
+            "do not run them again — use the data as given."
         )
     elif failed == total:
         header = (
             f"{total} data-collection script(s) were executed automatically "
             "before this task, and they ALL FAILED.\n"
-            "Do not retry them. Continue with the information you have, and "
-            "say plainly in your reply that data collection failed — do not "
+            "Each error is below. You may re-run a script whose error looks "
+            "transient, using the exact call shown; if it fails again, say "
+            "plainly in your reply that data collection failed — do not "
             "invent or assume the missing data."
         )
     else:
         header = (
             f"{total} data-collection script(s) were executed automatically "
             f"before this task; {failed} of them FAILED.\n"
-            "They have ALREADY RUN — do not call run_tool_batch again and do "
-            "not retry the failed ones. Use the results that succeeded, say "
-            "plainly which data could not be collected, and do not invent or "
-            "assume the missing values."
+            "Do not re-run the ones that succeeded — use their results as "
+            "given. You may re-run a failed script whose error looks "
+            "transient, using the exact call shown. Say plainly which data "
+            "could not be collected, and do not invent or assume it."
         )
 
     sections: list[str] = []
@@ -293,57 +320,6 @@ def build_prompt_block(result: PreprocessResult) -> str:
 
     joined = "\n\n".join(sections)
     return f"<preprocess_result>\n{header}\n\n{joined}\n</preprocess_result>"
-
-
-def inject_preprocess_block(
-    request_input: Any,
-    result: PreprocessResult,
-) -> Any:
-    """Append the preprocess block to the last user message.
-
-    Appends to the existing last user turn rather than pushing a new one:
-    two consecutive user messages are something several formatters
-    normalise or reject outright.
-
-    Tolerates the shapes ``CronJobRequest.input`` actually allows — it is
-    ``Optional[Any]``, and the console's drawer will happily produce a bare
-    string from ``JSON.parse('"hi"')``.
-    """
-    block = build_prompt_block(result)
-    text_block = {"type": "text", "text": block}
-
-    if isinstance(request_input, str):
-        return [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": request_input},
-                    text_block,
-                ],
-            },
-        ]
-
-    if not isinstance(request_input, list) or not request_input:
-        return [{"role": "user", "content": [text_block]}]
-
-    messages = [dict(m) if isinstance(m, dict) else m for m in request_input]
-    for message in reversed(messages):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if isinstance(content, list):
-            message["content"] = [*content, text_block]
-        elif isinstance(content, str):
-            message["content"] = [
-                {"type": "text", "text": content},
-                text_block,
-            ]
-        else:
-            message["content"] = [text_block]
-        return messages
-
-    # No user turn to attach to; add one rather than losing the data.
-    return [*messages, {"role": "user", "content": [text_block]}]
 
 
 # ---------------------------------------------------------------------------
@@ -496,7 +472,13 @@ async def run_preprocess(
                 )
                 continue
 
-            script_path = _resolve_step_path(step, stage, index)
+            script_path = _resolve_step_path(
+                step,
+                stage,
+                index,
+                workspace_dir=getattr(workspace, "workspace_dir", None),
+                job_id=job.id,
+            )
             if isinstance(script_path, str):
                 results.append(
                     _step_failure(spec, step, script_path),
@@ -526,6 +508,9 @@ def _resolve_step_path(
     step: PreprocessStepSpec,
     stage: Path,
     index: int,
+    *,
+    workspace_dir: Any = None,
+    job_id: Optional[str] = None,
 ) -> Path | str:
     """Resolve one step to a file, or return an error message.
 
@@ -534,10 +519,7 @@ def _resolve_step_path(
     failure, never a gap in the list.
     """
     if step.script:
-        resolved = resolve_batch_script(step.script)
-        if resolved is None:
-            return f"batch script not found in pool: {step.script}"
-        return resolved
+        return _resolve_named_script(step.script, workspace_dir, job_id)
     try:
         stage.mkdir(parents=True, exist_ok=True)
         # Indexed so chained inline steps cannot overwrite each other.
@@ -549,6 +531,31 @@ def _resolve_step_path(
         return path
     except OSError as exc:
         return f"could not stage inline actions: {exc}"
+
+
+def _resolve_named_script(
+    script: str,
+    workspace_dir: Any = None,
+    job_id: Optional[str] = None,
+) -> Path | str:
+    """Resolve a step's script name, or say why it failed.
+
+    One path: a script belongs to the job that runs it, so the name is a
+    file in ``<workspace_dir>/cron_jobs/<job_id>/batch/`` and nothing else.
+    A template's script reaches a job by being *copied* in when the
+    template is applied, never by reference — which is what keeps two jobs
+    from sharing a file one of them can edit.
+
+    The message is the only diagnostic a user gets for a preprocess that
+    collected nothing, so it names the job's own scripts rather than some
+    global location the user cannot find.
+    """
+    if workspace_dir is None or not job_id:
+        return f"cannot resolve batch script without a job: {script}"
+    resolved = resolve_job_script(workspace_dir, job_id, script)
+    if resolved is None:
+        return f"batch script not found in this job's scripts: {script}"
+    return resolved
 
 
 async def _execute_step(
@@ -650,6 +657,7 @@ async def _execute_step(
         step=step,
         chunk=chunk,
         duration_ms=_step_ms(),
+        script_path=script_path,
     )
 
 
@@ -671,6 +679,7 @@ def _normalize(
     step: PreprocessStepSpec,
     chunk: Any,
     duration_ms: int,
+    script_path: Optional[Path] = None,
 ) -> PreprocessStepResult:
     """Turn a ToolChunk into a PreprocessStepResult."""
     rtb = _run_tool_batch_module()
@@ -693,7 +702,7 @@ def _normalize(
         ok=ok,
         status="ok" if ok else "failed",
         script_label=label,
-        call_text=_render_call_text(spec, step, label),
+        call_text=_render_call_text(spec, step, label, script_path),
         result_json=_truncate(raw),
         user_text=render_user_text(payload),
         error=error,
@@ -706,9 +715,6 @@ __all__ = [
     "PreprocessResult",
     "PreprocessStepResult",
     "build_prompt_block",
-    "get_batch_pool_dir",
-    "inject_preprocess_block",
     "render_user_text",
-    "resolve_batch_script",
     "run_preprocess",
 ]

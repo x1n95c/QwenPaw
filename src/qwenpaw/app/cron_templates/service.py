@@ -2,7 +2,7 @@
 """Lifecycle service for cron job template packages.
 
 The shape follows ``SkillPoolService``: one class owning create / update /
-delete / import-from-zip / export-to-zip over a shared pool directory,
+delete / import-from-zip / export-to-zip over one directory,
 with packaged builtins merged in read-only. Every write is staged in a
 temp directory, validated and security-scanned there, and only then moved
 into the pool — a rejected package never leaves a partial directory behind.
@@ -10,24 +10,25 @@ into the pool — a rejected package never leaves a partial directory behind.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from pathlib import Path
 from typing import Any, TypeVar
 
+from ...agents.utils.file_handling import (
+    read_text_file_with_encoding_fallback,
+)
 from ...exceptions import CronTemplateConflictError, CronTemplateError
 from ...utils.io_utils import staged_dir
-from ..tool_batches.service import ToolBatchService
 from .models import (
     CreateCronTemplateRequest,
     CronTemplateFrontmatter,
     CronTemplateInfo,
     CronTemplatePayload,
-    InstallTemplateBatchesRequest,
-    InstallTemplateSkillsRequest,
+    TemplateBatchScriptInfo,
     UpdateCronTemplateRequest,
     TEMPLATE_BATCH_DIR,
-    TEMPLATE_SKILLS_DIR,
 )
 from .store import (
     build_import_conflict,
@@ -38,12 +39,13 @@ from .store import (
     get_builtin_cron_template_dir,
     get_cron_template_dir,
     iter_template_dirs,
-    list_batch_files,
+    materialized_builtin_names,
     normalize_template_name,
     pack_template_to_zip,
     read_template_package,
     reconcile_template_manifest,
     record_template_origin,
+    resolve_builtin_template_dir,
     resolve_template_dir,
     safe_template_dir,
     scan_template_dir_or_raise,
@@ -84,49 +86,63 @@ def _drop_key_if_overridden(literal: str | None, current_key: str) -> str:
 
 
 class CronTemplateService:
-    """Manage folder-based cron job templates in the shared pool.
+    """Manage folder-based cron job templates for one workspace.
 
-    The pool lives at ``WORKING_DIR/cron_templates`` and is intentionally
-    agent-agnostic: a template is a recipe, so it is shared across agents
-    the same way the skill pool is. Packaged builtins under
-    ``app/cron_templates/builtin`` are listed alongside user templates but
-    cannot be modified — importing one copies it into the pool first.
+    Templates live at ``<workspace_dir>/cron_templates`` — per agent, not
+    shared. A template is part of how *one* agent works, and two agents
+    silently sharing an edit to one was surprising. Packaged builtins under
+    ``app/cron_templates/builtin`` stay global and read-only; they are
+    listed alongside a workspace's own and forking one copies it in.
     """
 
-    def __init__(self) -> None:
-        ensure_template_pool_initialized()
+    def __init__(self, workspace_dir: Path | str) -> None:
+        self._ws = Path(workspace_dir)
+        ensure_template_pool_initialized(self._ws)
 
     # ----- read -----
 
     def list_templates(
         self, include_builtin: bool = True
     ) -> list[CronTemplateInfo]:
-        """List pool templates, then packaged builtins not shadowed by them."""
-        reconcile_template_manifest()
+        """List this workspace's templates, then builtins they don't shadow."""
+        reconcile_template_manifest(self._ws)
         templates: list[CronTemplateInfo] = []
         seen: set[str] = set()
-        for package_dir in iter_template_dirs(get_cron_template_dir()):
+        for package_dir in iter_template_dirs(get_cron_template_dir(self._ws)):
             info = self._safe_read(package_dir, package_dir.name, "user")
             if info is not None:
                 templates.append(info)
                 seen.add(info.name)
         if include_builtin:
-            for package_dir in iter_template_dirs(
-                get_builtin_cron_template_dir(),
-            ):
-                if package_dir.name in seen:
+            # Materialised builtins plus any not yet copied out of the wheel.
+            # Not a directory walk of the store: that directory is shared
+            # with packages predating per-workspace templates, and only the
+            # record says which entries are ours to show.
+            builtin_names = sorted(
+                materialized_builtin_names()
+                | {
+                    path.name
+                    for path in iter_template_dirs(
+                        get_builtin_cron_template_dir(),
+                    )
+                },
+            )
+            for name in builtin_names:
+                if name in seen:
                     continue
-                info = self._safe_read(
-                    package_dir,
-                    package_dir.name,
-                    "builtin",
-                )
+                # Through the resolver, so store-before-wheel precedence has
+                # exactly one definition.
+                resolved = resolve_template_dir(name, self._ws)
+                if resolved is None or resolved[1] != "builtin":
+                    continue
+                info = self._safe_read(resolved[0], name, "builtin")
                 if info is not None:
                     templates.append(info)
+                    seen.add(name)
         return templates
 
     def get_template(self, name: str) -> CronTemplateInfo:
-        resolved = resolve_template_dir(name)
+        resolved = resolve_template_dir(name, self._ws)
         if resolved is None:
             raise CronTemplateError(f"Template not found: {name}")
         package_dir, source = resolved
@@ -137,7 +153,7 @@ class CronTemplateService:
 
         Resolves inside the package and refuses anything that escapes it.
         """
-        resolved = resolve_template_dir(name)
+        resolved = resolve_template_dir(name, self._ws)
         if resolved is None:
             raise CronTemplateError(f"Template not found: {name}")
         package_dir, _ = resolved
@@ -151,11 +167,63 @@ class CronTemplateService:
             )
         if not target.is_file():
             raise CronTemplateError(f"File not found: {relative_path}")
-        from ...agents.utils.file_handling import (
-            read_text_file_with_encoding_fallback,
-        )
-
         return read_text_file_with_encoding_fallback(target)
+
+    def list_batch_scripts(
+        self, include_builtin: bool = True
+    ) -> list[TemplateBatchScriptInfo]:
+        """List every ``batch/*.json`` bundled across template packages.
+
+        Feeds the job form's script picker: a preprocess step can address
+        one of these directly as ``<template>/batch/<file>.json`` instead
+        of being limited to the flat pool, which is what makes a script
+        stay visibly attached to the task it belongs to.
+
+        Built on ``list_templates`` rather than walking the two pools again
+        so the user-shadows-builtin precedence has exactly one definition —
+        the same one ``resolve_template_dir`` (and therefore the runtime
+        resolver) applies. Description / arg names / preview come from
+        ``build_batch_info``, the pool's own describer, so a packaged
+        script and a pool script render identically.
+        """
+        from ..tool_batches.store import build_batch_info
+
+        scripts: list[TemplateBatchScriptInfo] = []
+        for info in self.list_templates(include_builtin):
+            package_dir = Path(info.package_dir)
+            for relative in info.batch_files:
+                path = package_dir / relative
+                try:
+                    content = json.loads(
+                        read_text_file_with_encoding_fallback(path),
+                    )
+                except (OSError, ValueError, RecursionError) as exc:
+                    # One broken file must not blank out the whole picker.
+                    logger.warning(
+                        "Skipping unreadable template batch '%s/%s': %s",
+                        info.name,
+                        relative,
+                        exc,
+                    )
+                    continue
+                described = build_batch_info(path.stem, content, path)
+                scripts.append(
+                    TemplateBatchScriptInfo(
+                        ref=f"{info.name}/{relative}",
+                        template=info.name,
+                        template_title=info.title,
+                        template_title_key=info.title_key,
+                        template_source=info.source,
+                        file_path=relative,
+                        file_name=path.name,
+                        description=described.description,
+                        arg_names=described.arg_names,
+                        action_count=described.action_count,
+                        preview_actions=described.preview_actions,
+                        updated_at=described.updated_at,
+                    ),
+                )
+        return scripts
 
     # ----- write -----
 
@@ -165,7 +233,7 @@ class CronTemplateService:
     ) -> CronTemplateInfo:
         """Create (or, with ``overwrite``, replace) a pool template."""
         name = normalize_template_name(body.name)
-        pool = ensure_template_pool_initialized()
+        pool = ensure_template_pool_initialized(self._ws)
         target = safe_template_dir(pool, name)
         if target.exists() and not body.overwrite:
             raise CronTemplateConflictError(
@@ -173,7 +241,10 @@ class CronTemplateService:
                     "reason": "conflict",
                     "name": name,
                     "message": f"Template '{name}' already exists",
-                    "suggested_name": suggest_conflict_name(name),
+                    "suggested_name": suggest_conflict_name(
+                        name,
+                        self._pool_names(),
+                    ),
                 },
             )
 
@@ -208,8 +279,8 @@ class CronTemplateService:
             scan_template_dir_or_raise(stage, name)
             copy_template_dir(stage, target)
 
-        record_template_origin(name, "api")
-        reconcile_template_manifest()
+        record_template_origin(name, "api", self._ws)
+        reconcile_template_manifest(self._ws)
         return read_template_package(target, name, "user")
 
     def update_template(
@@ -225,11 +296,10 @@ class CronTemplateService:
         read-only; fork one first.
         """
         normalized = normalize_template_name(name)
-        pool = ensure_template_pool_initialized()
+        pool = ensure_template_pool_initialized(self._ws)
         target = safe_template_dir(pool, normalized)
         if not target.is_dir():
-            builtin = get_builtin_cron_template_dir() / normalized
-            if builtin.is_dir():
+            if resolve_builtin_template_dir(normalized) is not None:
                 raise CronTemplateError(
                     f"Builtin template '{normalized}' is read-only; "
                     f"fork it into the pool before editing",
@@ -287,7 +357,7 @@ class CronTemplateService:
             scan_template_dir_or_raise(stage, normalized)
             copy_template_dir(stage, target)
 
-        reconcile_template_manifest()
+        reconcile_template_manifest(self._ws)
         return read_template_package(target, normalized, "user")
 
     @staticmethod
@@ -305,25 +375,29 @@ class CronTemplateService:
     def delete_template(self, name: str) -> bool:
         """Remove a pool template. Builtins are never deleted."""
         normalized = normalize_template_name(name)
-        target = safe_template_dir(get_cron_template_dir(), normalized)
+        target = safe_template_dir(get_cron_template_dir(self._ws), normalized)
         if not target.exists():
-            builtin = get_builtin_cron_template_dir() / normalized
-            if builtin.exists():
+            if resolve_builtin_template_dir(normalized) is not None:
                 raise CronTemplateError(
                     f"Builtin template '{normalized}' cannot be deleted",
                 )
             return False
         shutil.rmtree(target)
-        forget_template(normalized)
+        forget_template(normalized, self._ws)
         return True
 
     def fork_builtin(self, name: str) -> CronTemplateInfo:
-        """Copy a packaged builtin into the pool so it becomes editable."""
+        """Copy a builtin into the workspace so it becomes editable.
+
+        The source is whichever copy resolution picked — the materialised one
+        under the user-level store, or the wheel's if that has not been
+        written yet. Either is byte-identical, so the fork does not care.
+        """
         normalized = normalize_template_name(name)
-        builtin_dir = get_builtin_cron_template_dir() / normalized
-        if not builtin_dir.is_dir():
+        builtin_dir = resolve_builtin_template_dir(normalized)
+        if builtin_dir is None or not builtin_dir.is_dir():
             raise CronTemplateError(f"Builtin template not found: {name}")
-        pool = ensure_template_pool_initialized()
+        pool = ensure_template_pool_initialized(self._ws)
         target = safe_template_dir(pool, normalized)
         if target.exists():
             raise CronTemplateConflictError(
@@ -331,8 +405,8 @@ class CronTemplateService:
             )
         validate_template_package(builtin_dir, normalized)
         copy_template_dir(builtin_dir, target)
-        record_template_origin(normalized, "builtin")
-        reconcile_template_manifest()
+        record_template_origin(normalized, "builtin", self._ws)
+        reconcile_template_manifest(self._ws)
         return read_template_package(target, normalized, "user")
 
     # ----- import / export -----
@@ -351,7 +425,7 @@ class CronTemplateService:
         the caller gets every colliding name plus a suggested rename, and
         nothing is written until all names are free (or ``overwrite``).
         """
-        pool = ensure_template_pool_initialized()
+        pool = ensure_template_pool_initialized(self._ws)
         tmp_dir, found = extract_template_zip(data)
         renames = rename_map or {}
         try:
@@ -394,9 +468,9 @@ class CronTemplateService:
             imported: list[str] = []
             for package_dir, name in planned:
                 copy_template_dir(package_dir, safe_template_dir(pool, name))
-                record_template_origin(name, "upload")
+                record_template_origin(name, "upload", self._ws)
                 imported.append(name)
-            reconcile_template_manifest()
+            reconcile_template_manifest(self._ws)
             return {
                 "imported": imported,
                 "count": len(imported),
@@ -407,7 +481,7 @@ class CronTemplateService:
 
     def export_to_zip(self, name: str) -> tuple[str, bytes]:
         """Package a template as a zip. Returns ``(filename, bytes)``."""
-        resolved = resolve_template_dir(name)
+        resolved = resolve_template_dir(name, self._ws)
         if resolved is None:
             raise CronTemplateError(f"Template not found: {name}")
         package_dir, _ = resolved
@@ -418,204 +492,9 @@ class CronTemplateService:
             pack_template_to_zip(package_dir, normalized),
         )
 
-    # ----- bundled skills -----
-
-    def install_skills(
-        self,
-        name: str,
-        body: InstallTemplateSkillsRequest,
-        workspace_dir: Path | None = None,
-    ) -> dict[str, Any]:
-        """Install skills shipped inside a template package.
-
-        Reuses the skill system's own import path (``import_skill_dir``)
-        rather than copying directories by hand, so bundled skills land in
-        the pool / workspace with the same validation and manifest
-        bookkeeping as any other skill.
-        """
-        from ...agents.skill_system.registry import (
-            reconcile_pool_manifest,
-            reconcile_workspace_manifest,
-        )
-
-        wanted = self._resolve_wanted_skills(name, body)
-        resolved = resolve_template_dir(name)
-        assert resolved is not None  # get_template already validated
-        package_dir, _ = resolved
-
-        # Narrow workspace_dir once so the post-install bookkeeping below
-        # does not need a cast on every use.
-        ws_dir = (
-            self._require_workspace_dir(workspace_dir)
-            if body.target == "workspace"
-            else None
-        )
-        skill_root = self._skill_root_for(ws_dir)
-
-        installed, skipped = self._copy_bundled_skills(
-            package_dir=package_dir,
-            skill_root=skill_root,
-            wanted=wanted,
-            overwrite=body.overwrite,
-        )
-
-        if ws_dir is not None:
-            reconcile_workspace_manifest(ws_dir)
-            if body.enable and installed:
-                self._enable_workspace_skills(ws_dir, installed)
-        else:
-            reconcile_pool_manifest()
-
-        return {
-            "installed": installed,
-            "skipped": skipped,
-            "target": body.target,
-        }
-
-    # ----- bundled batches -----
-
-    def install_batches(
-        self,
-        name: str,
-        body: InstallTemplateBatchesRequest,
-    ) -> dict[str, Any]:
-        """Copy a template package's ``batch/*.json`` scripts into the pool.
-
-        Mirrors ``install_skills`` but for batch scripts: the files are
-        copied (base names kept) rather than referenced, so jobs only
-        ever resolve scripts from the one pool directory. The copy goes
-        through the tool-batches import pipeline, so the scripts get the
-        same validation, security scan and batch conflict reporting as a
-        zip upload. Returns ``{"imported": [...], "conflicts": [...]}``;
-        when conflicts is non-empty nothing was written.
-        """
-        resolved = resolve_template_dir(name)
-        if resolved is None:
-            raise CronTemplateError(f"Template not found: {name}")
-        package_dir, _ = resolved
-        relative_paths = list_batch_files(package_dir)
-        if not relative_paths:
-            raise CronTemplateError(
-                f"Template '{name}' does not bundle any batch scripts",
-            )
-        candidates = [
-            (package_dir / relative, relative) for relative in relative_paths
-        ]
-        return ToolBatchService().import_batch_files(
-            candidates,
-            rename_map=body.rename_map,
-            overwrite=body.overwrite,
-        )
-
-    # ----- helpers -----
-
-    def _resolve_wanted_skills(
-        self,
-        name: str,
-        body: InstallTemplateSkillsRequest,
-    ) -> list[str]:
-        """Validate the requested subset against what the package ships."""
-        info = self.get_template(name)
-        available = set(info.skills)
-        if not available:
-            raise CronTemplateError(
-                f"Template '{name}' does not bundle any skills",
-            )
-        wanted = list(body.skills or sorted(available))
-        unknown = [item for item in wanted if item not in available]
-        if unknown:
-            raise CronTemplateError(
-                f"Template '{name}' does not bundle skill(s): "
-                f"{', '.join(sorted(unknown))}",
-            )
-        return wanted
-
-    @staticmethod
-    def _require_workspace_dir(workspace_dir: Path | None) -> Path:
-        if workspace_dir is None:
-            raise CronTemplateError(
-                "workspace_dir is required when target is 'workspace'",
-            )
-        return Path(workspace_dir)
-
-    @staticmethod
-    def _skill_root_for(ws_dir: Path | None) -> Path:
-        """Pick the install root: the workspace's skills dir, or the pool."""
-        from ...agents.skill_system import (
-            get_skill_pool_dir,
-            get_workspace_skills_dir,
-        )
-
-        root = (
-            get_workspace_skills_dir(ws_dir)
-            if ws_dir is not None
-            else get_skill_pool_dir()
-        )
-        root.mkdir(parents=True, exist_ok=True)
-        return root
-
-    @staticmethod
-    def _copy_bundled_skills(
-        *,
-        package_dir: Path,
-        skill_root: Path,
-        wanted: list[str],
-        overwrite: bool,
-    ) -> tuple[list[str], list[str]]:
-        """Copy skills in, returning ``(installed, skipped)``.
-
-        Goes through ``import_skill_dir`` rather than copying by hand so
-        bundled skills get the same frontmatter validation as any other
-        skill import.
-        """
-        from ...agents.skill_system.store import import_skill_dir
-
-        installed: list[str] = []
-        skipped: list[str] = []
-        for skill_name in wanted:
-            target = skill_root / skill_name
-            if target.exists():
-                if not overwrite:
-                    skipped.append(skill_name)
-                    continue
-                shutil.rmtree(target)
-            src = package_dir / TEMPLATE_SKILLS_DIR / skill_name
-            if import_skill_dir(src, skill_root, skill_name):
-                installed.append(skill_name)
-            else:
-                skipped.append(skill_name)
-        return installed, skipped
-
-    @staticmethod
-    def _enable_workspace_skills(
-        workspace_dir: Path,
-        skill_names: list[str],
-    ) -> None:
-        from ...agents.skill_system.store import (
-            default_workspace_manifest,
-            get_workspace_skill_manifest_path,
-            mutate_json,
-        )
-
-        def _update(payload: dict[str, Any]) -> dict[str, Any]:
-            skills = payload.setdefault("skills", {})
-            for skill_name in skill_names:
-                entry = skills.get(skill_name)
-                entry = dict(entry) if isinstance(entry, dict) else {}
-                entry["enabled"] = True
-                entry.setdefault("channels", ["all"])
-                skills[skill_name] = entry
-            return payload
-
-        mutate_json(
-            get_workspace_skill_manifest_path(workspace_dir),
-            default_workspace_manifest(),
-            _update,
-        )
-
-    @staticmethod
-    def _pool_names() -> set[str]:
-        pool = get_cron_template_dir()
+    def _pool_names(self) -> set[str]:
+        """Template names already taken in this workspace."""
+        pool = get_cron_template_dir(self._ws)
         if not pool.exists():
             return set()
         return {path.name for path in iter_template_dirs(pool)}

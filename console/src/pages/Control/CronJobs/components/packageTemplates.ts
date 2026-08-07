@@ -234,3 +234,79 @@ export function toTemplateDefinitions(
     ...defs.filter((d) => d.packageSource === "builtin"),
   ];
 }
+
+/**
+ * The script name a bundled file installs under.
+ *
+ * `batch/weather.json` is how a package addresses its own file; `weather`
+ * is what a preprocess step names once the file has been copied into a
+ * job. A template's `form.preprocess` declares the latter.
+ */
+export function baseScriptName(packageRelativePath: string): string {
+  return (
+    packageRelativePath
+      .split("/")
+      .pop()
+      ?.replace(/\.json$/i, "") ?? ""
+  );
+}
+
+/**
+ * The script names a template's `form.preprocess` declares.
+ *
+ * Used to decide which of a package's bundled files to copy: a package may
+ * also ship scripts meant for the *agent* to pick between at run time, and
+ * those should not be copied into the job.
+ */
+export function declaredPreprocessScripts(
+  formValues: Record<string, unknown>,
+): string[] {
+  const preprocess = formValues.preprocess;
+  if (!preprocess || typeof preprocess !== "object") return [];
+  const steps = (preprocess as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return [];
+  const names: string[] = [];
+  for (const step of steps) {
+    const script = (step as { script?: unknown } | null)?.script;
+    if (typeof script === "string" && script.trim()) {
+      names.push(baseScriptName(script.trim()));
+    }
+  }
+  return names;
+}
+
+/**
+ * Point a template's declared preprocess steps at the copies that landed.
+ *
+ * A template says `steps: [{script: "weather"}]`, meaning "the script my
+ * `batch/weather.json` installs as". Copying it into a job normally keeps
+ * that name, but the server renames on collision, so the form has to be
+ * rewritten from what actually landed — otherwise the chain names a script
+ * the job does not have.
+ *
+ * Steps naming something absent from `landed` are left alone: they may
+ * refer to a script the user already had.
+ */
+export function remapPreprocessScripts(
+  formValues: Record<string, unknown>,
+  landed: Record<string, string>,
+): Record<string, unknown> {
+  const preprocess = formValues.preprocess;
+  if (!preprocess || typeof preprocess !== "object") return formValues;
+  const steps = (preprocess as { steps?: unknown }).steps;
+  if (!Array.isArray(steps)) return formValues;
+
+  return {
+    ...formValues,
+    preprocess: {
+      ...(preprocess as Record<string, unknown>),
+      steps: steps.map((step) => {
+        if (!step || typeof step !== "object") return step;
+        const declared = (step as { script?: unknown }).script;
+        if (typeof declared !== "string") return step;
+        const actual = landed[baseScriptName(declared)];
+        return actual ? { ...step, script: actual } : step;
+      }),
+    },
+  };
+}

@@ -241,6 +241,26 @@ def init_cmd(
     if ensure_skill_pool_initialized():
         click.echo("✓ Skill pool initialized")
 
+    # --- Copy the builtin cron templates out of the wheel ---
+    from ..app.cron_templates.store import (
+        ensure_builtin_templates_materialized,
+    )
+
+    materialized = ensure_builtin_templates_materialized()
+    if materialized["copied"] or materialized["updated"]:
+        click.echo(
+            "✓ Builtin cron templates ready "
+            f"({len(materialized['copied'])} added, "
+            f"{len(materialized['updated'])} updated)",
+        )
+    for blocked_name in materialized["blocked"]:
+        # Worth a line rather than only a log: the user has a package of
+        # that name, so the builtin they expected is silently absent.
+        click.echo(
+            f"! Kept your own '{blocked_name}'; the builtin of the same "
+            "name was not installed",
+        )
+
     # Get default workspace path for subsequent operations
     default_workspace = Path(f"{WORKING_DIR}/workspaces/default").expanduser()
 

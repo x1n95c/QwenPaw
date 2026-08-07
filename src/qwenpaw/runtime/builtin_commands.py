@@ -592,17 +592,16 @@ async def _skill_fallback_handler(
     if not skill_md.exists():
         return None
 
-    from ..agents.utils.file_handling import (
-        read_text_file_with_encoding_fallback,
-    )
-
-    import frontmatter as fm
-
-    raw = read_text_file_with_encoding_fallback(skill_md)
-    post = fm.loads(raw)
-    display_name = post.get("name") or skill_name
-
     if not user_input:
+        # The info card needs frontmatter only, so it never pays for
+        # reading the body. Kept on `skill_name` as the display fallback,
+        # which is what this card has always shown.
+        from ..agents.skill_system.store import (
+            read_frontmatter_safe_from_path,
+        )
+
+        post = read_frontmatter_safe_from_path(skill_md, skill_name)
+        display_name = post.get("name") or skill_name
         desc = post.get("description") or "No description."
         return Msg(
             name="assistant",
@@ -621,12 +620,22 @@ async def _skill_fallback_handler(
             ],
         )
 
+    from ..agents.skill_system.prompt import (
+        load_skill_body,
+        render_skill_invocation,
+    )
+
+    loaded = load_skill_body(skill_dir)
+    if loaded is None:
+        return None
+    display_name, body = loaded
+
     # Rewrite last message with skill body — agent will execute with it
-    merged = (
-        f"Use the [{display_name}] skill in "
-        f"`{skill_dir}` to fulfill "
-        f"user's task: {user_input}\n\n"
-        f"{post.content}"
+    merged = render_skill_invocation(
+        display_name,
+        skill_dir,
+        body,
+        user_input,
     )
     msgs = getattr(ctx, "input_msgs", None)
     if msgs:

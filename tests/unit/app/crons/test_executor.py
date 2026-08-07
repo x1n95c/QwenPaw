@@ -414,7 +414,11 @@ async def test_agent_job_injects_into_the_prompt(monkeypatch, fake_preprocess):
 
     blob = json.dumps(captured["input"], ensure_ascii=False)
     assert "<preprocess_result>" in blob
-    assert "do not call run_tool_batch again" in blob
+    assert "do not run them again" in blob
+    # The collected data has to precede the instruction it was collected
+    # for — "报告下面这份数据" only reads correctly in that order.
+    content = captured["input"][0]["content"]
+    assert "<preprocess_result>" in content[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -486,3 +490,158 @@ async def test_session_id_helper_matches_previous_behaviour():
         CronExecutor._resolve_session_id(isolated)
         == f"console:u1:cron:{isolated.id}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Attached skills, and the order they share the prompt with a preprocess.
+#
+# The contract is skill instructions, then the data they are to be applied
+# to, then the request. Asserted by index rather than by "is present",
+# because a silent inversion is exactly what one-call-per-block would cause.
+# ---------------------------------------------------------------------------
+
+SKILL_DOC = "---\nname: Advisor\n---\n\nADVICE BODY\n"
+
+
+def _write_skill(workspace_dir, name: str, text: str = SKILL_DOC):
+    from pathlib import Path
+
+    skill_dir = Path(workspace_dir) / "skills" / name
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(text, encoding="utf-8")
+    return skill_dir
+
+
+class _WorkspaceWithDir(_Workspace):
+    """A workspace the skill resolver can actually look inside."""
+
+    def __init__(self, workspace_dir, captured: dict) -> None:
+        super().__init__()
+        self.workspace_dir = str(workspace_dir)
+        self._captured = captured
+
+    async def stream_query(self, request):
+        self._captured.update(request)
+        for event in ():
+            yield event
+
+
+@pytest.mark.asyncio
+async def test_agent_job_prepends_the_skill_body(
+    monkeypatch,
+    fake_preprocess,
+    tmp_path,
+):
+    _calls, box = fake_preprocess
+    box["result"] = None
+    _patch_trace_storage(monkeypatch)
+    _write_skill(tmp_path, "advisor")
+
+    captured: dict = {}
+    job = make_cron_job_spec(skills=[{"name": "advisor"}])
+    executor = CronExecutor(
+        workspace=_WorkspaceWithDir(tmp_path, captured),
+        channel_manager=AsyncMock(),
+    )
+
+    await executor.execute(job)
+
+    content = captured["input"][0]["content"]
+    assert "Use the [Advisor] skill in" in content[0]["text"]
+    assert "ADVICE BODY" in content[0]["text"]
+    # The request body stays last: the instruction is what the model should
+    # read most recently.
+    assert content[-1]["text"] == "ping"
+
+
+@pytest.mark.asyncio
+async def test_skill_precedes_preprocess_which_precedes_the_request(
+    monkeypatch,
+    fake_preprocess,
+    tmp_path,
+):
+    _calls, box = fake_preprocess
+    box["result"] = _preprocess_result()
+    _patch_trace_storage(monkeypatch)
+    _write_skill(tmp_path, "advisor")
+
+    captured: dict = {}
+    job = make_cron_job_spec(
+        skills=[{"name": "advisor"}],
+        preprocess={"script": "collect"},
+    )
+    executor = CronExecutor(
+        workspace=_WorkspaceWithDir(tmp_path, captured),
+        channel_manager=AsyncMock(),
+    )
+
+    await executor.execute(job)
+
+    texts = [block["text"] for block in captured["input"][0]["content"]]
+    assert len(texts) == 3
+    assert "Use the [Advisor] skill in" in texts[0]
+    assert "<preprocess_result>" in texts[1]
+    assert texts[2] == "ping"
+
+
+@pytest.mark.asyncio
+async def test_an_unresolvable_skill_still_runs_the_job(
+    monkeypatch,
+    fake_preprocess,
+    tmp_path,
+):
+    """A deleted skill degrades to a note, never to a skipped fire."""
+    _calls, box = fake_preprocess
+    box["result"] = None
+    _patch_trace_storage(monkeypatch)
+
+    captured: dict = {}
+    job = make_cron_job_spec(skills=[{"name": "deleted"}])
+    workspace = _WorkspaceWithDir(tmp_path, captured)
+    executor = CronExecutor(workspace=workspace, channel_manager=AsyncMock())
+
+    result = await executor.execute(job)
+
+    assert result["delivery_status"] != "skipped"
+    blob = json.dumps(captured["input"], ensure_ascii=False)
+    assert "could not be loaded (not found)" in blob
+    assert "do not invent its rules" in blob
+
+
+@pytest.mark.asyncio
+async def test_a_text_job_with_skills_sends_identical_text(
+    monkeypatch,
+    fake_preprocess,
+    tmp_path,
+):
+    """No model runs on the text path, so a skill must be a pure no-op."""
+    _calls, box = fake_preprocess
+    box["result"] = _preprocess_result(user_text="disk 42% full")
+    _patch_trace_storage(monkeypatch)
+    _write_skill(tmp_path, "advisor")
+
+    sent: list[str] = []
+
+    def _make_executor():
+        channels = AsyncMock()
+
+        async def _send_text(**kwargs):
+            sent.append(kwargs["text"])
+
+        channels.send_text = _send_text
+        return CronExecutor(
+            workspace=_WorkspaceWithDir(tmp_path, {}),
+            channel_manager=channels,
+        )
+
+    for skills in (None, [{"name": "advisor"}]):
+        job = make_cron_job_spec(
+            task_type="text",
+            text="Daily check",
+            preprocess={"script": "collect"},
+            skills=skills,
+        )
+        await _make_executor().execute(job)
+
+    assert sent == ["Daily check\n\ndisk 42% full"] * 2
+    assert "ADVICE BODY" not in "".join(sent)
