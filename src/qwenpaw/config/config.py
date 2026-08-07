@@ -103,14 +103,14 @@ def _get_default_acp_agents() -> Dict[str, ACPAgentConfig]:
         "claude_code": ACPAgentConfig(
             enabled=True,
             command="npx",
-            args=["-y", "@zed-industries/claude-agent-acp"],
+            args=["-y", "@agentclientprotocol/claude-agent-acp"],
             trusted=True,
             tool_parse_mode="update_detail",
         ),
         "codex": ACPAgentConfig(
             enabled=True,
             command="npx",
-            args=["-y", "@zed-industries/codex-acp"],
+            args=["-y", "@agentclientprotocol/codex-acp"],
             trusted=True,
             tool_parse_mode="call_detail",
         ),
