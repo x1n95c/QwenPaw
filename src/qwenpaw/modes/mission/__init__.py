@@ -219,11 +219,13 @@ class MissionMode(AgentMode):
         agent_id = getattr(ctx, "agent_id", "")
         session_id = getattr(ctx, "session_id", "")
 
-        # Pin the project for the mission's whole life: a later session
-        # directory switch must not move a running mission's worker.
-        ctx.mode_state.setdefault("mission", {})["project_dir_pin"] = str(
-            project_dir,
-        )
+        # Pin the project directories for the mission's whole life: a
+        # later session switch must not move a running mission's worker.
+        # The singular pin stays for older consumers; the list pin is
+        # what the per-turn resolver honours.
+        mission_state = ctx.mode_state.setdefault("mission", {})
+        mission_state["project_dir_pin"] = str(project_dir)
+        mission_state["project_dirs_pin"] = _effective_project_dirs(ctx)
 
         prompt, loop_dir = await start_mission(
             task_text=task_text,
@@ -283,6 +285,24 @@ def _effective_project_dir(ctx: "HookContext") -> "Path":
     if resolved is not None:
         return resolved
     return Path(getattr(ctx, "workspace_dir", ".") or ".")
+
+
+def _effective_project_dirs(ctx: "HookContext") -> list[dict]:
+    """Return the full project-dir list Mission should stay bound to.
+
+    Snapshot of the per-turn resolved list (primary first, labels kept)
+    in the serializable ``{"path", "label"}`` shape. Empty when nothing
+    is configured — the resolver then falls back to the workspace, which
+    must not be pinned as if it were a project.
+    """
+    from ...config.context import get_current_project_dirs
+
+    dirs = get_current_project_dirs()
+    if not dirs:
+        return []
+    return [
+        {"path": str(entry.path), "label": entry.label} for entry in dirs
+    ]
 
 
 def _info_msg(text: str) -> Msg:

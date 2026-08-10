@@ -266,28 +266,52 @@ class MultimodalHintContributor(SyncPromptContributor):
 _DIRECTORY_CONTEXT_TEMPLATE = """\
 ### Directories
 
-Project directory: {project_dir}
+{project_dirs_block}
 Agent workspace: {workspace_dir}
 
-Relative file paths and shell commands resolve from the **project
-directory** — `read_file("src/main.py")` and a bare `pytest` both act on
-the project, so you do not need to pass absolute paths or an explicit
-`cwd` for ordinary work.
+Relative file paths and shell commands resolve from the **primary
+project directory** — `read_file("src/main.py")` and a bare `pytest`
+both act on it, so you do not need to pass absolute paths or an
+explicit `cwd` for ordinary work there.{extra_dirs_guidance}
 
 The agent workspace holds internal QwenPaw state (config, memory,
 sessions, skills). Do not read or write there unless the user asks.
 """
 
+_EXTRA_DIRS_GUIDANCE = """
+Other project directories are listed above. They are fully accessible,
+but only by ABSOLUTE path — relative paths never resolve there. When
+running shell commands in one, pass its path as the working directory."""
+
 _DIRECTORY_CONTEXT_MISSING_SUFFIX = """\
-WARNING: the configured project directory does not currently exist.
-Tell the user instead of writing files to a different location.
+WARNING: the configured primary project directory does not currently
+exist. Tell the user instead of writing files to a different location.
 """
 
 
-class DirectoryContextContributor(SyncPromptContributor):
-    """State the project dir and agent workspace, in every mode.
+def _format_project_dirs_block(entries: list[tuple]) -> str:
+    """Render the numbered directory list with a primary marker.
 
-    The project directory is not a Coding Mode concept — normal chats
+    ``entries`` is ``[(path, label, is_missing), ...]``, primary first.
+    """
+    if len(entries) == 1:
+        path, label, _missing = entries[0]
+        suffix = f" — {label}" if label else ""
+        return f"Project directory (primary): {path}{suffix}"
+
+    lines = ["Project directories:"]
+    for index, (path, label, missing) in enumerate(entries, start=1):
+        marker = " (primary)" if index == 1 else ""
+        note = f" — {label}" if label else ""
+        missing_note = " [MISSING]" if missing else ""
+        lines.append(f"{index}. {path}{marker}{note}{missing_note}")
+    return "\n".join(lines)
+
+
+class DirectoryContextContributor(SyncPromptContributor):
+    """State the project dirs and agent workspace, in every mode.
+
+    Project directories are not a Coding Mode concept — normal chats
     resolve relative paths the same way — so this block is unconditional
     rather than gated on a mode being active.
     """
@@ -299,6 +323,7 @@ class DirectoryContextContributor(SyncPromptContributor):
         from ..config.context import (
             get_current_project_dir,
             get_current_project_dir_source,
+            get_current_project_dirs,
         )
 
         workspace_dir = getattr(ctx, "workspace_dir", None)
@@ -323,9 +348,19 @@ class DirectoryContextContributor(SyncPromptContributor):
                 "alone unless the user asks about them.\n"
             )
 
+        dirs = get_current_project_dirs() or ()
+        entries = [
+            (str(entry.path), entry.label, not entry.exists)
+            for entry in dirs
+        ]
+        if not entries:
+            entries = [(str(project_dir), None, False)]
         block = _DIRECTORY_CONTEXT_TEMPLATE.format(
-            project_dir=project_dir,
+            project_dirs_block=_format_project_dirs_block(entries),
             workspace_dir=workspace_dir or "(unknown)",
+            extra_dirs_guidance=(
+                _EXTRA_DIRS_GUIDANCE if len(entries) > 1 else ""
+            ),
         )
         if get_current_project_dir_source() != "workspace_fallback" and not (
             Path(project_dir).is_dir()

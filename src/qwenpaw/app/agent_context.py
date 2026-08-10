@@ -137,11 +137,10 @@ async def get_agent_for_request(
 
 
 def get_coding_dir(workspace: "Workspace") -> Path:
-    """Return the agent's default project directory for *workspace*.
+    """Return the agent's default PRIMARY project directory.
 
-    Reads the mode-independent top-level ``project_dir`` (falling back to
-    the deprecated ``coding_mode.project_dir`` for un-migrated configs).
-    Falls back to ``workspace_dir`` when no project is configured.
+    Reads the mode-independent ``project_dirs`` list and returns its first
+    entry. Falls back to ``workspace_dir`` when no project is configured.
 
     This is the **agent-level default** and is what HTTP handlers should
     use, since they run outside an agent turn. Code running inside a turn
@@ -149,10 +148,10 @@ def get_coding_dir(workspace: "Workspace") -> Path:
     session-level override.
     """
     from ..config.config import load_agent_config
-    from ..config.project_dir import agent_project_dir_from_config
+    from ..config.project_dir import agent_primary_project_dir_from_config
 
     try:
-        project_dir = agent_project_dir_from_config(
+        project_dir = agent_primary_project_dir_from_config(
             load_agent_config(workspace.agent_id),
         )
     except Exception:
@@ -161,6 +160,25 @@ def get_coding_dir(workspace: "Workspace") -> Path:
     if project_dir:
         return Path(project_dir).expanduser().resolve()
     return workspace.workspace_dir
+
+
+def get_coding_dirs(workspace: "Workspace") -> list[Path]:
+    """Return all agent-level project directories, primary first.
+
+    Empty when no project is configured (callers fall back to the
+    workspace where a directory is required).
+    """
+    from ..config.config import load_agent_config
+    from ..config.project_dir import agent_project_dirs_from_config
+
+    try:
+        entries = agent_project_dirs_from_config(
+            load_agent_config(workspace.agent_id),
+        )
+    except Exception:
+        entries = []
+
+    return [Path(entry["path"]).expanduser().resolve() for entry in entries]
 
 
 def get_active_agent_id() -> str:

@@ -233,6 +233,42 @@ def test_resolve_allowed_fork_project_dir(tmp_path: Path) -> None:
     )
 
 
+def test_resolve_allowed_fork_project_dir_covers_all_project_dirs(
+    tmp_path: Path,
+) -> None:
+    """Allowed roots are the workspace plus EVERY bound project dir — a
+    fork may target any repository the user attached, not just the
+    primary."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    primary = tmp_path / "primary"
+    secondary = tmp_path / "secondary"
+    wt_secondary = secondary / ".qwenpaw" / "worktrees" / "abc"
+    wt_secondary.mkdir(parents=True)
+    unrelated = tmp_path / "unrelated"
+    unrelated_wt = unrelated / ".qwenpaw" / "worktrees" / "x"
+    unrelated_wt.mkdir(parents=True)
+
+    # Under a bound secondary dir: accepted.
+    assert (
+        resolve_allowed_fork_project_dir(
+            str(wt_secondary),
+            workspace_dir=workspace,
+            project_dirs=[str(primary), str(secondary)],
+        )
+        == wt_secondary.resolve()
+    )
+    # Not under any bound root: rejected.
+    assert (
+        resolve_allowed_fork_project_dir(
+            str(unrelated_wt),
+            workspace_dir=workspace,
+            project_dirs=[str(primary), str(secondary)],
+        )
+        is None
+    )
+
+
 def test_failed_fork_blocks_current_scope_not_next(
     tmp_path: Path,
 ) -> None:

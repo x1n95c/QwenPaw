@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
 """Context variables for the agent workspace and project directories.
 
-Two distinct directories are tracked per request:
+Two distinct concepts are tracked per request:
 
 ``current_workspace_dir``
     The agent's **internal** storage root (config, memory, sessions,
     skills, media, cache).  Never repointed to a business repository.
 
-``current_project_dir``
-    The **effective project directory** for this turn: the base for
-    relative paths in file tools, the default ``cwd`` for shell
-    commands, and the root for code/Git tooling.  Resolved once per
-    turn from session override → agent config → workspace fallback.
+``current_project_dir`` / ``current_project_dirs``
+    The **effective project directories** for this turn. The first
+    entry (mirrored into ``current_project_dir``) is the PRIMARY
+    project directory: the base for relative paths in file tools, the
+    default ``cwd`` for shell commands, and the root for code/Git
+    tooling. Additional entries are extra project directories, granted
+    by governance and described in the prompt, but addressed by
+    absolute path only. Resolved once per turn from fork override →
+    mode pin → request override → session override → agent config →
+    workspace fallback.
 
 Keeping them separate is deliberate: repointing ``current_workspace_dir``
 to simulate a project switch would make memory, skills, cache, approvals
@@ -26,6 +31,8 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from agentscope.state import AgentState
     from agentscope.tool import Toolkit
+
+    from .project_dir import ResolvedProjectDir
 
 # Context variable to store the current agent's workspace directory
 current_workspace_dir: ContextVar[Path | None] = ContextVar(
@@ -94,6 +101,47 @@ def get_current_project_dir_source() -> str | None:
 def set_current_project_dir_source(source: str | None) -> None:
     """Record where the effective project directory came from."""
     current_project_dir_source.set(source)
+
+
+# The full effective project-directory list for this turn, in order.
+# Index 0 mirrors ``current_project_dir``. Empty when nothing is
+# configured (tools then fall back to the workspace via
+# ``get_tool_base_dir``).
+current_project_dirs: ContextVar[tuple["ResolvedProjectDir", ...] | None] = (
+    ContextVar(
+        "current_project_dirs",
+        default=None,
+    )
+)
+
+
+def get_current_project_dirs() -> tuple["ResolvedProjectDir", ...] | None:
+    """Return the effective project-directory list for the current turn.
+
+    ``None`` means the hook never ran (no workspace context); an empty
+    tuple means "configured nowhere" — both fall back to the workspace
+    for tool resolution.
+    """
+    return current_project_dirs.get()
+
+
+def set_current_project_dirs(
+    dirs: tuple["ResolvedProjectDir", ...] | None,
+) -> None:
+    """Pin the effective project-directory list for the current turn."""
+    current_project_dirs.set(dirs)
+
+
+def get_all_project_dir_paths() -> list[Path]:
+    """Return every effective project-directory path, primary first.
+
+    Convenience for consumers that need the whole granted set
+    (governance, containment checks). Empty when nothing is configured.
+    """
+    dirs = current_project_dirs.get()
+    if not dirs:
+        return []
+    return [entry.path for entry in dirs]
 
 
 def get_tool_base_dir() -> Path:

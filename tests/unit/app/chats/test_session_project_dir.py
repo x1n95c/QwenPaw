@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Per-chat project-directory overrides on ``ChatManager``.
+"""Per-chat project-directory LIST overrides on ``ChatManager``.
 
 Uses the real :class:`JsonChatRepository` so persistence is exercised too:
 the override has to survive a round-trip through disk, since the whole
@@ -16,7 +16,13 @@ import pytest
 from qwenpaw.app.chats.manager import ChatManager
 from qwenpaw.app.chats.models import ChatSpec
 from qwenpaw.app.chats.repo import JsonChatRepository
-from qwenpaw.config.project_dir import session_project_dir_from_meta
+from qwenpaw.config.project_dir import session_project_dirs_from_meta
+
+_DEMO_LIST = [{"path": "/repos/demo", "label": None}]
+_TWO_DIRS = [
+    {"path": "/repos/main", "label": None},
+    {"path": "/repos/extra", "label": "backend"},
+]
 
 
 @pytest.fixture
@@ -43,11 +49,24 @@ async def _seed(manager: ChatManager, **meta: object) -> ChatSpec:
 async def test_set_stores_in_controlled_namespace(manager: ChatManager):
     chat = await _seed(manager)
 
-    updated = await manager.set_session_project_dir(chat.id, "/repos/demo")
+    updated = await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
 
     assert updated is not None
-    assert updated.meta["runtime_context"]["project_dir"] == "/repos/demo"
-    assert session_project_dir_from_meta(updated.meta) == "/repos/demo"
+    assert updated.meta["runtime_context"]["project_dirs"] == _DEMO_LIST
+    assert session_project_dirs_from_meta(updated.meta) == _DEMO_LIST
+
+
+@pytest.mark.asyncio
+async def test_stores_multiple_dirs_with_labels(manager: ChatManager):
+    chat = await _seed(manager)
+
+    updated = await manager.set_session_project_dirs(chat.id, _TWO_DIRS)
+
+    assert updated is not None
+    assert session_project_dirs_from_meta(updated.meta) == [
+        {"path": str(Path("/repos/main")), "label": None},
+        {"path": str(Path("/repos/extra")), "label": "backend"},
+    ]
 
 
 @pytest.mark.asyncio
@@ -57,26 +76,48 @@ async def test_override_persists_across_repo_reload(
 ):
     """The override must outlive the process, not just the in-memory spec."""
     chat = await _seed(manager)
-    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    await manager.set_session_project_dirs(chat.id, _TWO_DIRS)
 
     reloaded = ChatManager(repo=JsonChatRepository(repo_path))
     fetched = await reloaded.get_chat(chat.id)
 
     assert fetched is not None
-    assert session_project_dir_from_meta(fetched.meta) == "/repos/demo"
+    entries = session_project_dirs_from_meta(fetched.meta)
+    assert entries is not None
+    assert len(entries) == 2
 
 
 @pytest.mark.asyncio
 async def test_clear_removes_empty_namespace(manager: ChatManager):
     chat = await _seed(manager)
-    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
 
-    cleared = await manager.set_session_project_dir(chat.id, None)
+    cleared = await manager.set_session_project_dirs(chat.id, None)
 
     assert cleared is not None
-    assert session_project_dir_from_meta(cleared.meta) is None
+    assert session_project_dirs_from_meta(cleared.meta) is None
     # No leftover scaffolding for a chat that no longer overrides anything.
     assert "runtime_context" not in cleared.meta
+
+
+@pytest.mark.asyncio
+async def test_legacy_singular_key_is_dropped_on_write(manager: ChatManager):
+    """Draft-era chats stored one path; the list supersedes it."""
+    chat = await _seed(
+        manager,
+        runtime_context={"project_dir": "/repos/old-single"},
+    )
+
+    updated = await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
+
+    assert updated is not None
+    assert "project_dir" not in updated.meta["runtime_context"]
+    assert session_project_dirs_from_meta(updated.meta) == _DEMO_LIST
+
+    # Clearing also drops the legacy key.
+    cleared = await manager.set_session_project_dirs(chat.id, None)
+    assert cleared is not None
+    assert session_project_dirs_from_meta(cleared.meta) is None
 
 
 @pytest.mark.asyncio
@@ -88,12 +129,12 @@ async def test_sibling_meta_keys_survive(manager: ChatManager):
     """
     chat = await _seed(manager, some_system_key="keep-me")
 
-    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
     after_set = await manager.get_chat(chat.id)
     assert after_set is not None
     assert after_set.meta["some_system_key"] == "keep-me"
 
-    await manager.set_session_project_dir(chat.id, None)
+    await manager.set_session_project_dirs(chat.id, None)
     after_clear = await manager.get_chat(chat.id)
     assert after_clear is not None
     assert after_clear.meta["some_system_key"] == "keep-me"
@@ -103,12 +144,12 @@ async def test_sibling_meta_keys_survive(manager: ChatManager):
 async def test_sibling_runtime_context_keys_survive(manager: ChatManager):
     chat = await _seed(manager, runtime_context={"other_setting": "x"})
 
-    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
     after_set = await manager.get_chat(chat.id)
     assert after_set is not None
     assert after_set.meta["runtime_context"]["other_setting"] == "x"
 
-    await manager.set_session_project_dir(chat.id, None)
+    await manager.set_session_project_dirs(chat.id, None)
     after_clear = await manager.get_chat(chat.id)
     assert after_clear is not None
     # The namespace stays because a sibling key still lives there.
@@ -117,14 +158,14 @@ async def test_sibling_runtime_context_keys_survive(manager: ChatManager):
 
 @pytest.mark.asyncio
 async def test_unknown_chat_returns_none(manager: ChatManager):
-    assert await manager.set_session_project_dir("nope", "/repos/demo") is None
+    assert await manager.set_session_project_dirs("nope", _DEMO_LIST) is None
 
 
 @pytest.mark.asyncio
 async def test_set_bumps_updated_at(manager: ChatManager):
     chat = await _seed(manager)
 
-    updated = await manager.set_session_project_dir(chat.id, "/repos/demo")
+    updated = await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
 
     assert updated is not None
     assert updated.updated_at >= chat.updated_at
@@ -137,7 +178,10 @@ async def test_concurrent_sets_do_not_lose_updates(manager: ChatManager):
 
     await asyncio.gather(
         *(
-            manager.set_session_project_dir(chat.id, f"/repos/p{i}")
+            manager.set_session_project_dirs(
+                chat.id,
+                [{"path": f"/repos/p{i}", "label": None}],
+            )
             for i in range(10)
         ),
     )
@@ -147,27 +191,28 @@ async def test_concurrent_sets_do_not_lose_updates(manager: ChatManager):
     # Whichever write landed last, the sibling key must not be lost and the
     # value must be one of the ones we actually wrote (not a merge artifact).
     assert final.meta["some_system_key"] == "keep-me"
-    assert session_project_dir_from_meta(final.meta) in {
-        f"/repos/p{i}" for i in range(10)
-    }
+    entries = session_project_dirs_from_meta(final.meta)
+    assert entries is not None
+    assert len(entries) == 1
+    assert entries[0]["path"] in {f"/repos/p{i}" for i in range(10)}
 
 
 @pytest.mark.asyncio
 async def test_clearing_a_never_set_override_is_safe(manager: ChatManager):
     chat = await _seed(manager)
 
-    cleared = await manager.set_session_project_dir(chat.id, None)
+    cleared = await manager.set_session_project_dirs(chat.id, None)
 
     assert cleared is not None
     assert "runtime_context" not in cleared.meta
 
 
 @pytest.mark.asyncio
-async def test_blank_value_is_treated_as_clear(manager: ChatManager):
+async def test_empty_list_is_treated_as_clear(manager: ChatManager):
     chat = await _seed(manager)
-    await manager.set_session_project_dir(chat.id, "/repos/demo")
+    await manager.set_session_project_dirs(chat.id, _DEMO_LIST)
 
-    cleared = await manager.set_session_project_dir(chat.id, "")
+    cleared = await manager.set_session_project_dirs(chat.id, [])
 
     assert cleared is not None
-    assert session_project_dir_from_meta(cleared.meta) is None
+    assert session_project_dirs_from_meta(cleared.meta) is None

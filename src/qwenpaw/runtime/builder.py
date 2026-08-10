@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from ..agents.acp.meta import ACP_CODING_PROJECT_META_KEY
-from ..config.project_dir import agent_project_dir_from_config
+from ..config.project_dir import agent_project_dirs_from_config
 from ..utils.io_utils import run_sync_io
 
 _logger = logging.getLogger(__name__)
@@ -243,20 +243,31 @@ class AgentBuilder:
                 active_modes = plugins.active_mode_names(ctx)
 
         # Governor (governance policy layer). Built per request against the
-        # dir the tools will actually use, so a session-level project switch
-        # is reflected in the policy instead of the agent's startup dir.
-        from ..config.context import get_current_project_dir
+        # dirs the tools will actually use, so a session-level project
+        # switch is reflected in the policy instead of the agent's startup
+        # dirs. Every effective project dir is registered: the primary via
+        # the PROJECT_DIR placeholder, the rest as extra ALLOW rules.
+        from ..config.context import get_current_project_dirs
 
-        _resolved_project = get_current_project_dir()
-        _project_dir = (
-            str(_resolved_project)
-            if _resolved_project is not None
-            else agent_project_dir_from_config(agent_config)
-        )
+        _resolved_dirs = get_current_project_dirs()
+        if _resolved_dirs:
+            _project_dir = str(_resolved_dirs[0].path)
+            _extra_project_dirs = [
+                str(entry.path) for entry in _resolved_dirs[1:]
+            ]
+        else:
+            _agent_entries = agent_project_dirs_from_config(agent_config)
+            _project_dir = (
+                _agent_entries[0]["path"] if _agent_entries else None
+            )
+            _extra_project_dirs = [
+                entry["path"] for entry in _agent_entries[1:]
+            ]
         governor = await run_sync_io(
             self._init_governor,
             workspace_dir,
             _project_dir,
+            _extra_project_dirs,
         )
 
         # Inject governor into local_workspace so list_tools() can
@@ -462,8 +473,13 @@ class AgentBuilder:
     def _init_governor(
         workspace_dir: Any,
         coding_project_dir: Any = None,
+        extra_project_dirs: Iterable[Any] = (),
     ) -> Any:
         """Initialize ResourceGovernor if governance is available.
+
+        ``coding_project_dir`` is the PRIMARY project directory;
+        ``extra_project_dirs`` are the remaining bound directories, all
+        of which get ALLOW rules and sandbox mounts.
 
         Returns the started governor, or ``None`` when governance cannot
         be initialised (missing dependencies, unsupported platform, etc.).
@@ -478,6 +494,7 @@ class AgentBuilder:
                 coding_project_dir=(
                     str(coding_project_dir) if coding_project_dir else None
                 ),
+                extra_project_dirs=[str(path) for path in extra_project_dirs],
             )
             governor.start()
             _logger.info("Governance started: dir=%s", workspace_dir)
@@ -571,9 +588,11 @@ class AgentBuilder:
             return agent_config
 
         # When fork_project_dir is present, the final coding project MUST be
-        # the validated worktree — never fall through to an unchecked ACP path.
+        # the validated worktree — never fall through to an unchecked ACP
+        # path. Allowed roots cover every bound project directory, not
+        # just the primary.
         if isinstance(fork_raw, str) and fork_raw.strip():
-            existing_pd = agent_project_dir_from_config(agent_config)
+            existing_entries = agent_project_dirs_from_config(agent_config)
             workspace_hint = request_context.get("workspace_dir") or getattr(
                 agent_config,
                 "workspace_dir",
@@ -582,7 +601,7 @@ class AgentBuilder:
             validated = resolve_allowed_fork_project_dir(
                 fork_raw,
                 workspace_dir=workspace_hint,
-                coding_project_dir=existing_pd,
+                project_dirs=[entry["path"] for entry in existing_entries],
             )
             if validated is None:
                 _logger.warning(
@@ -610,7 +629,21 @@ class AgentBuilder:
             return agent_config
 
         agent_config = agent_config.model_copy(deep=True)
-        agent_config.project_dir = str(project_dir)
+        # The request dir becomes the primary; other bound directories
+        # stay accessible. The write lands on a deep copy, so the
+        # per-run override never reaches the agent's saved default.
+        from ..config.config import ProjectDirEntry
+        from ..config.project_dir import same_dir
+
+        kept = [
+            entry
+            for entry in getattr(agent_config, "project_dirs", [])
+            if not same_dir(entry.path, project_dir)
+        ]
+        agent_config.project_dirs = [
+            ProjectDirEntry(path=str(project_dir)),
+            *kept,
+        ]
         cm = getattr(agent_config, "coding_mode", None)
         if cm is None:
             from ..config.config import CodingModeConfig

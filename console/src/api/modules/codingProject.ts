@@ -101,6 +101,28 @@ export const codingProjectApi = {
       )}${showHidden ? "&show_hidden=true" : ""}`,
     ),
 
+  /**
+   * Whether the backend can show the OS folder dialog. False for a remote
+   * console or a headless host, where the in-app browser is the only way.
+   */
+  nativePickerAvailable: () =>
+    request<{ available: boolean }>(
+      "/workspace/coding-project/native-picker",
+    ),
+
+  /**
+   * Ask the backend to open the OS folder dialog and report the choice.
+   * `path: null` with `cancelled: true` means the user dismissed it.
+   */
+  openNativePicker: (prompt?: string) =>
+    request<{ path: string | null; cancelled: boolean }>(
+      "/workspace/coding-project/native-picker",
+      {
+        method: "POST",
+        body: JSON.stringify({ prompt: prompt || undefined }),
+      },
+    ),
+
   /** Low-level: POST to clone endpoint and return a ReadableStream of SSE. */
   cloneStream: (url: string, name?: string): Promise<Response> =>
     fetch(getApiUrl("/workspace/coding-project/clone"), {

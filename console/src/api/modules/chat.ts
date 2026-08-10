@@ -5,11 +5,17 @@ import type {
   ChatSpec,
   ChatHistory,
   ChatDeleteResponse,
-  ChatProjectDir,
+  ChatProjectDirs,
   ChatUpdateRequest,
   BatchArchiveResult,
   Session,
 } from "../types";
+
+/** One project-directory entry as sent to the server. */
+export interface ProjectDirPayload {
+  path: string;
+  label?: string | null;
+}
 
 /** Response from POST /console/upload. url = filename only; agent_id from header. */
 export interface ChatUploadResponse {
@@ -128,32 +134,43 @@ export const chatApi = {
       method: "POST",
     }),
 
-  /** Read this chat's effective project directory and where it came from. */
-  getProjectDir: (chatId: string) =>
-    request<ChatProjectDir>(
-      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+  /** Read this chat's effective project directories, primary first. */
+  getProjectDirs: (chatId: string) =>
+    request<ChatProjectDirs>(
+      `/chats/${encodeURIComponent(chatId)}/project-dirs`,
     ),
 
   /**
-   * Bind this chat to a project directory.
+   * Bind this chat to an ordered project-directory list (index 0 is the
+   * primary). The payload is the WHOLE desired list — add, remove and
+   * make-primary are list transforms followed by one PUT.
    *
    * Persisted server-side, so it survives a reload or a different browser.
-   * Takes effect on the next turn; an in-flight turn keeps its directory.
+   * Takes effect on the next turn; an in-flight turn keeps its dirs.
    * A path that does not exist is rejected with 422.
    */
-  setProjectDir: (chatId: string, projectDir: string) =>
-    request<ChatProjectDir>(
-      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+  setProjectDirs: (
+    chatId: string,
+    projectDirs: ProjectDirPayload[],
+    projectName?: string | null,
+  ) =>
+    request<ChatProjectDirs>(
+      `/chats/${encodeURIComponent(chatId)}/project-dirs`,
       {
         method: "PUT",
-        body: JSON.stringify({ project_dir: projectDir }),
+        body: JSON.stringify({
+          project_dirs: projectDirs,
+          // null clears it, so the name goes back to tracking the primary
+          // directory rather than pinning a stale one.
+          project_name: projectName ?? null,
+        }),
       },
     ),
 
   /** Drop the override so this chat inherits the agent default again. */
-  clearProjectDir: (chatId: string) =>
-    request<ChatProjectDir>(
-      `/chats/${encodeURIComponent(chatId)}/project-dir`,
+  clearProjectDirs: (chatId: string) =>
+    request<ChatProjectDirs>(
+      `/chats/${encodeURIComponent(chatId)}/project-dirs`,
       { method: "DELETE" },
     ),
 };

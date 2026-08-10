@@ -14,7 +14,7 @@ import time
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterator, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -82,9 +82,15 @@ def resolve_allowed_fork_project_dir(
     fork_project: str | None,
     *,
     workspace_dir: str | Path | None = None,
-    coding_project_dir: str | Path | None = None,
+    project_dirs: Sequence[str | Path] | None = None,
 ) -> Path | None:
-    """Return a validated fork worktree path, or None if rejected."""
+    """Return a validated fork worktree path, or None if rejected.
+
+    A fork worktree is only accepted when it lives under the worktree
+    area of an allowed root: the agent workspace plus **every** bound
+    project directory (primary and extras alike) — a fork may target any
+    repository the user attached to this agent/chat.
+    """
     if not isinstance(fork_project, str) or not fork_project.strip():
         return None
     try:
@@ -95,7 +101,7 @@ def resolve_allowed_fork_project_dir(
         return None
 
     bases: list[Path] = []
-    for raw in (coding_project_dir, workspace_dir):
+    for raw in (*(project_dirs or ()), workspace_dir):
         if not raw:
             continue
         try:
@@ -411,15 +417,16 @@ def resolve_git_project_dir(
         try:
             from ..config.config import load_agent_config
 
-            from ..config.project_dir import agent_project_dir_from_config
+            from ..config.project_dir import agent_project_dirs_from_config
 
             cfg = load_agent_config(aid)
-            # Mode-independent: a configured project dir counts even when
-            # Coding Mode is off, so normal-mode forks bind to the project.
-            configured = agent_project_dir_from_config(cfg)
-            if configured:
+            # Mode-independent: configured project dirs count even when
+            # Coding Mode is off, so normal-mode forks bind to the
+            # projects. Every bound directory is a candidate registry
+            # base, primary first.
+            for entry in agent_project_dirs_from_config(cfg):
                 candidates.append(
-                    Path(configured).expanduser().resolve(),
+                    Path(entry["path"]).expanduser().resolve(),
                 )
             if getattr(cfg, "workspace_dir", None):
                 candidates.append(

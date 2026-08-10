@@ -1632,8 +1632,8 @@ class PlanConfig(BaseModel):
 class CodingModeConfig(BaseModel):
     """Configuration for the Coding Mode feature.
 
-    Coding Mode owns **no directory of its own**. The project directory is
-    a mode-independent concept stored at ``AgentProfileConfig.project_dir``.
+    Coding Mode owns **no directory of its own**. Project directories are
+    a mode-independent concept stored at ``AgentProfileConfig.project_dirs``.
     Coding Mode only adds: the IDE layout, code-understanding tools
     (LSP / AST), a coding-specific system prompt, and the Git watchdog.
     """
@@ -1646,11 +1646,36 @@ class CodingModeConfig(BaseModel):
         default=None,
         deprecated=True,
         description=(
-            "DEPRECATED — moved to the top-level ``project_dir``. Retained "
-            "only so existing agent.json files still parse; a one-time "
-            "startup migration lifts the value up and clears this field. "
-            "Do not read this in new code: use "
-            "``config.project_dir`` or ``resolve_effective_project_dir()``."
+            "DEPRECATED — moved to the top-level ``project_dirs`` list. "
+            "Retained only so existing agent.json files still parse; a "
+            "one-time migration lifts the value into the list and clears "
+            "this field. Do not read this in new code: use "
+            "``config.project_dirs`` or "
+            "``resolve_effective_project_dirs()``."
+        ),
+    )
+
+
+class ProjectDirEntry(BaseModel):
+    """One entry of the agent's project-directory list.
+
+    The list is ordered: index 0 is the **primary** project directory
+    (relative paths and shell cwd resolve there); the rest are extra
+    project directories addressed by absolute path.
+    """
+
+    path: str = Field(
+        ...,
+        min_length=1,
+        description="Absolute path to the project directory",
+    )
+    label: Optional[str] = Field(
+        default=None,
+        max_length=50,
+        description=(
+            "Optional user-facing note (e.g. 'backend API repo'), "
+            "rendered into the system prompt so the model knows what "
+            "this directory is for"
         ),
     )
 
@@ -1668,15 +1693,27 @@ class AgentProfileConfig(BaseModel):
         default="",
         description="Path to agent's workspace (optional, for reference)",
     )
-    project_dir: Optional[str] = Field(
-        default=None,
+    project_dirs: list[ProjectDirEntry] = Field(
+        default_factory=list,
         description=(
-            "Agent-level default project directory (absolute path). "
-            "This is where the agent does its work: the base for relative "
-            "paths in file tools, the default cwd for shell commands, and "
-            "the root for code/Git tooling. Shared by ALL modes — it is "
-            "not a Coding Mode concept. A Chat session may override it. "
-            "None means fall back to workspace_dir."
+            "Agent-level default project directories, in order. The "
+            "first entry is the PRIMARY project directory: the base for "
+            "relative paths in file tools, the default cwd for shell "
+            "commands, and the root for code/Git tooling. Additional "
+            "entries are extra project directories the agent may access "
+            "by absolute path. Shared by ALL modes — not a Coding Mode "
+            "concept. A Chat session may override the whole list. Empty "
+            "means fall back to workspace_dir."
+        ),
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        max_length=60,
+        description=(
+            "Display name for the whole project (the directory list as a "
+            "unit), distinct from the per-directory labels. Purely "
+            "descriptive: never used to resolve a path. None means fall "
+            "back to the primary directory's label, then its basename."
         ),
     )
     backend: str = Field(
@@ -2655,11 +2692,12 @@ def load_agent_config(  # pylint: disable=too-many-branches,too-many-statements
             display_migrated = False
             access_control_migrated = False
 
-        # Lift legacy coding_mode.project_dir to the top level so every
-        # mode reads the project directory from one place.
-        from .project_dir import migrate_project_dir_in_place
+        # Lift legacy project-dir fields (coding_mode.project_dir and the
+        # singular top-level project_dir) into the project_dirs list so
+        # every mode reads project directories from one place.
+        from .project_dir import migrate_project_dirs_in_place
 
-        project_dir_migrated = migrate_project_dir_in_place(data)
+        project_dir_migrated = migrate_project_dirs_in_place(data)
 
         if (
             weixin_migrated

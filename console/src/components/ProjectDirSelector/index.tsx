@@ -1,38 +1,29 @@
 import {
   AlertTriangle,
   ChevronDown,
-  ChevronRight,
-  Eye,
-  EyeOff,
   Folder,
-  FolderSearch,
-  Home,
+  FolderOpen,
   LoaderCircle,
   RotateCcw,
+  X,
 } from "lucide-react";
 import { Button, Input, Popover } from "antd";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 
 import { chatApi } from "../../api/modules/chat";
 import { codingProjectApi } from "../../api/modules/codingProject";
-import { usePendingProjectDirStore } from "../../stores/pendingProjectDirStore";
-import { useDirectoryBrowser } from "../DirectoryBrowser/useDirectoryBrowser";
-import type { ChatProjectDir } from "../../api/types";
+import {
+  usePendingProjectDirStore,
+  type PendingProjectDirEntry,
+} from "../../stores/pendingProjectDirStore";
+import {
+  isNativeDirectoryPickerAvailable,
+  pickDirectory,
+  PICK_CANCELLED,
+} from "../../utils/pickDirectory";
+import type { ChatProjectDirEntry, ChatProjectDirs } from "../../api/types";
 import styles from "./index.module.less";
-
-/**
- * The console gives an unsent chat a local timestamp id (`<ms>-<rand>`)
- * until its first message resolves it to a server UUID. Such an id cannot be
- * used with the per-chat API — the chat does not exist yet — so it must take
- * the pending path instead, or the PUT would 404.
- */
-const LOCAL_TIMESTAMP_ID = /^\d+-[a-z0-9]+$/;
-
-function isServerChatId(chatId: string | null | undefined): boolean {
-  if (!chatId || chatId === "new") return false;
-  return !LOCAL_TIMESTAMP_ID.test(chatId);
-}
 
 /** Last path segment, so the pill stays short. Handles both separators. */
 function basename(path: string): string {
@@ -40,60 +31,94 @@ function basename(path: string): string {
   return parts[parts.length - 1] || path;
 }
 
+/** Case-insensitive path compare, matching the server's dedupe rule. */
+function samePath(a: string, b: string): boolean {
+  return a.trim().toLowerCase() === b.trim().toLowerCase();
+}
+
 interface ProjectDirSelectorProps {
   /**
-   * The server-side chat this selector acts on. Undefined/null/"new" while
-   * the chat has not been created yet — in that case the selector still
-   * renders and stores the choice as *pending* (see localSessionId).
+   * The console's routing id for the conversation. This is NOT the backend
+   * chat id: the console keeps a locally generated `<ms>-<rand>` session id
+   * for the whole life of a chat and stashes the backend UUID alongside it,
+   * so the UUID has to be looked up (see `resolveChatId` below) rather than
+   * guessed from the shape of this value.
    */
   chatId: string | null | undefined;
   /**
    * The console's local session id for an unsent new chat. A pending
-   * directory is keyed by it so several unsent new chats keep separate
-   * picks, and it rides along with the first message instead of being
-   * persisted now.
+   * directory list is keyed by it so several unsent new chats keep
+   * separate picks, and it rides along with the first message instead of
+   * being persisted now.
    */
   localSessionId?: string | null;
+  /**
+   * Maps the console's session id to the backend chat UUID, returning null
+   * while the chat has not been created yet.
+   *
+   * Injected rather than imported so this component does not depend on the
+   * Chat page's sessionApi (and so tests can drive both states). Without
+   * it the component stays in "not created yet" mode, which is the safe
+   * default: picks are held locally and sent with the next message.
+   */
+  resolveChatId?: (sessionId: string) => string | null;
+  /**
+   * Bumped by the parent when the backend id becomes known, so the panel
+   * re-reads the now-persisted value instead of showing the agent default
+   * it loaded while the chat was still local.
+   */
+  refreshKey?: number;
 }
 
 /**
- * Shows the directory the next message will operate in, and lets the user
- * bind this chat to a different one.
+ * Shows the project directories the next message will operate in, and lets
+ * the user manage the list: add, remove, and pick which one is PRIMARY.
  *
- * Lives in the Sender action bar (not the page header) because it describes
- * the execution context of the *next message*, which is a property of the
- * composer rather than of the whole conversation.
+ * The list is ordered — index 0 is the primary directory (relative paths
+ * and shell commands resolve there); the rest are extra directories the
+ * agent can reach by absolute path. Every mutation PUTs the whole list,
+ * so there are no incremental endpoints to race.
+ *
+ * Sits above the composer because it describes where the *next message*
+ * will run — context for the whole input rather than one more button in
+ * the action bar.
  */
 export function ProjectDirSelector({
   chatId,
   localSessionId,
+  resolveChatId,
+  refreshKey = 0,
 }: ProjectDirSelectorProps) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
-  const [info, setInfo] = useState<ChatProjectDir | null>(null);
+  const [info, setInfo] = useState<ChatProjectDirs | null>(null);
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
-  const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [browsing, setBrowsing] = useState(false);
+  // In-flight name edits, keyed by path. Absent means "show whatever the
+  // entry currently says"; present means the user has typed something that
+  // is not committed yet.
+  const [nameDrafts, setNameDrafts] = useState<Record<string, string>>({});
+  // Uncommitted edit of the *project* name (undefined = not editing).
+  const [projectNameDraft, setProjectNameDraft] = useState<
+    string | undefined
+  >();
+  // Undefined until probed, so the button does not flash in and out.
+  const [nativePicker, setNativePicker] = useState<boolean | undefined>();
 
-  // Counts successful listings. `data.current` alone is not enough to drive
-  // the draft sync below: navigating to a directory we are already viewing
-  // (Home while at home) leaves `current` unchanged, so an effect keyed only
-  // on it would never fire.
-  const [listingSeq, setListingSeq] = useState(0);
-
-  // Only fetch listings once the browser is actually expanded, so opening
-  // the panel to read the current directory costs no requests.
-  const browser = useDirectoryBrowser({
-    enabled: browsing,
-    onLoaded: () => setListingSeq((n) => n + 1),
-  });
-
-  const isRealChat = isServerChatId(chatId);
+  // The backend chat UUID, or null while the chat exists only locally.
+  // Looked up rather than inferred: the routing id keeps its local
+  // `<ms>-<rand>` shape for the chat's whole life, so judging by shape
+  // made every real chat look uncreated — which is why a bound directory
+  // used to keep showing the agent default after it had taken effect.
+  const realChatId = chatId ? (resolveChatId?.(chatId) ?? null) : null;
+  const isRealChat = Boolean(realChatId);
   const pendingKey = localSessionId || "";
   const pending = usePendingProjectDirStore((st) =>
     pendingKey ? st.byLocalId[pendingKey] : undefined,
+  );
+  const pendingName = usePendingProjectDirStore((st) =>
+    pendingKey ? st.nameByLocalId[pendingKey] : undefined,
   );
   const setPending = usePendingProjectDirStore((st) => st.setPending);
   const clearPending = usePendingProjectDirStore((st) => st.clearPending);
@@ -102,343 +127,487 @@ export function ProjectDirSelector({
     setLoading(true);
     setError(null);
     try {
-      if (isRealChat && chatId) {
-        setInfo(await chatApi.getProjectDir(chatId));
+      if (realChatId) {
+        setInfo(await chatApi.getProjectDirs(realChatId));
       } else {
         // No chat exists yet, so there is no per-chat value to read. Show
-        // what the agent would use, so the pill is informative before the
-        // first message rather than absent.
+        // what the agent would use (its primary), so the pill is
+        // informative before the first message rather than absent. The
+        // agent workspace fallback is NOT shown: an unbound chat simply
+        // renders the empty state.
         const agent = await codingProjectApi.get();
-        setInfo({
-          project_dir: agent.path,
-          source: agent.is_workspace_default
-            ? "workspace_fallback"
-            : "agent",
-          agent_project_dir: agent.is_workspace_default ? null : agent.path,
-          exists: agent.exists ?? true,
-        });
+        if (agent.is_workspace_default) {
+          setInfo({ project_dirs: [], source: "workspace_fallback" });
+        } else {
+          setInfo({
+            project_dirs: [
+              { path: agent.path, exists: agent.exists ?? true },
+            ],
+            source: "agent",
+            agent_project_dirs: [
+              { path: agent.path, exists: agent.exists ?? true },
+            ],
+          });
+        }
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, [chatId, isRealChat]);
+  }, [realChatId]);
 
-  // Refresh when the chat changes so the pill never shows a stale directory
-  // from the previously open conversation.
+  // Refresh when the chat changes, and again once its backend id resolves
+  // (`realChatId` flips from null) or the parent signals that the first
+  // message has been sent — otherwise the card would keep showing the
+  // agent default it read while the chat was still local.
   useEffect(() => {
     setInfo(null);
     setError(null);
-    // Runs for a not-yet-created chat too: load() falls back to the agent
-    // default there, so the pill is never blank.
     void load();
-  }, [chatId, isRealChat, load]);
-
-  // Set once the user starts moving around in the browser. Guards the two
-  // effects below from fighting each other: the seed must not clobber a
-  // browsed pick, and the initial listing must not clobber the seed.
-  const browsedRef = useRef(false);
-
-  // Seed the input with the current value each time the panel opens.
-  useEffect(() => {
-    if (!open) {
-      browsedRef.current = false;
-      return;
-    }
-    if (browsedRef.current) return;
-    const seed = pending ?? info?.project_dir;
-    if (seed) setDraft(seed);
-  }, [open, info, pending]);
-
-  /**
-   * Navigate *and* select: the folder you are looking at is the one "Apply"
-   * will bind. Setting the draft from the clicked entry makes it immediate
-   * (the listing already carries absolute paths); the effect below then
-   * replaces it with the server's canonical form, which is what expands
-   * "~" and resolves any "..".
-   */
-  // Destructured so the dependency is a plain identifier: `navigate` is
-  // referentially stable inside the hook, while `browser` is a fresh object
-  // every render.
-  const { navigate } = browser;
-  const go = useCallback(
-    (next: string) => {
-      browsedRef.current = true;
-      if (next.startsWith("/")) setDraft(next);
-      navigate(next);
-    },
-    [navigate],
-  );
-
-  const browsedPath = browser.data?.current;
-  useEffect(() => {
-    // Only after a user-initiated move — otherwise merely expanding the
-    // browser would silently repoint the draft at the home directory.
-    if (!browsedPath || !browsedRef.current) return;
-    setDraft(browsedPath);
-    // listingSeq re-runs this on every successful listing, including ones
-    // that land on the same path we were already showing.
-  }, [browsedPath, listingSeq]);
-
-  const apply = async () => {
-    const next = draft.trim();
-    if (!next) return;
-
-    // No chat to attach to yet: remember the choice and let the first
-    // message carry it. The server re-validates the path when it persists
-    // it, so a bad path surfaces then rather than being silently used.
-    if (!isRealChat || !chatId) {
-      if (!pendingKey) {
-        setError(t("projectDir.noSessionYet"));
-        return;
-      }
-      setPending(pendingKey, next);
-      setOpen(false);
-      return;
-    }
-
-    setSaving(true);
-    setError(null);
-    try {
-      setInfo(await chatApi.setProjectDir(chatId, next));
-      clearPending(pendingKey);
-      setOpen(false);
-    } catch (err) {
-      // Surface the server's 422 (e.g. "Not a directory") instead of
-      // closing the panel as if it had worked.
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const inherit = async () => {
-    if (!isRealChat || !chatId) {
-      // Nothing is persisted yet, so dropping the pending pick *is* the
-      // whole "inherit" operation for an unsent chat.
-      clearPending(pendingKey);
-      setOpen(false);
-      return;
-    }
-    setSaving(true);
-    setError(null);
-    try {
-      setInfo(await chatApi.clearProjectDir(chatId));
-      clearPending(pendingKey);
-      setOpen(false);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setSaving(false);
-    }
-  };
+  }, [chatId, realChatId, refreshKey, load]);
 
   // A pending pick wins the display: it is what the next message will use.
-  const effectivePath = pending ?? info?.project_dir ?? "";
+  const entries: ChatProjectDirEntry[] =
+    pending?.map((entry) => ({
+      path: entry.path,
+      label: entry.label,
+      exists: true,
+    })) ??
+    info?.project_dirs ??
+    [];
   const isPending = Boolean(pending) && !isRealChat;
   const isSession = Boolean(pending) || info?.source === "session";
+  const primary = entries[0];
   // A pending path has not been server-checked yet, so do not claim it is
   // missing; the router validates it when the first message arrives.
-  const missing = pending ? false : info ? !info.exists : false;
-  const label = effectivePath ? basename(effectivePath) : "…";
+  const primaryMissing = pending ? false : primary ? !primary.exists : false;
+
+  // The project's own name, falling back to the primary directory's so the
+  // card always has something to show. `projectNameDraft` holds an
+  // uncommitted edit; `undefined` means "not editing".
+  const derivedName = primary
+    ? primary.label || basename(primary.path)
+    : undefined;
+  const storedName = pendingName ?? info?.project_name ?? derivedName;
+  const projectName = projectNameDraft ?? storedName;
+  // The name as *persisted*: null when it is merely derived from the
+  // primary directory. Every list mutation resends it, so without this a
+  // reorder or a removal would wipe a name the user had set.
+  const customName =
+    pendingName ?? (info?.project_name_is_custom ? info.project_name : null) ??
+    null;
+
+  /**
+   * Commit a new full list, and optionally a new project name. For a real
+   * chat this PUTs; for an unsent chat it updates the pending store.
+   * `null` clears the override entirely (restore-default / removing the
+   * last entry).
+   */
+  const commit = useCallback(
+    async (
+      next: PendingProjectDirEntry[] | null,
+      name?: string | null,
+    ) => {
+      // `undefined` means "leave the name alone", so it resolves to what
+      // is stored; `null` clears it.
+      const nextName = name === undefined ? customName : name;
+      if (!isRealChat || !realChatId) {
+        if (!pendingKey) {
+          setError(t("projectDir.noSessionYet"));
+          return;
+        }
+        if (next && next.length > 0) {
+          setPending(pendingKey, next, nextName);
+        } else {
+          clearPending(pendingKey);
+        }
+        return;
+      }
+      setSaving(true);
+      setError(null);
+      try {
+        if (next && next.length > 0) {
+          setInfo(
+            await chatApi.setProjectDirs(realChatId, next, nextName),
+          );
+        } else {
+          setInfo(await chatApi.clearProjectDirs(realChatId));
+        }
+        clearPending(pendingKey);
+      } catch (err) {
+        // Surface the server's 422 (e.g. "Not a directory") instead of
+        // closing the panel as if it had worked.
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setSaving(false);
+      }
+    },
+    [
+      realChatId,
+      isRealChat,
+      pendingKey,
+      customName,
+      setPending,
+      clearPending,
+      t,
+    ],
+  );
+
+  /** Commit a rename of the project itself (not of a directory). */
+  const commitProjectName = (raw: string) => {
+    const name = raw.trim();
+    setProjectNameDraft(undefined);
+    // Blank, or unchanged from what the primary directory already implies:
+    // store nothing so the name keeps tracking the directory.
+    const nextName = !name || name === derivedName ? null : name;
+    if (customName === nextName) return;
+    if (entries.length === 0) return;
+    void commit(toPayload(entries), nextName);
+  };
+
+  const toPayload = (list: ChatProjectDirEntry[]): PendingProjectDirEntry[] =>
+    list.map((entry) => ({ path: entry.path, label: entry.label ?? null }));
+
+  const makePrimary = (index: number) => {
+    if (index <= 0 || index >= entries.length) return;
+    const next = [...entries];
+    const [moved] = next.splice(index, 1);
+    next.unshift(moved);
+    void commit(toPayload(next));
+  };
+
+  const removeAt = (index: number) => {
+    const next = entries.filter((_, i) => i !== index);
+    // Removing the last entry is the same as restoring the default: the
+    // chat goes back to inheriting the agent list.
+    void commit(next.length > 0 ? toPayload(next) : null);
+  };
+
+  const setNameDraft = (path: string, value: string) =>
+    setNameDrafts((prev) => ({ ...prev, [path]: value }));
+
+  const clearNameDraft = (path: string) =>
+    setNameDrafts((prev) => {
+      if (!(path in prev)) return prev;
+      const next = { ...prev };
+      delete next[path];
+      return next;
+    });
+
+  /**
+   * Rename by editing the entry's label. A blank name clears the label so
+   * the row falls back to the folder's own basename, which is how a rename
+   * is undone.
+   */
+  const renameAt = (index: number, rawName: string) => {
+    const entry = entries[index];
+    if (!entry) return;
+    const name = rawName.trim();
+    const nextLabel = name && name !== basename(entry.path) ? name : null;
+    if ((entry.label ?? null) === nextLabel) return;
+    const next = toPayload(entries);
+    next[index] = { ...next[index], label: nextLabel };
+    void commit(next);
+  };
+
+  // Reset half-typed names when the panel closes: reopening should show
+  // what is actually bound, not a stale edit.
+  useEffect(() => {
+    if (open) return;
+    setNameDrafts({});
+    setProjectNameDraft(undefined);
+  }, [open]);
+
+  // Probe once the panel is first opened, not on mount: an unopened
+  // selector should cost no requests.
+  useEffect(() => {
+    if (!open || nativePicker !== undefined) return;
+    let alive = true;
+    void isNativeDirectoryPickerAvailable().then((ok) => {
+      if (alive) setNativePicker(ok);
+    });
+    return () => {
+      alive = false;
+    };
+  }, [open, nativePicker]);
+
+  const addPath = async (path: string) => {
+    if (entries.some((entry) => samePath(entry.path, path))) {
+      setError(t("projectDir.duplicate"));
+      return;
+    }
+    // Added unnamed: renaming is a separate, optional gesture on the row.
+    await commit([...toPayload(entries), { path, label: null }]);
+  };
+
+  /** Open the OS folder chooser and add whatever comes back. */
+  const chooseNative = async () => {
+    setError(null);
+    try {
+      const picked = await pickDirectory({
+        title: t("projectDir.pickTitle"),
+        defaultPath: primary?.path,
+      });
+      if (picked === PICK_CANCELLED) return;
+      await addPath(picked);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+      setNativePicker(false);
+    }
+  };
+
+  const restoreDefault = async () => {
+    await commit(null);
+    setOpen(false);
+  };
 
   const panel = (
     <div className={styles.panel}>
       <div>
         <div className={styles.panelTitle}>{t("projectDir.title")}</div>
-        <div className={styles.panelHint}>{t("projectDir.hint")}</div>
+        <div className={styles.panelHint}>{t("projectDir.listHint")}</div>
       </div>
 
-      <div className={styles.currentBox}>
-        <span className={styles.currentLabel}>
-          {isPending
-            ? t("projectDir.sourcePending")
-            : isSession
-              ? t("projectDir.sourceSession")
-              : t("projectDir.sourceAgent")}
-        </span>
-        {effectivePath || "—"}
-      </div>
-
-      {missing ? (
-        <div className={styles.missingNotice}>
-          <AlertTriangle size={13} />
-          <span>{t("projectDir.unavailable")}</span>
+      {entries.length > 0 ? (
+        <ul className={styles.dirList}>
+          {entries.map((entry, index) => {
+            const isPrimary = index === 0;
+            // An uncommitted edit wins; otherwise the label, and finally
+            // the folder's own name. A label *is* the display name here,
+            // so clearing the field falls back to the basename.
+            const displayName =
+              nameDrafts[entry.path] ?? (entry.label || basename(entry.path));
+            return (
+              <li
+                className={styles.dirRow}
+                data-missing={!pending && !entry.exists}
+                data-primary={isPrimary}
+                key={entry.path}
+              >
+                <div className={styles.dirMain}>
+                  <span className={styles.dirName}>
+                    <Folder size={12} />
+                    {/* Always a real input, never a span that turns into
+                        one on double-click: an affordance you have to
+                        discover is one most people never find. Borderless
+                        until hover/focus so a list of them still reads as
+                        a list rather than a form. */}
+                    <Input
+                      aria-label={t("projectDir.renameAria")}
+                      className={styles.nameInput}
+                      disabled={saving}
+                      maxLength={50}
+                      onBlur={() => {
+                        renameAt(index, displayName);
+                        clearNameDraft(entry.path);
+                      }}
+                      onChange={(e) =>
+                        setNameDraft(entry.path, e.target.value)
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key !== "Escape") return;
+                        // Revert, and keep the key from also closing the
+                        // popover out from under the user. Deliberately no
+                        // blur(): it fires synchronously, so onBlur would
+                        // still see the pre-revert value in its closure and
+                        // save the text we just discarded. Leaving focus in
+                        // place also matches how revert normally behaves —
+                        // and a later blur is harmless, because the value
+                        // then equals what is already stored.
+                        e.stopPropagation();
+                        clearNameDraft(entry.path);
+                      }}
+                      onPressEnter={(e) =>
+                        (e.target as HTMLInputElement).blur()
+                      }
+                      size="small"
+                      title={t("projectDir.renameHint")}
+                      value={displayName}
+                      variant="borderless"
+                    />
+                    {!pending && !entry.exists ? (
+                      <span className={styles.missingTag}>
+                        <AlertTriangle size={10} />
+                        {t("projectDir.unavailable")}
+                      </span>
+                    ) : null}
+                  </span>
+                  <span className={styles.dirPath} title={entry.path}>
+                    {entry.path}
+                  </span>
+                </div>
+                <div className={styles.dirActions}>
+                  {/* One slot, two states, same width: the label reads
+                      "Primary" on the current one and "Make primary" on
+                      the others, so nothing shifts when the choice moves.
+                      The primary label stays lit; the others appear on
+                      hover so the list reads quietly at rest. */}
+                  {isPrimary ? (
+                    <span className={styles.primaryLabel}>
+                      {t("projectDir.primaryTag")}
+                    </span>
+                  ) : (
+                    <Button
+                      className={styles.makePrimaryBtn}
+                      disabled={saving}
+                      onClick={() => makePrimary(index)}
+                      size="small"
+                      type="text"
+                    >
+                      {t("projectDir.makePrimary")}
+                    </Button>
+                  )}
+                  <Button
+                    aria-label={t("projectDir.remove")}
+                    disabled={saving}
+                    icon={<X size={13} />}
+                    onClick={() => removeAt(index)}
+                    size="small"
+                    title={t("projectDir.remove")}
+                    type="text"
+                  />
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      ) : (
+        <div className={styles.emptyState}>
+          {loading ? (
+            <LoaderCircle size={14} />
+          ) : (
+            t("projectDir.unbound")
+          )}
         </div>
-      ) : null}
+      )}
 
-      <div className={styles.browseRow}>
-        <Input
-          aria-label={t("projectDir.inputAria")}
-          onChange={(e) => setDraft(e.target.value)}
-          onPressEnter={() => void apply()}
-          placeholder={t("projectDir.placeholder")}
-          size="small"
-          value={draft}
-        />
-        <Button
-          aria-expanded={browsing}
-          icon={<FolderSearch size={13} />}
-          onClick={() => setBrowsing((v) => !v)}
-          size="small"
-          title={t("projectDir.browse")}
-          type={browsing ? "primary" : "default"}
-        />
+      <div className={styles.addSection}>
+        {nativePicker === false ? (
+          // Nothing can open a dialog here (remote console / headless
+          // host), so say why instead of showing a button that fails.
+          <div className={styles.panelHint}>
+            {t("projectDir.pickerUnavailable")}
+          </div>
+        ) : (
+          <Button
+            block
+            disabled={saving || nativePicker === undefined}
+            icon={<FolderOpen size={14} />}
+            loading={saving}
+            onClick={() => void chooseNative()}
+            size="small"
+            type="primary"
+          >
+            {t("projectDir.chooseFolder")}
+          </Button>
+        )}
       </div>
-
-      {browsing ? (
-        <>
-          <div className={styles.browseToolbar}>
-            <Button
-              icon={<Home size={12} />}
-              onClick={() => go("~")}
-              size="small"
-              title={t("projectDir.browseHome")}
-              type="text"
-            />
-            <Button
-              // Plain navigate: re-reading a listing is not a selection, so
-              // it must not move the draft.
-              icon={<RotateCcw size={12} />}
-              onClick={() => browser.navigate(browser.path)}
-              size="small"
-              title={t("projectDir.browseRefresh")}
-              type="text"
-            />
-            <Button
-              icon={
-                browser.showHidden ? <Eye size={12} /> : <EyeOff size={12} />
-              }
-              onClick={() => browser.setShowHidden((v) => !v)}
-              size="small"
-              title={t("projectDir.browseHidden")}
-              type={browser.showHidden ? "primary" : "text"}
-            />
-          </div>
-
-          <div className={styles.browsePath} title={browser.data?.current}>
-            {browser.data?.current ?? browser.path}
-          </div>
-
-          <div className={styles.browseList}>
-            {browser.loading ? (
-              <div className={styles.browseEmpty}>
-                {t("projectDir.browseLoading")}
-              </div>
-            ) : browser.error ? (
-              <div className={styles.browseEmpty}>{browser.error}</div>
-            ) : (
-              <>
-                {browser.data?.parent ? (
-                  <button
-                    className={styles.browseItem}
-                    onClick={() => go(browser.data!.parent!)}
-                    type="button"
-                  >
-                    <Folder size={13} />
-                    <span className={styles.browseItemName}>..</span>
-                  </button>
-                ) : null}
-                {browser.data?.dirs.map((dir) => (
-                  <button
-                    className={styles.browseItem}
-                    key={dir.path}
-                    onClick={() => go(dir.path)}
-                    type="button"
-                  >
-                    <Folder size={13} />
-                    <span className={styles.browseItemName}>{dir.name}</span>
-                    <ChevronRight size={12} />
-                  </button>
-                ))}
-                {!browser.data?.dirs.length && !browser.data?.parent ? (
-                  <div className={styles.browseEmpty}>
-                    {t("projectDir.browseEmpty")}
-                  </div>
-                ) : null}
-              </>
-            )}
-          </div>
-        </>
-      ) : null}
 
       {error ? <div className={styles.errorNotice}>{error}</div> : null}
 
       <div className={styles.actions}>
         <Button
-          disabled={saving || !draft.trim() || draft.trim() === info?.project_dir}
-          loading={saving}
-          onClick={() => void apply()}
-          size="small"
-          type="primary"
-        >
-          {t("projectDir.apply")}
-        </Button>
-        <Button
           disabled={saving || (!isSession && !pending)}
-          onClick={() => void inherit()}
+          icon={<RotateCcw size={12} />}
+          onClick={() => void restoreDefault()}
           size="small"
         >
-          {t("projectDir.inherit")}
+          {t("projectDir.restoreDefault")}
         </Button>
       </div>
-
-      {info?.agent_project_dir && isSession ? (
-        <div className={styles.panelHint}>
-          {t("projectDir.agentDefault", { path: info.agent_project_dir })}
-        </div>
-      ) : null}
     </div>
   );
 
   // The trigger uses a native `title` rather than an antd <Tooltip>:
   // nesting Tooltip and Popover around the same child makes both attach
   // handlers to it, and the hover-opened tooltip swallows the click that
-  // should open the panel. The full path also appears inside the panel.
+  // should open the panel. The full paths also appear inside the panel.
   //
   // Popover requires exactly one child, so keep this comment out of the
   // JSX body — a `{/* ... */}` there turns children into an array.
   return (
-    <Popover
-      arrow={false}
-      content={panel}
-      onOpenChange={setOpen}
-      open={open}
-      overlayClassName={styles.popover}
-      placement="topLeft"
-      trigger="click"
+    <div
+      className={styles.card}
+      data-missing={primaryMissing}
+      data-pending={isPending}
+      data-source={isPending ? "pending" : (info?.source ?? "")}
     >
-      <button
-        aria-expanded={open}
-        aria-haspopup="dialog"
-        aria-label={t("projectDir.triggerAria", {
-          path: effectivePath,
-        })}
-        className={styles.trigger}
-        data-missing={missing}
-        data-pending={isPending}
-        data-source={isPending ? "pending" : (info?.source ?? "")}
-        title={effectivePath}
-        type="button"
-      >
-        {loading && !info ? (
-          <LoaderCircle size={13} />
-        ) : missing ? (
-          <AlertTriangle size={13} />
-        ) : (
-          <Folder size={13} />
-        )}
-        <span className={styles.triggerLabel}>{label}</span>
-        <span className={styles.sourceTag}>
-          {isPending
-            ? t("projectDir.tagPending")
-            : isSession
-              ? t("projectDir.tagSession")
-              : t("projectDir.tagInherited")}
+      <span className={styles.cardLabel}>{t("projectDir.title")}</span>
+
+      {loading && !info ? (
+        <LoaderCircle className={styles.spin} size={13} />
+      ) : primaryMissing ? (
+        <AlertTriangle size={13} />
+      ) : (
+        <Folder size={13} />
+      )}
+
+      {entries.length > 0 ? (
+        // Editable while collapsed: naming a project is the common case and
+        // should not require opening the panel first.
+        <Input
+          aria-label={t("projectDir.projectNameLabel")}
+          className={styles.cardNameInput}
+          disabled={saving}
+          maxLength={60}
+          onBlur={(e) => commitProjectName(e.target.value)}
+          onChange={(e) => setProjectNameDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key !== "Escape") return;
+            e.stopPropagation();
+            setProjectNameDraft(undefined);
+          }}
+          onPressEnter={(e) => (e.target as HTMLInputElement).blur()}
+          placeholder={derivedName}
+          size="small"
+          title={primary?.path}
+          value={projectName ?? ""}
+          variant="borderless"
+        />
+      ) : (
+        <span className={styles.cardUnbound}>
+          {t("projectDir.unboundShort")}
         </span>
-        <ChevronDown size={12} />
-      </button>
-    </Popover>
+      )}
+
+      {entries.length > 1 ? (
+        <span className={styles.countTag} title={t("projectDir.countTitle")}>
+          ·{entries.length}
+        </span>
+      ) : null}
+
+      <span className={styles.sourceTag}>
+        {isPending
+          ? t("projectDir.tagPending")
+          : isSession
+            ? t("projectDir.tagSession")
+            : t("projectDir.tagInherited")}
+      </span>
+
+      {/* The chevron is the popover trigger, not the whole card: the name
+          field lives in the card and must be typeable without opening the
+          panel. Popover also takes exactly one child. */}
+      <Popover
+        arrow={false}
+        content={panel}
+        onOpenChange={setOpen}
+        open={open}
+        overlayClassName={styles.popover}
+        placement="topLeft"
+        trigger="click"
+      >
+        <button
+          aria-expanded={open}
+          aria-haspopup="dialog"
+          aria-label={t("projectDir.manageAria")}
+          className={styles.cardToggle}
+          title={t("projectDir.manageAria")}
+          type="button"
+        >
+          <ChevronDown size={13} />
+        </button>
+      </Popover>
+    </div>
   );
 }

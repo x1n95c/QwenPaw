@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Verify the workspace / project-dir split against a live sandbox.
+"""Verify the workspace / project-dirs split against a live sandbox.
 
 Run this after ``scripts/dev_sandbox_workspace.py`` and after exporting
 ``QWENPAW_WORKING_DIR``. It drives the real resolver, the real ContextVars
 and the real tool entry points — no mocks — and reports pass/fail per
-behaviour described in ``docs/project_dir.md``.
+behaviour of the project-dirs model (ordered list, index 0 = primary).
 
     eval "$(python scripts/dev_sandbox_workspace.py --print-env-only)"
     python scripts/dev_check_project_dir.py
@@ -77,52 +77,71 @@ def test_resolver_precedence() -> None:
         SOURCE_FORK,
         SOURCE_SESSION,
         SOURCE_WORKSPACE_FALLBACK,
-        resolve_effective_project_dir,
+        resolve_effective_project_dirs,
     )
 
     ws = "/tmp/ws"
-    r = resolve_effective_project_dir(workspace_dir=ws)
+    r = resolve_effective_project_dirs(workspace_dir=ws)
     check(
-        "no config -> workspace fallback",
-        r.source == SOURCE_WORKSPACE_FALLBACK and str(r.path) == ws,
+        "no config -> workspace fallback (empty list)",
+        r.source == SOURCE_WORKSPACE_FALLBACK
+        and r.dirs == ()
+        and str(r.primary_path) == ws,
         f"got {r}",
     )
 
-    r = resolve_effective_project_dir(
+    r = resolve_effective_project_dirs(
         workspace_dir=ws,
-        agent_project_dir="/tmp/agent",
-    )
-    check("agent default wins over fallback", r.source == SOURCE_AGENT, str(r))
-
-    r = resolve_effective_project_dir(
-        workspace_dir=ws,
-        agent_project_dir="/tmp/agent",
-        session_project_dir="/tmp/session",
+        agent_project_dirs=[{"path": "/tmp/agent", "label": "main"}],
     )
     check(
-        "session override wins over agent",
-        r.source == SOURCE_SESSION and str(r.path) == "/tmp/session",
+        "agent default wins over fallback (label kept)",
+        r.source == SOURCE_AGENT and r.dirs[0].label == "main",
         str(r),
     )
 
-    r = resolve_effective_project_dir(
+    r = resolve_effective_project_dirs(
         workspace_dir=ws,
-        agent_project_dir="/tmp/agent",
-        session_project_dir="/tmp/session",
+        agent_project_dirs=[{"path": "/tmp/agent"}],
+        session_project_dirs=[{"path": "/tmp/session"}],
+    )
+    check(
+        "session override wins over agent",
+        r.source == SOURCE_SESSION
+        and str(r.primary_path) == "/tmp/session",
+        str(r),
+    )
+
+    r = resolve_effective_project_dirs(
+        workspace_dir=ws,
+        agent_project_dirs=[{"path": "/tmp/agent"}],
+        session_project_dirs=[{"path": "/tmp/session"}],
         request_override="/tmp/acp",
-        mode_override="/tmp/mission",
+        mode_override=[{"path": "/tmp/mission"}],
         fork_project_dir="/tmp/worktree",
     )
     check(
         "fork override beats every other source",
-        r.source == SOURCE_FORK and str(r.path) == "/tmp/worktree",
+        r.source == SOURCE_FORK and str(r.primary_path) == "/tmp/worktree",
         str(r),
     )
 
-    r = resolve_effective_project_dir(
+    r = resolve_effective_project_dirs(
         workspace_dir=ws,
-        agent_project_dir="  ",
-        session_project_dir="",
+        agent_project_dirs=[{"path": "/tmp/agent"}],
+        fork_project_dir="/tmp/worktree",
+    )
+    check(
+        "fork replaces the primary but keeps the rest",
+        [str(e.path) for e in r.dirs]
+        == [str(Path("/tmp/worktree")), str(Path("/tmp/agent"))],
+        str(r),
+    )
+
+    r = resolve_effective_project_dirs(
+        workspace_dir=ws,
+        agent_project_dirs=[{"path": "  "}],
+        session_project_dirs=None,
     )
     check(
         "blank values are ignored, not treated as a path",
@@ -130,23 +149,29 @@ def test_resolver_precedence() -> None:
         str(r),
     )
 
-    r = resolve_effective_project_dir(
+    r = resolve_effective_project_dirs(
         workspace_dir=ws,
-        agent_project_dir="/tmp/definitely/not/here",
+        agent_project_dirs=[{"path": "/tmp/definitely/not/here"}],
     )
-    check("missing dir is reported, not swallowed", r.exists is False, str(r))
+    check(
+        "missing dir is reported, not swallowed",
+        r.dirs[0].exists is False,
+        str(r),
+    )
 
 
 def test_migration(working_dir: Path) -> None:
     section("Legacy config migration")
-    from qwenpaw.config.project_dir import migrate_project_dir_in_place
+    from qwenpaw.config.project_dir import migrate_project_dirs_in_place
 
     data = {"coding_mode": {"enabled": True, "project_dir": "/tmp/legacy"}}
-    changed = migrate_project_dir_in_place(data)
+    changed = migrate_project_dirs_in_place(data)
     check(
-        "legacy value lifted to top level",
+        "legacy value lifted into project_dirs",
         changed
-        and data["project_dir"] == "/tmp/legacy"
+        and data["project_dirs"] == [
+            {"path": str(Path("/tmp/legacy")), "label": None},
+        ]
         and "project_dir" not in data["coding_mode"],
         json.dumps(data),
     )
@@ -157,18 +182,18 @@ def test_migration(working_dir: Path) -> None:
     )
     check(
         "second run is a no-op (idempotent)",
-        migrate_project_dir_in_place(data) is False,
+        migrate_project_dirs_in_place(data) is False,
         json.dumps(data),
     )
 
     data = {
-        "project_dir": "/tmp/new",
+        "project_dirs": [{"path": "/tmp/new", "label": None}],
         "coding_mode": {"project_dir": "/tmp/old"},
     }
-    migrate_project_dir_in_place(data)
+    migrate_project_dirs_in_place(data)
     check(
-        "existing top-level value wins over legacy",
-        data["project_dir"] == "/tmp/new"
+        "existing list wins over legacy",
+        data["project_dirs"] == [{"path": "/tmp/new", "label": None}]
         and "project_dir" not in data["coding_mode"],
         json.dumps(data),
     )
@@ -183,13 +208,13 @@ def test_migration(working_dir: Path) -> None:
         check(
             "loading the legacy agent migrates agent.json on disk",
             "project_dir" not in on_disk.get("coding_mode", {})
-            and bool(on_disk.get("project_dir")),
+            and bool(on_disk.get("project_dirs")),
             json.dumps(on_disk.get("coding_mode")),
         )
         check(
-            "migrated config resolves the project dir",
-            bool(cfg.project_dir),
-            f"project_dir={cfg.project_dir!r}",
+            "migrated config resolves the project dirs",
+            bool(cfg.project_dirs),
+            f"project_dirs={cfg.project_dirs!r}",
         )
 
 
@@ -215,12 +240,12 @@ def test_tool_base_dir(working_dir: Path) -> None:
 
     set_current_project_dir(project)
     check(
-        "project dir set -> base is the project",
+        "primary project dir set -> base is the project",
         get_tool_base_dir() == project,
         str(get_tool_base_dir()),
     )
     check(
-        "relative read path resolves into the project",
+        "relative read path resolves into the primary project",
         _resolve_file_path("PROJECT_MARKER.txt")
         == str(project / "PROJECT_MARKER.txt"),
         _resolve_file_path("PROJECT_MARKER.txt"),
@@ -271,7 +296,7 @@ def test_shell_default_cwd(working_dir: Path) -> None:
     try:
         out = asyncio.run(_run("pwd"))
         check(
-            "bare command runs in the project dir",
+            "bare command runs in the primary project dir",
             str(project) in out or str(project.resolve()) in out,
             out.strip()[:200],
         )
@@ -288,18 +313,21 @@ def test_shell_default_cwd(working_dir: Path) -> None:
         set_current_workspace_dir(None)
 
 
-def test_governance_placeholders() -> None:
-    section("Governance placeholders")
+def test_governance_registration() -> None:
+    section("Governance registration")
     from qwenpaw.governance.policy import (
         GovernanceAction,
+        ToolCallSpec,
         _create_default_policy,
     )
 
     ws = "/tmp/gov-ws"
     project = "/tmp/gov-project"
+    extra = "/tmp/gov-extra"
     policy = _create_default_policy(
         workspace_dir=ws,
         coding_project_dir=project,
+        extra_project_dirs=[extra],
     )
     unresolved = [
         rule.match
@@ -312,20 +340,28 @@ def test_governance_placeholders() -> None:
         str(unresolved),
     )
 
-    from qwenpaw.governance.policy import ToolCallSpec
-
     def _tc(tool: str, target: str) -> ToolCallSpec:
         return ToolCallSpec(tool, target, "agent", "session")
 
     check(
-        "writes inside the project dir are allowed",
+        "writes inside the primary project dir are allowed",
         policy.evaluate(_tc("Write", f"{project}/src/x.py")).action
+        is GovernanceAction.ALLOW,
+    )
+    check(
+        "writes inside an EXTRA project dir are allowed",
+        policy.evaluate(_tc("Write", f"{extra}/src/x.py")).action
         is GovernanceAction.ALLOW,
     )
     check(
         "writes inside the workspace are allowed",
         policy.evaluate(_tc("Write", f"{ws}/notes.md")).action
         is GovernanceAction.ALLOW,
+    )
+    check(
+        "writes outside every granted dir are not auto-allowed",
+        policy.evaluate(_tc("Write", "/tmp/gov-unrelated/x.py")).action
+        is not GovernanceAction.ALLOW,
     )
 
 
@@ -372,20 +408,19 @@ def test_session_override_across_turns(working_dir: Path) -> None:
     """
     section("Session override across turns")
 
-    import asyncio
-
     from qwenpaw.app.channels.schema import DEFAULT_CHANNEL
     from qwenpaw.app.chats.manager import ChatManager
     from qwenpaw.app.chats.repo import JsonChatRepository
-    from qwenpaw.config.project_dir import resolve_effective_project_dir
+    from qwenpaw.config.project_dir import resolve_effective_project_dirs
     from qwenpaw.hooks.request_setup.contextvars_hook import (
-        _session_project_dir,
+        _session_project_dirs,
     )
 
     workspace = working_dir / "workspaces" / "default"
     agent_default = working_dir.parent / "project"
     session_project = working_dir.parent / "session-project"
     session_project.mkdir(parents=True, exist_ok=True)
+    session_entries = [{"path": str(session_project), "label": None}]
 
     class _Ctx:
         def __init__(self, manager: object) -> None:
@@ -406,20 +441,22 @@ def test_session_override_across_turns(working_dir: Path) -> None:
             "devcheck",
             DEFAULT_CHANNEL,
         )
-        await manager.set_session_project_dir(chat.id, str(session_project))
+        await manager.set_session_project_dirs(chat.id, session_entries)
         ctx = _Ctx(manager)
 
         check(
             "hook reads back the override just set",
-            await _session_project_dir(ctx) == str(session_project),
+            await _session_project_dirs(ctx) == session_entries,
         )
 
         all_session = True
         for _ in range(4):
-            resolved = resolve_effective_project_dir(
+            resolved = resolve_effective_project_dirs(
                 workspace_dir=str(workspace),
-                agent_project_dir=str(agent_default),
-                session_project_dir=await _session_project_dir(ctx),
+                agent_project_dirs=[
+                    {"path": str(agent_default), "label": None},
+                ],
+                session_project_dirs=await _session_project_dirs(ctx),
             )
             if resolved.source != "session":
                 all_session = False
@@ -433,14 +470,16 @@ def test_session_override_across_turns(working_dir: Path) -> None:
         reloaded = ChatManager(repo=JsonChatRepository(repo_path))
         check(
             "override survives a manager restart",
-            await _session_project_dir(_Ctx(reloaded)) == str(session_project),
+            await _session_project_dirs(_Ctx(reloaded)) == session_entries,
         )
 
-        await manager.set_session_project_dir(chat.id, None)
-        resolved = resolve_effective_project_dir(
+        await manager.set_session_project_dirs(chat.id, None)
+        resolved = resolve_effective_project_dirs(
             workspace_dir=str(workspace),
-            agent_project_dir=str(agent_default),
-            session_project_dir=await _session_project_dir(ctx),
+            agent_project_dirs=[
+                {"path": str(agent_default), "label": None},
+            ],
+            session_project_dirs=await _session_project_dirs(ctx),
         )
         check(
             "clearing returns to the agent default",
@@ -458,9 +497,9 @@ def test_session_override_across_turns(working_dir: Path) -> None:
 def test_state_stays_out_of_the_project(working_dir: Path) -> None:
     """Mission and fork bookkeeping must not land in the user's repo.
 
-    The project dir is where the agent *works*; it is not a place to keep
-    agent state. Fork checkouts are ~100 MB each and are never cleaned up,
-    so this invariant is the difference between a clean repository and
+    The project dirs are where the agent *works*; they are not a place to
+    keep agent state. Fork checkouts are ~100 MB each and are never cleaned
+    up, so this invariant is the difference between a clean repository and
     tens of gigabytes of dead worktrees inside it.
     """
     section("Agent state stays out of the project")
@@ -556,7 +595,7 @@ def main() -> int:
     test_migration(working_dir)
     test_tool_base_dir(working_dir)
     test_shell_default_cwd(working_dir)
-    test_governance_placeholders()
+    test_governance_registration()
     test_workspace_not_repointed(working_dir)
     test_session_override_across_turns(working_dir)
     test_state_stays_out_of_the_project(working_dir)

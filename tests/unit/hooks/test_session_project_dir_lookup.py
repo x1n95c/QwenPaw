@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Reading the persisted per-chat project override on every turn.
+"""Reading the persisted per-chat project-dirs override on every turn.
 
 Regression cover for a bug where the override applied only to the turn that
 set it: the lookup called ``get_chat_id_by_session()`` with the wrong
@@ -9,11 +9,12 @@ every later turn silently fell back to the agent default.
 # pylint: disable=protected-access
 from __future__ import annotations
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from qwenpaw.hooks.request_setup.contextvars_hook import _session_project_dir
+from qwenpaw.hooks.request_setup.contextvars_hook import _session_project_dirs
 
 
 class _ChatManager:
@@ -46,29 +47,34 @@ def _ctx(chat_manager, *, session_id="console:u1", channel="console"):
     )
 
 
-def _chat(project_dir: str | None):
+def _chat(entries: list[dict] | None):
     meta = {}
-    if project_dir:
-        meta["runtime_context"] = {"project_dir": project_dir}
+    if entries is not None:
+        meta["runtime_context"] = {"project_dirs": entries}
     return SimpleNamespace(id="chat-1", meta=meta)
+
+
+_CHOSEN = [{"path": "/repos/chosen", "label": None}]
 
 
 @pytest.mark.asyncio
 async def test_reads_the_persisted_override():
     """The whole point: this must work on turn 2, 3, 4 … not just turn 1."""
-    manager = _ChatManager(_chat("/repos/chosen"))
+    manager = _ChatManager(_chat(_CHOSEN))
 
-    result = await _session_project_dir(_ctx(manager))
+    result = await _session_project_dirs(_ctx(manager))
 
-    assert result == "/repos/chosen"
+    assert result == [
+        {"path": str(Path("/repos/chosen")), "label": None},
+    ]
 
 
 @pytest.mark.asyncio
 async def test_passes_channel_to_the_lookup():
     """`channel` is a required positional arg; omitting it raised TypeError."""
-    manager = _ChatManager(_chat("/repos/chosen"))
+    manager = _ChatManager(_chat(_CHOSEN))
 
-    await _session_project_dir(_ctx(manager, channel="console"))
+    await _session_project_dirs(_ctx(manager, channel="console"))
 
     assert manager.lookup_calls == [("console:u1", "console", "u1")]
 
@@ -76,19 +82,19 @@ async def test_passes_channel_to_the_lookup():
 @pytest.mark.asyncio
 async def test_returns_none_when_chat_has_no_override():
     manager = _ChatManager(_chat(None))
-    assert await _session_project_dir(_ctx(manager)) is None
+    assert await _session_project_dirs(_ctx(manager)) is None
 
 
 @pytest.mark.asyncio
 async def test_returns_none_when_no_chat_matches():
     manager = _ChatManager(None)
-    assert await _session_project_dir(_ctx(manager)) is None
+    assert await _session_project_dirs(_ctx(manager)) is None
 
 
 @pytest.mark.asyncio
 async def test_returns_none_without_a_session_id():
-    manager = _ChatManager(_chat("/repos/chosen"))
-    assert await _session_project_dir(_ctx(manager, session_id="")) is None
+    manager = _ChatManager(_chat(_CHOSEN))
+    assert await _session_project_dirs(_ctx(manager, session_id="")) is None
 
 
 @pytest.mark.asyncio
@@ -98,7 +104,23 @@ async def test_returns_none_without_a_chat_manager():
         workspace=SimpleNamespace(chat_manager=None),
         request=SimpleNamespace(channel="console", user_id="u1"),
     )
-    assert await _session_project_dir(ctx) is None
+    assert await _session_project_dirs(ctx) is None
+
+
+@pytest.mark.asyncio
+async def test_legacy_single_value_is_wrapped():
+    """Draft-era chats stored one path under project_dir."""
+    chat = SimpleNamespace(
+        id="chat-1",
+        meta={"runtime_context": {"project_dir": "/repos/legacy"}},
+    )
+    manager = _ChatManager(chat)
+
+    result = await _session_project_dirs(_ctx(manager))
+
+    assert result == [
+        {"path": str(Path("/repos/legacy")), "label": None},
+    ]
 
 
 @pytest.mark.asyncio
@@ -113,7 +135,7 @@ async def test_lookup_failure_is_logged_loudly(caplog):
             raise RuntimeError("repo unavailable")
 
     with caplog.at_level("WARNING"):
-        result = await _session_project_dir(_ctx(_Broken()))
+        result = await _session_project_dirs(_ctx(_Broken()))
 
     assert result is None
     assert any(
@@ -124,14 +146,16 @@ async def test_lookup_failure_is_logged_loudly(caplog):
 @pytest.mark.asyncio
 async def test_missing_channel_falls_back_to_default_channel():
     """Cron/heartbeat turns may not carry a channel on the request."""
-    manager = _ChatManager(_chat("/repos/chosen"))
+    manager = _ChatManager(_chat(_CHOSEN))
     ctx = SimpleNamespace(
         session_id="console:u1",
         workspace=SimpleNamespace(chat_manager=manager),
         request=SimpleNamespace(channel=None, user_id=None),
     )
 
-    result = await _session_project_dir(ctx)
+    result = await _session_project_dirs(ctx)
 
-    assert result == "/repos/chosen"
+    assert result == [
+        {"path": str(Path("/repos/chosen")), "label": None},
+    ]
     assert manager.lookup_calls[0][1], "a channel must still be supplied"

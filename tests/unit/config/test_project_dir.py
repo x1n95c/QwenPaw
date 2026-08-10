@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Effective project-directory resolution, normalization and migration."""
+"""Effective project-directory LIST resolution, normalization, migration.
+
+The model: an ordered list where index 0 is the PRIMARY directory
+(relative paths / shell cwd resolve there) and the rest are extra
+directories granted by governance and addressed by absolute path.
+"""
 
 from __future__ import annotations
 
@@ -9,95 +14,132 @@ from pathlib import Path
 import pytest
 
 from qwenpaw.config.project_dir import (
+    MAX_PROJECT_DIRS,
     SOURCE_AGENT,
     SOURCE_FORK,
     SOURCE_MODE,
     SOURCE_REQUEST,
     SOURCE_SESSION,
     SOURCE_WORKSPACE_FALLBACK,
-    agent_project_dir_from_config,
+    agent_primary_project_dir_from_config,
+    agent_project_dirs_from_config,
     describe_for_audit,
     is_within,
-    migrate_project_dir_in_place,
+    migrate_project_dirs_in_place,
     normalize_project_dir,
-    resolve_effective_project_dir,
+    normalize_project_dir_list,
+    resolve_effective_project_dirs,
     same_dir,
-    session_project_dir_from_meta,
+    session_project_dirs_from_meta,
 )
 
 _WS = "/tmp/qwenpaw-test-ws"
+
+
+def _paths(resolved) -> list[str]:
+    return [str(entry.path) for entry in resolved.dirs]
 
 
 class TestResolverPrecedence:
     """fork > mode > request > session > agent > workspace_fallback."""
 
     def test_nothing_configured_falls_back_to_workspace(self):
-        resolved = resolve_effective_project_dir(workspace_dir=_WS)
+        resolved = resolve_effective_project_dirs(workspace_dir=_WS)
         assert resolved.source == SOURCE_WORKSPACE_FALLBACK
-        assert str(resolved.path) == _WS
         assert resolved.is_workspace_fallback is True
+        assert resolved.dirs == ()
+        # The primary is the workspace, but it is NOT listed as a
+        # project dir — tools fall back, the UI shows the empty state.
+        assert str(resolved.primary_path) == _WS
 
     def test_agent_default_beats_fallback(self):
-        resolved = resolve_effective_project_dir(
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/agent-proj",
+            agent_project_dirs=[{"path": "/tmp/agent-proj"}],
         )
         assert resolved.source == SOURCE_AGENT
-        assert str(resolved.path) == "/tmp/agent-proj"
+        assert _paths(resolved) == [str(Path("/tmp/agent-proj"))]
 
-    def test_session_beats_agent(self):
-        resolved = resolve_effective_project_dir(
+    def test_session_beats_agent_wholesale(self):
+        """Session override replaces the whole list — no merging."""
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/agent-proj",
-            session_project_dir="/tmp/session-proj",
+            agent_project_dirs=[
+                {"path": "/tmp/agent-a"},
+                {"path": "/tmp/agent-b"},
+            ],
+            session_project_dirs=[{"path": "/tmp/session-proj"}],
         )
         assert resolved.source == SOURCE_SESSION
-        assert str(resolved.path) == "/tmp/session-proj"
+        assert _paths(resolved) == [str(Path("/tmp/session-proj"))]
 
-    def test_request_beats_session(self):
-        resolved = resolve_effective_project_dir(
+    def test_empty_session_list_means_explicitly_none(self):
+        """[] is not the same as absent: it clears the override target."""
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/agent-proj",
-            session_project_dir="/tmp/session-proj",
+            agent_project_dirs=[{"path": "/tmp/agent-proj"}],
+            session_project_dirs=[],
+        )
+        assert resolved.source == SOURCE_SESSION
+        assert resolved.dirs == ()
+
+    def test_request_becomes_primary_and_keeps_rest(self):
+        resolved = resolve_effective_project_dirs(
+            workspace_dir=_WS,
+            agent_project_dirs=[{"path": "/tmp/agent-proj"}],
+            session_project_dirs=[{"path": "/tmp/session-proj"}],
             request_override="/tmp/acp-proj",
         )
         assert resolved.source == SOURCE_REQUEST
-        assert str(resolved.path) == "/tmp/acp-proj"
+        assert _paths(resolved) == [
+            str(Path("/tmp/acp-proj")),
+            str(Path("/tmp/session-proj")),
+        ]
 
-    def test_mode_beats_request(self):
-        resolved = resolve_effective_project_dir(
+    def test_mode_pin_replaces_the_whole_list(self):
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/agent-proj",
-            session_project_dir="/tmp/session-proj",
+            agent_project_dirs=[{"path": "/tmp/agent-proj"}],
+            session_project_dirs=[{"path": "/tmp/session-proj"}],
             request_override="/tmp/acp-proj",
-            mode_override="/tmp/mission-proj",
+            mode_override=[{"path": "/tmp/mission-proj"}],
         )
         assert resolved.source == SOURCE_MODE
-        assert str(resolved.path) == "/tmp/mission-proj"
+        assert _paths(resolved) == [str(Path("/tmp/mission-proj"))]
 
-    def test_fork_beats_everything(self):
-        """The fork worktree is a sandbox boundary, so it must win.
-
-        If a session or agent value could override it, a forked sub-agent
-        would be able to write outside the worktree it was assigned.
+    def test_fork_replaces_primary_but_keeps_rest(self):
+        """The fork worktree is a sandbox boundary, so it must win the
+        primary slot. The remaining entries are user-configured trusted
+        paths and stay accessible.
         """
-        resolved = resolve_effective_project_dir(
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/agent-proj",
-            session_project_dir="/tmp/session-proj",
+            agent_project_dirs=[{"path": "/tmp/agent-proj"}],
+            session_project_dirs=[{"path": "/tmp/session-proj"}],
             request_override="/tmp/acp-proj",
-            mode_override="/tmp/mission-proj",
+            mode_override=[{"path": "/tmp/mission-proj"}],
             fork_project_dir="/tmp/worktree",
         )
         assert resolved.source == SOURCE_FORK
-        assert str(resolved.path) == "/tmp/worktree"
+        assert _paths(resolved) == [
+            str(Path("/tmp/worktree")),
+            str(Path("/tmp/mission-proj")),
+        ]
+
+    def test_fork_dedupes_itself_out_of_the_rest(self):
+        resolved = resolve_effective_project_dirs(
+            workspace_dir=_WS,
+            agent_project_dirs=[{"path": "/tmp/proj"}],
+            fork_project_dir="/tmp/proj",
+        )
+        assert _paths(resolved) == [str(Path("/tmp/proj"))]
 
     @pytest.mark.parametrize("blank", ["", "   ", None])
     def test_blank_values_are_skipped_not_used_as_paths(self, blank):
-        resolved = resolve_effective_project_dir(
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir=blank,
-            session_project_dir=blank,
+            agent_project_dirs=[{"path": blank}] if blank else [],
+            session_project_dirs=None,
         )
         assert resolved.source == SOURCE_WORKSPACE_FALLBACK
 
@@ -108,31 +150,113 @@ class TestResolverPrecedence:
         whatever directory the server happened to start in.
         """
         with pytest.raises(ValueError, match="workspace_dir"):
-            resolve_effective_project_dir(workspace_dir="")
+            resolve_effective_project_dirs(workspace_dir="")
 
-    def test_nonexistent_dir_is_reported_not_swallowed(self):
-        resolved = resolve_effective_project_dir(
+    def test_missing_dir_is_reported_not_swallowed(self):
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir="/tmp/definitely-not-here-12345",
+            agent_project_dirs=[{"path": "/tmp/definitely-not-here-12345"}],
         )
         assert resolved.source == SOURCE_AGENT
-        assert resolved.exists is False
+        assert resolved.dirs[0].exists is False
+        assert len(resolved.dirs) == 1
 
     def test_existing_dir_reports_exists(self, tmp_path):
-        resolved = resolve_effective_project_dir(
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir=str(tmp_path),
+            agent_project_dirs=[{"path": str(tmp_path)}],
         )
-        assert resolved.exists is True
+        assert resolved.dirs[0].exists is True
 
-    def test_file_is_not_a_valid_project_dir(self, tmp_path):
-        target = tmp_path / "a-file.txt"
-        target.write_text("x", encoding="utf-8")
-        resolved = resolve_effective_project_dir(
+    def test_labels_survive_resolution(self):
+        resolved = resolve_effective_project_dirs(
             workspace_dir=_WS,
-            agent_project_dir=str(target),
+            agent_project_dirs=[
+                {"path": "/tmp/a", "label": "backend"},
+                {"path": "/tmp/b"},
+            ],
         )
-        assert resolved.exists is False
+        assert resolved.dirs[0].label == "backend"
+        assert resolved.dirs[1].label is None
+
+    def test_primary_property_matches_first_entry(self):
+        resolved = resolve_effective_project_dirs(
+            workspace_dir=_WS,
+            agent_project_dirs=[
+                {"path": "/tmp/first"},
+                {"path": "/tmp/second"},
+            ],
+        )
+        assert resolved.primary.path == resolved.dirs[0].path
+        assert str(resolved.primary_path) == str(Path("/tmp/first"))
+
+
+class TestNormalizeList:
+    def test_order_is_preserved_index_zero_is_primary(self):
+        entries = normalize_project_dir_list(
+            ["/tmp/one", "/tmp/two", "/tmp/three"],
+        )
+        assert [str(p) for p, _ in entries] == [
+            str(Path("/tmp/one")),
+            str(Path("/tmp/two")),
+            str(Path("/tmp/three")),
+        ]
+
+    def test_duplicates_are_dropped_case_insensitively(self):
+        entries = normalize_project_dir_list(
+            [
+                {"path": "/Repo/Main", "label": "first"},
+                {"path": "/repo/main", "label": "dup"},
+                {"path": "/tmp/other"},
+            ],
+        )
+        assert len(entries) == 2
+        # The first occurrence keeps its label.
+        assert entries[0][1] == "first"
+
+    def test_accepts_strings_dicts_tuples_and_objects(self):
+        class Entry:
+            path = "/tmp/obj"
+            label = "from-object"
+
+        entries = normalize_project_dir_list(
+            [
+                "/tmp/str",
+                {"path": "/tmp/dict", "label": "d"},
+                ("/tmp/tuple", "t"),
+                Entry(),
+            ],
+        )
+        assert [str(p) for p, _ in entries] == [
+            str(Path("/tmp/str")),
+            str(Path("/tmp/dict")),
+            str(Path("/tmp/tuple")),
+            str(Path("/tmp/obj")),
+        ]
+        assert entries[1][1] == "d"
+        assert entries[3][1] == "from-object"
+
+    def test_blank_entries_are_dropped(self):
+        entries = normalize_project_dir_list(["", "  ", None, "/tmp/ok"])
+        assert len(entries) == 1
+
+    def test_cap_enforced(self):
+        raw = [f"/tmp/proj-{i}" for i in range(MAX_PROJECT_DIRS + 5)]
+        entries = normalize_project_dir_list(raw)
+        assert len(entries) == MAX_PROJECT_DIRS
+
+    def test_labels_are_trimmed_and_capped(self):
+        entries = normalize_project_dir_list(
+            [{"path": "/tmp/x", "label": "  "}],
+        )
+        assert entries[0][1] is None
+        entries = normalize_project_dir_list(
+            [{"path": "/tmp/x", "label": "y" * 80}],
+        )
+        assert len(entries[0][1]) == 50
+
+    def test_none_is_empty_list(self):
+        assert normalize_project_dir_list(None) == []
 
 
 class TestNormalize:
@@ -218,59 +342,95 @@ class TestIsWithin:
         assert is_within("/repo", None) is False
 
 
-class TestAgentProjectDirFromConfig:
+class TestAgentProjectDirsFromConfig:
     def test_none_config(self):
-        assert agent_project_dir_from_config(None) is None
+        assert agent_project_dirs_from_config(None) == []
+        assert agent_primary_project_dir_from_config(None) is None
 
-    def test_dict_top_level(self):
-        assert (
-            agent_project_dir_from_config({"project_dir": "/p"}) == "/p"
+    def test_reads_project_dirs_list(self):
+        config = {
+            "project_dirs": [
+                {"path": "/p1", "label": "main"},
+                {"path": "/p2"},
+            ],
+        }
+        entries = agent_project_dirs_from_config(config)
+        assert entries == [
+            {"path": str(Path("/p1")), "label": "main"},
+            {"path": str(Path("/p2")), "label": None},
+        ]
+        assert agent_primary_project_dir_from_config(config) == str(
+            Path("/p1"),
         )
 
-    def test_dict_legacy_fallback(self):
-        config = {"coding_mode": {"project_dir": "/legacy"}}
-        assert agent_project_dir_from_config(config) == "/legacy"
+    def test_accepts_plain_string_entries(self):
+        config = {"project_dirs": ["/only"]}
+        assert agent_primary_project_dir_from_config(config) == str(
+            Path("/only"),
+        )
 
-    def test_dict_top_level_wins(self):
-        config = {
-            "project_dir": "/new",
-            "coding_mode": {"project_dir": "/old"},
-        }
-        assert agent_project_dir_from_config(config) == "/new"
+    def test_empty_and_missing(self):
+        assert agent_project_dirs_from_config({"id": "x"}) == []
+        assert agent_project_dirs_from_config({"project_dirs": []}) == []
 
-    def test_dict_without_either(self):
-        assert agent_project_dir_from_config({"id": "x"}) is None
-
-    def test_object_top_level(self):
-        class Cfg:
-            project_dir = "/p"
-            coding_mode = None
-
-        assert agent_project_dir_from_config(Cfg()) == "/p"
-
-    def test_object_legacy_fallback(self):
-        class Cm:
-            project_dir = "/legacy"
+    def test_object_attribute_access(self):
+        class Entry:
+            def __init__(self, path, label):
+                self.path = path
+                self.label = label
 
         class Cfg:
-            project_dir = None
-            coding_mode = Cm()
+            project_dirs = [Entry("/p", None)]
 
-        assert agent_project_dir_from_config(Cfg()) == "/legacy"
+        assert agent_primary_project_dir_from_config(Cfg()) == str(
+            Path("/p"),
+        )
+
+    def test_malformed_entries_are_dropped_not_raised(self):
+        config = {"project_dirs": [{"no_path": True}, "/ok"]}
+        entries = agent_project_dirs_from_config(config)
+        assert len(entries) == 1
 
 
-class TestSessionProjectDirFromMeta:
+class TestSessionProjectDirsFromMeta:
     def test_reads_controlled_namespace(self):
-        meta = {"runtime_context": {"project_dir": "/session-proj"}}
-        assert session_project_dir_from_meta(meta) == "/session-proj"
+        meta = {
+            "runtime_context": {
+                "project_dirs": [{"path": "/s1", "label": "x"}],
+            },
+        }
+        assert session_project_dirs_from_meta(meta) == [
+            {"path": str(Path("/s1")), "label": "x"},
+        ]
+
+    def test_legacy_single_value_is_wrapped_into_a_list(self):
+        meta = {"runtime_context": {"project_dir": "/legacy"}}
+        assert session_project_dirs_from_meta(meta) == [
+            {"path": str(Path("/legacy")), "label": None},
+        ]
+
+    def test_list_wins_over_legacy_key(self):
+        meta = {
+            "runtime_context": {
+                "project_dirs": ["/new"],
+                "project_dir": "/old",
+            },
+        }
+        result = session_project_dirs_from_meta(meta)
+        assert result == [{"path": str(Path("/new")), "label": None}]
+
+    def test_empty_list_is_explicitly_none_not_inherit(self):
+        """[] was stored as "explicitly no dirs" and must round-trip."""
+        meta = {"runtime_context": {"project_dirs": []}}
+        assert session_project_dirs_from_meta(meta) == []
 
     def test_top_level_meta_key_is_ignored(self):
         """Only the controlled namespace counts.
 
         A generic meta patch from a client must not be able to set the
-        project dir as a side effect.
+        project dirs as a side effect.
         """
-        assert session_project_dir_from_meta({"project_dir": "/x"}) is None
+        assert session_project_dirs_from_meta({"project_dirs": ["/x"]}) is None
 
     @pytest.mark.parametrize(
         "meta",
@@ -285,71 +445,192 @@ class TestSessionProjectDirFromMeta:
         ],
     )
     def test_malformed_meta_returns_none(self, meta):
-        assert session_project_dir_from_meta(meta) is None
+        assert session_project_dirs_from_meta(meta) is None
 
 
 class TestMigration:
-    def test_lifts_legacy_value(self):
+    def test_lifts_legacy_coding_mode_value(self):
         data = {"coding_mode": {"enabled": True, "project_dir": "/legacy"}}
-        assert migrate_project_dir_in_place(data) is True
-        assert data["project_dir"] == "/legacy"
+        assert migrate_project_dirs_in_place(data) is True
+        assert data["project_dirs"] == [
+            {"path": str(Path("/legacy")), "label": None},
+        ]
         assert "project_dir" not in data["coding_mode"]
         assert data["coding_mode"]["enabled"] is True
 
+    def test_lifts_singular_top_level_value(self):
+        data = {"project_dir": "/single"}
+        assert migrate_project_dirs_in_place(data) is True
+        assert data["project_dirs"] == [
+            {"path": str(Path("/single")), "label": None},
+        ]
+        assert "project_dir" not in data
+
     def test_is_idempotent(self):
         data = {"coding_mode": {"project_dir": "/legacy"}}
-        assert migrate_project_dir_in_place(data) is True
-        assert migrate_project_dir_in_place(data) is False
+        assert migrate_project_dirs_in_place(data) is True
+        assert migrate_project_dirs_in_place(data) is False
 
-    def test_top_level_wins_and_legacy_dropped(self):
+    def test_existing_list_wins_and_legacy_dropped(self):
         data = {
-            "project_dir": "/new",
+            "project_dirs": [{"path": "/new", "label": None}],
+            "project_dir": "/draft",
             "coding_mode": {"project_dir": "/old"},
         }
-        assert migrate_project_dir_in_place(data) is True
-        assert data["project_dir"] == "/new"
+        assert migrate_project_dirs_in_place(data) is True
+        assert data["project_dirs"] == [
+            {"path": str(Path("/new")), "label": None},
+        ]
+        assert "project_dir" not in data
         assert "project_dir" not in data["coding_mode"]
 
-    def test_no_legacy_key_is_noop(self):
-        data = {"project_dir": "/new", "coding_mode": {"enabled": True}}
-        assert migrate_project_dir_in_place(data) is False
-        assert data["project_dir"] == "/new"
+    def test_canonical_list_is_noop(self):
+        data = {
+            "project_dirs": [
+                {"path": str(Path("/a")), "label": None},
+            ],
+        }
+        assert migrate_project_dirs_in_place(data) is False
 
-    def test_no_coding_mode_is_noop(self):
+    def test_no_legacy_key_is_noop(self):
         data = {"id": "default"}
-        assert migrate_project_dir_in_place(data) is False
-        assert "project_dir" not in data
+        assert migrate_project_dirs_in_place(data) is False
+        assert "project_dirs" not in data
 
     def test_null_legacy_value_is_just_dropped(self):
         data = {"coding_mode": {"project_dir": None}}
-        assert migrate_project_dir_in_place(data) is True
+        assert migrate_project_dirs_in_place(data) is True
         assert "project_dir" not in data["coding_mode"]
-        assert data.get("project_dir") is None
+        assert "project_dirs" not in data
 
     def test_missing_path_is_preserved_not_reset(self):
         """A stale path must migrate too, so the UI can flag it."""
         data = {"coding_mode": {"project_dir": "/gone/missing/12345"}}
-        assert migrate_project_dir_in_place(data) is True
-        assert data["project_dir"] == str(Path("/gone/missing/12345"))
+        assert migrate_project_dirs_in_place(data) is True
+        assert data["project_dirs"] == [
+            {"path": str(Path("/gone/missing/12345")), "label": None},
+        ]
 
     def test_value_is_normalized_on_migration(self):
         data = {"coding_mode": {"project_dir": "/a/b/../c"}}
-        migrate_project_dir_in_place(data)
-        assert data["project_dir"] == str(Path("/a/c"))
+        migrate_project_dirs_in_place(data)
+        assert data["project_dirs"] == [
+            {"path": str(Path("/a/c")), "label": None},
+        ]
 
     def test_non_dict_coding_mode_is_ignored(self):
         data = {"coding_mode": "nonsense"}
-        assert migrate_project_dir_in_place(data) is False
+        assert migrate_project_dirs_in_place(data) is False
 
 
 class TestDescribeForAudit:
-    def test_records_both_dirs_and_provenance(self, tmp_path):
-        resolved = resolve_effective_project_dir(
+    def test_records_dirs_and_provenance(self, tmp_path):
+        resolved = resolve_effective_project_dirs(
             workspace_dir=str(tmp_path),
-            agent_project_dir=str(tmp_path),
+            agent_project_dirs=[
+                {"path": str(tmp_path)},
+                {"path": "/tmp/other"},
+            ],
         )
         record = describe_for_audit(resolved, str(tmp_path))
         assert record["workspace_dir"] == str(tmp_path)
         assert record["project_dir"] == str(tmp_path)
         assert record["project_dir_source"] == SOURCE_AGENT
         assert record["project_dir_exists"] is True
+        assert record["project_dirs"] == [str(tmp_path), "/tmp/other"]
+
+
+class TestProjectName:
+    """The project's display name: descriptive only, never a path."""
+
+    def test_derived_from_the_primary_label_then_basename(self):
+        from qwenpaw.config.project_dir import default_project_name
+
+        assert (
+            default_project_name([{"path": "/repos/app", "label": "My App"}])
+            == "My App"
+        )
+        assert (
+            default_project_name([{"path": "/repos/app", "label": None}])
+            == "app"
+        )
+
+    def test_derived_name_ignores_non_primary_entries(self):
+        from qwenpaw.config.project_dir import default_project_name
+
+        entries = [
+            {"path": "/repos/main", "label": None},
+            {"path": "/repos/other", "label": "Other"},
+        ]
+        assert default_project_name(entries) == "main"
+
+    def test_no_directories_means_no_name(self):
+        from qwenpaw.config.project_dir import default_project_name
+
+        assert default_project_name([]) is None
+
+    def test_precedence_session_then_agent_then_derived(self):
+        from qwenpaw.config.project_dir import resolve_project_name
+
+        entries = [{"path": "/repos/app", "label": None}]
+        assert (
+            resolve_project_name(
+                entries=entries,
+                session_name="Session",
+                agent_name="Agent",
+            )
+            == "Session"
+        )
+        assert (
+            resolve_project_name(entries=entries, agent_name="Agent")
+            == "Agent"
+        )
+        assert resolve_project_name(entries=entries) == "app"
+
+    def test_blank_override_falls_through_rather_than_blanking(self):
+        # Otherwise clearing the field would leave the UI with no name.
+        from qwenpaw.config.project_dir import resolve_project_name
+
+        entries = [{"path": "/repos/app", "label": None}]
+        assert (
+            resolve_project_name(entries=entries, session_name="   ") == "app"
+        )
+
+    def test_normalize_trims_and_caps_length(self):
+        from qwenpaw.config.project_dir import (
+            MAX_PROJECT_NAME_LEN,
+            normalize_project_name,
+        )
+
+        assert normalize_project_name("  spaced  ") == "spaced"
+        assert normalize_project_name("") is None
+        assert normalize_project_name(None) is None
+        assert normalize_project_name(123) is None
+        assert (
+            len(normalize_project_name("x" * 500)) == MAX_PROJECT_NAME_LEN
+        )
+
+    def test_read_from_agent_config_and_chat_meta(self):
+        from types import SimpleNamespace
+
+        from qwenpaw.config.project_dir import (
+            agent_project_name_from_config,
+            session_project_name_from_meta,
+        )
+
+        assert (
+            agent_project_name_from_config(
+                SimpleNamespace(project_name="From Agent"),
+            )
+            == "From Agent"
+        )
+        assert agent_project_name_from_config({"project_name": "D"}) == "D"
+        assert agent_project_name_from_config(None) is None
+        assert (
+            session_project_name_from_meta(
+                {"runtime_context": {"project_name": "From Chat"}},
+            )
+            == "From Chat"
+        )
+        assert session_project_name_from_meta({}) is None
+        assert session_project_name_from_meta(None) is None

@@ -24,7 +24,9 @@ class ProjectDirInjectionHook(ModeGatedHook):
 
     async def _run(self, ctx: HookContext) -> HookResult:
         from ...config.context import get_current_project_dir
-        from ...config.project_dir import agent_project_dir_from_config
+        from ...config.project_dir import (
+            agent_primary_project_dir_from_config,
+        )
 
         project_dir = get_current_project_dir()
         if project_dir is not None:
@@ -34,7 +36,7 @@ class ProjectDirInjectionHook(ModeGatedHook):
             return HookResult()
 
         # No resolved value (e.g. a non-request code path): fall back to
-        # the agent-level default so behaviour degrades gracefully.
+        # the agent-level primary so behaviour degrades gracefully.
         cfg = ctx.agent_config
         if cfg is None:
             try:
@@ -43,7 +45,7 @@ class ProjectDirInjectionHook(ModeGatedHook):
                 cfg = load_agent_config(ctx.agent_id)
             except Exception:
                 return HookResult()
-        configured = agent_project_dir_from_config(cfg)
+        configured = agent_primary_project_dir_from_config(cfg)
         if configured:
             ctx.mode_state.setdefault("coding", {})[
                 "project_dir"

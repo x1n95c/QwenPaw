@@ -112,14 +112,15 @@ unless the user explicitly switches.
 
 
 def _project_dir_from_config(agent_config: object | None) -> str | None:
-    """Extract the configured project dir from an agent config.
+    """Extract the configured PRIMARY project dir from an agent config.
 
     Thin wrapper over the shared resolver helper, kept because callers in
-    this module pass either a dict or a pydantic model.
+    this module pass either a dict or a pydantic model. Coding Mode's
+    code-understanding tools (LSP/AST) root at the primary directory.
     """
-    from ...config.project_dir import agent_project_dir_from_config
+    from ...config.project_dir import agent_primary_project_dir_from_config
 
-    return agent_project_dir_from_config(agent_config)
+    return agent_primary_project_dir_from_config(agent_config)
 
 
 class CodingModeMixin:

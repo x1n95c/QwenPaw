@@ -65,19 +65,56 @@ def _projects_base(workspace_dir: Path) -> Path:
 
 
 def _save_project_dir(agent_id: str, project_dir: str | None) -> None:
-    """Persist the agent's default project dir to agent.json (sync).
+    """Persist the agent's primary project dir to agent.json (sync).
 
-    Writes the mode-independent top-level ``project_dir`` and clears the
-    deprecated ``coding_mode.project_dir`` so the two can never disagree.
+    Writes the mode-independent ``project_dirs`` list: the given path
+    becomes the PRIMARY entry (index 0) while other bound directories are
+    kept; ``None`` resets the whole list back to the workspace default.
+    Also clears the deprecated ``coding_mode.project_dir`` so the two can
+    never disagree.
 
     Intended to run inside an executor thread.
     """
-    from ...config.config import load_agent_config, save_agent_config
-    from ...config.project_dir import normalize_project_dir
+    from ...config.config import (
+        ProjectDirEntry,
+        load_agent_config,
+        save_agent_config,
+    )
+    from ...config.project_dir import (
+        agent_project_dirs_from_config,
+        normalize_project_dir,
+        same_dir,
+    )
 
     config = load_agent_config(agent_id)
     normalized = normalize_project_dir(project_dir)
-    config.project_dir = str(normalized) if normalized else None
+    if normalized is None:
+        config.project_dirs = []
+    else:
+        existing = agent_project_dirs_from_config(config)
+        kept = [
+            entry
+            for entry in existing
+            if not same_dir(entry["path"], normalized)
+        ]
+        label = next(
+            (
+                entry["label"]
+                for entry in existing
+                if same_dir(entry["path"], normalized)
+            ),
+            None,
+        )
+        config.project_dirs = [
+            ProjectDirEntry(path=str(normalized), label=label),
+            *(
+                ProjectDirEntry(
+                    path=entry["path"],
+                    label=entry["label"],
+                )
+                for entry in kept
+            ),
+        ]
     config.coding_mode.project_dir = None
     save_agent_config(config.id, config)
 
@@ -555,6 +592,95 @@ async def browse_dirs(
         }
 
     return await asyncio.to_thread(_scan)
+
+
+# ---------------------------------------------------------------------------
+# Native folder chooser
+#
+# Localhost-only on purpose: this opens a GUI dialog on the *server's*
+# display. That is the user's own screen for a local install, and the wrong
+# screen (or nothing at all) for a hosted one.
+# ---------------------------------------------------------------------------
+
+_LOCALHOST_ADDRS = {"127.0.0.1", "::1", "localhost"}
+
+
+def _enforce_localhost(request: Request) -> None:
+    """Reject non-localhost callers."""
+    client = request.client
+    if client and client.host not in _LOCALHOST_ADDRS:
+        raise HTTPException(
+            status_code=403,
+            detail="The native folder dialog is localhost-only",
+        )
+
+
+class NativePickerAvailability(BaseModel):
+    available: bool
+
+
+class NativePickerRequest(BaseModel):
+    prompt: str | None = None
+
+
+class NativePickerResult(BaseModel):
+    # None means the user cancelled, which is not an error.
+    path: str | None = None
+    cancelled: bool = False
+
+
+@router.get(
+    "/native-picker",
+    response_model=NativePickerAvailability,
+    summary="Whether this host can show an OS folder dialog",
+)
+async def native_picker_status(request: Request) -> NativePickerAvailability:
+    """Let the console decide between the OS dialog and the in-app browser."""
+    client = request.client
+    if client and client.host not in _LOCALHOST_ADDRS:
+        # Not an error: a remote console simply uses the in-app browser.
+        return NativePickerAvailability(available=False)
+    from ..native_dir_picker import native_picker_available
+
+    return NativePickerAvailability(
+        available=await asyncio.to_thread(native_picker_available),
+    )
+
+
+@router.post(
+    "/native-picker",
+    response_model=NativePickerResult,
+    summary="Open the OS folder dialog and return the chosen path",
+)
+async def native_picker_open(
+    request: Request,
+    req: NativePickerRequest | None = None,
+) -> NativePickerResult:
+    """Show the OS folder chooser and return an absolute path.
+
+    A browser cannot obtain an absolute path from its own file dialogs, so
+    the backend — which runs on the same machine for a local install —
+    opens the dialog instead.
+    """
+    _enforce_localhost(request)
+    from ..native_dir_picker import pick_directory
+
+    prompt = (req.prompt if req else None) or "Select a project folder"
+    try:
+        chosen = await pick_directory(prompt)
+    except RuntimeError as exc:
+        # 501: the host cannot do this, so the console should fall back
+        # rather than show the user a hard failure.
+        raise HTTPException(status_code=501, detail=str(exc)) from exc
+
+    if chosen is None:
+        return NativePickerResult(path=None, cancelled=True)
+    if not Path(chosen).is_dir():
+        raise HTTPException(
+            status_code=422,
+            detail=f"Not a directory: {chosen}",
+        )
+    return NativePickerResult(path=chosen, cancelled=False)
 
 
 @router.get("/list", summary="List all coding projects for this agent")

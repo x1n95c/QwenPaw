@@ -38,7 +38,8 @@ import { LoopModeSelector } from "../../components/LoopInput";
 import { ProjectDirSelector } from "../../components/ProjectDirSelector";
 import {
   clearPendingProjectDir,
-  getPendingProjectDir,
+  getPendingProjectDirs,
+  getPendingProjectName,
 } from "../../stores/pendingProjectDirStore";
 import { useChatAnywhereInput } from "@agentscope-ai/chat";
 import styles from "./index.module.less";
@@ -1339,7 +1340,22 @@ export default function ChatPage() {
   // the "other tab is owner" banner on every session switch.
   const isQueueOnlyTab = ownershipResolved && !isOwner;
   const hasQueueItems = messageQueue.length > 0;
-  const showSenderBeforeUI = isQueueOnlyTab || hasQueueItems;
+  // The project card lives above the input (not in the action bar beside
+  // the voice/file buttons) because it states *where* the next message
+  // runs — context for the whole composer rather than one more control.
+  const showSenderBeforeUI =
+    isQueueOnlyTab || hasQueueItems || usesQwenPawBackend;
+
+  // The console keeps its locally generated session id for the life of a
+  // chat and stores the backend UUID beside it, so chat-scoped endpoints
+  // need this lookup rather than the routing id.
+  const resolveBackendChatId = useCallback(
+    (sessionId: string) => sessionApi.getRealIdForSession(sessionId),
+    [],
+  );
+  // Bumped once the first message has been accepted, so the project card
+  // re-reads the override the server just persisted for the new chat.
+  const [projectDirRefresh, setProjectDirRefresh] = useState(0);
 
   const scheduleNextSend = useCallback(() => {
     if (autoSendTimerRef.current) clearTimeout(autoSendTimerRef.current);
@@ -2091,6 +2107,10 @@ export default function ChatPage() {
         setLastChatIdRef.current,
         selectedAgentRef.current,
       );
+      // The backend chat id is now known, so anything reading chat-scoped
+      // state has to re-read. `getRealIdForSession` is a plain lookup over
+      // mutable state and cannot trigger a render on its own.
+      setProjectDirRefresh((n) => n + 1);
       navigateRef.current(buildCurrentSessionPath(realId), { replace: true });
     };
 
@@ -2328,22 +2348,29 @@ export default function ChatPage() {
         }
       }
 
-      // A new chat has no server-side id yet, so a directory the user
-      // picked before sending cannot have been persisted. Carry it here so
-      // the *first* turn already runs there; the console router validates
-      // and persists it onto the chat it is about to create.
-      const pendingDir = getPendingProjectDir(
+      // A new chat has no server-side id yet, so directories the user
+      // picked before sending cannot have been persisted. Carry them here
+      // so the *first* turn already runs there; the console router
+      // validates and persists them onto the chat it is about to create.
+      // Index 0 is the primary directory.
+      const pendingDirs = getPendingProjectDirs(
         String(requestBody.session_id || ""),
       );
-      if (pendingDir) {
+      if (pendingDirs && pendingDirs.length > 0) {
         const ctx =
           requestBody.request_context &&
           typeof requestBody.request_context === "object"
             ? (requestBody.request_context as Record<string, unknown>)
             : {};
+        const pendingName = getPendingProjectName(
+          String(requestBody.session_id || ""),
+        );
         requestBody.request_context = {
           ...ctx,
-          pending_project_dir: pendingDir,
+          pending_project_dirs: pendingDirs,
+          // Only send a name the user actually typed; null would otherwise
+          // pin an empty name over the derived one.
+          ...(pendingName ? { pending_project_name: pendingName } : {}),
         };
       }
 
@@ -2405,11 +2432,16 @@ export default function ChatPage() {
         sessionApi.triggerResolve(localIdToResolve);
       }
 
-      // The server has taken ownership of the pending directory (it wrote it
-      // onto the chat it just created). Dropping it here lets the pill go
-      // back to reading the persisted value instead of masking it forever.
-      if (response.ok && pendingDir) {
+      // The server has taken ownership of the pending directories (it wrote
+      // them onto the chat it just created). Dropping them here lets the
+      // pill go back to reading the persisted value instead of masking it
+      // forever.
+      if (response.ok && pendingDirs && pendingDirs.length > 0) {
         clearPendingProjectDir(String(requestBody.session_id || ""));
+        // Covers the case where the chat already had a backend id (so
+        // onSessionIdResolved never fires): the server has just written
+        // the override and the card must stop showing the old value.
+        setProjectDirRefresh((n) => n + 1);
       }
 
       return wrapChatResponseUsageStream(response, chatRef);
@@ -2833,6 +2865,16 @@ export default function ChatPage() {
         allowSpeech: whisperChecked && !whisperEnabled,
         beforeUI: showSenderBeforeUI ? (
           <>
+            {usesQwenPawBackend && (
+              <div className={styles.senderProjectRow}>
+                <ProjectDirSelector
+                  chatId={chatId}
+                  localSessionId={queueSessionId}
+                  refreshKey={projectDirRefresh}
+                  resolveChatId={resolveBackendChatId}
+                />
+              </div>
+            )}
             {isQueueOnlyTab && (
               <Alert
                 type="info"
@@ -2865,12 +2907,6 @@ export default function ChatPage() {
               />
             ) : null}
             {usesQwenPawBackend && <LoopModeSelector />}
-            {usesQwenPawBackend && (
-              <ProjectDirSelector
-                chatId={chatId}
-                localSessionId={queueSessionId}
-              />
-            )}
             {pluginSenderPrefix}
           </>
         ),
@@ -3146,6 +3182,11 @@ export default function ChatPage() {
     // ProjectDirSelector binds to the *viewed* chat, not queueSessionId
     // (which falls back to lastActiveChatId and could point elsewhere).
     chatId,
+    // Without these the memo keeps handing the selector a stale
+    // refreshKey, so it never re-reads the directories the server just
+    // persisted for a newly created chat.
+    projectDirRefresh,
+    resolveBackendChatId,
     onFileCardClick,
     whisperChecked,
     whisperEnabled,

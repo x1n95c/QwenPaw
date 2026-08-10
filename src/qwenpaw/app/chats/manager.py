@@ -222,12 +222,23 @@ class ChatManager:
         await self._repo.upsert_chat(merged)
         return merged
 
-    async def set_session_project_dir(
+    async def set_session_project_dirs(
         self,
         chat_id: str,
-        project_dir: Optional[str],
+        project_dirs: Optional[list[dict]],
+        project_name: Optional[str] = None,
     ) -> Optional[ChatSpec]:
-        """Set or clear this chat's project-directory override.
+        """Set or clear this chat's project-directory list override.
+
+        ``project_dirs`` is the whole list, primary first (each entry
+        ``{"path": str, "label": str | None}``); the stored value
+        replaces whatever was there before. Passing ``None`` removes the
+        override so the chat goes back to inheriting the agent default.
+
+        ``project_name`` is the display name for the list as a whole.
+        ``None`` clears it, so the name goes back to being derived from
+        the primary directory instead of pinning one that no longer
+        matches.
 
         The value lives in the controlled ``meta["runtime_context"]``
         namespace. This is a dedicated method rather than a ``meta`` field
@@ -235,9 +246,6 @@ class ChatManager:
         a client would clobber unrelated system metadata, and the nested
         read-modify-write has to happen under the manager lock to avoid
         losing a concurrent update to a sibling key.
-
-        Passing ``None`` removes the override so the chat goes back to
-        inheriting the agent default.
 
         Returns the updated spec, or ``None`` if the chat does not exist.
         """
@@ -248,10 +256,18 @@ class ChatManager:
 
             meta = dict(existing.meta or {})
             runtime_context = dict(meta.get("runtime_context") or {})
-            if project_dir:
-                runtime_context["project_dir"] = project_dir
+            if project_dirs:
+                runtime_context["project_dirs"] = project_dirs
             else:
-                runtime_context.pop("project_dir", None)
+                runtime_context.pop("project_dirs", None)
+                # A name without directories would describe nothing.
+                project_name = None
+            if project_name:
+                runtime_context["project_name"] = project_name
+            else:
+                runtime_context.pop("project_name", None)
+            # Draft-era chats stored a single path; the list supersedes it.
+            runtime_context.pop("project_dir", None)
 
             if runtime_context:
                 meta["runtime_context"] = runtime_context

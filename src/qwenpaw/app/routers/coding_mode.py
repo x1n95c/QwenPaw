@@ -45,14 +45,18 @@ async def get_coding_mode(request: Request) -> dict:
         load_agent_config,
         workspace.agent_id,
     )
-    from ...config.project_dir import agent_project_dir_from_config
+    from ...config.project_dir import (
+        agent_primary_project_dir_from_config,
+        agent_project_dirs_from_config,
+    )
 
     cm = config.coding_mode
     return {
         "enabled": bool(cm.enabled),
-        # Read the mode-independent field (falling back to the legacy
-        # nested one for configs that have not been migrated yet).
-        "project_dir": agent_project_dir_from_config(config),
+        # Read the mode-independent list; "project_dir" stays singular for
+        # compatibility and carries the primary (first entry).
+        "project_dir": agent_primary_project_dir_from_config(config),
+        "project_dirs": agent_project_dirs_from_config(config),
         "agent_id": config.id,
     }
 

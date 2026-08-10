@@ -52,21 +52,21 @@ def _enforce_localhost(request: Request) -> None:
 
 
 def _get_project_dir(agent_id: str) -> Optional[Path]:
-    """Resolve the project directory for fork operations.
+    """Resolve the source project directory for fork operations.
 
     Priority:
-    1. the agent's ``project_dir``
+    1. the agent's PRIMARY project dir (first ``project_dirs`` entry)
     2. ``workspace_dir`` (fallback)
 
-    Note this no longer requires Coding Mode to be enabled: the project
-    directory is mode-independent, so forking a normal-mode agent that has
-    a project configured now correctly targets that project's repository
-    instead of the agent's internal workspace.
+    Note this no longer requires Coding Mode to be enabled: project
+    directories are mode-independent, so forking a normal-mode agent that
+    has a project configured now correctly targets that project's
+    repository instead of the agent's internal workspace.
 
     Returns the directory as a Path if it is a git repository,
     or None if no valid git repo is found (in-place fork).
     """
-    from ...config.project_dir import agent_project_dir_from_config
+    from ...config.project_dir import agent_primary_project_dir_from_config
 
     try:
         config = load_agent_config(agent_id)
@@ -76,7 +76,7 @@ def _get_project_dir(agent_id: str) -> Optional[Path]:
             detail=f"Agent '{agent_id}' not found: {exc}",
         ) from exc
 
-    project_dir = agent_project_dir_from_config(config)
+    project_dir = agent_primary_project_dir_from_config(config)
     if project_dir:
         candidate = Path(project_dir).expanduser().resolve()
     else:

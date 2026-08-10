@@ -2,6 +2,7 @@
 """Chat management API."""
 from __future__ import annotations
 import logging
+from pathlib import Path
 from typing import Optional
 from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -340,31 +341,55 @@ async def update_chat(
     return updated
 
 
-class ProjectDirRequest(BaseModel):
-    """Payload for setting a chat's project-directory override."""
+class ProjectDirEntryPayload(BaseModel):
+    """One project-directory entry as sent by the client."""
 
     model_config = ConfigDict(extra="forbid")
 
-    project_dir: str = Field(
+    path: str = Field(
         ...,
         min_length=1,
-        description="Absolute path to use for this chat",
+        description="Absolute path to a project directory",
+    )
+    label: Optional[str] = Field(
+        default=None,
+        max_length=50,
+        description="Optional note describing what this directory is for",
     )
 
 
-class ProjectDirResponse(BaseModel):
-    """Effective project directory for a chat, plus where it came from."""
+class ProjectDirsRequest(BaseModel):
+    """Payload for setting a chat's project-directory list override.
 
-    project_dir: str = Field(description="Effective project directory")
-    source: str = Field(
+    The list is ordered: the first entry becomes the PRIMARY project
+    directory. The payload is the whole desired list — add, remove and
+    make-primary are all expressed as list transforms followed by one PUT.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    project_dirs: list[ProjectDirEntryPayload] = Field(
+        ...,
+        min_length=1,
+        description="Full ordered list, primary first",
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        max_length=60,
         description=(
-            "Provenance: 'session' (this chat overrides), 'agent' (agent "
-            "default), or 'workspace_fallback' (nothing configured)"
+            "Display name for the list as a whole. Omit or send null to "
+            "let it be derived from the primary directory."
         ),
     )
-    agent_project_dir: Optional[str] = Field(
+
+
+class ProjectDirEntryView(BaseModel):
+    """One effective project-directory entry for the UI."""
+
+    path: str = Field(description="Directory path")
+    label: Optional[str] = Field(
         default=None,
-        description="The agent-level default, for showing inheritance",
+        description="Display name for this directory, when one was set",
     )
     exists: bool = Field(
         description=(
@@ -374,17 +399,59 @@ class ProjectDirResponse(BaseModel):
     )
 
 
-async def _resolve_chat_project_dir(
+class ProjectDirsResponse(BaseModel):
+    """Effective project-directory list for a chat, plus provenance."""
+
+    project_dirs: list[ProjectDirEntryView] = Field(
+        description=(
+            "Effective list, primary first. Empty when nothing is "
+            "configured (tools then fall back to the agent workspace; "
+            "the workspace path itself is deliberately not listed)."
+        ),
+    )
+    source: str = Field(
+        description=(
+            "Provenance of the list: 'session' (this chat overrides), "
+            "'agent' (agent default), or 'workspace_fallback' (nothing "
+            "configured)"
+        ),
+    )
+    agent_project_dirs: list[ProjectDirEntryView] = Field(
+        default_factory=list,
+        description="The agent-level default list, for showing inheritance",
+    )
+    project_name: Optional[str] = Field(
+        default=None,
+        description=(
+            "Display name to show for the project. Already resolved "
+            "(session override → agent default → primary directory's "
+            "name), so the UI can render it directly."
+        ),
+    )
+    project_name_is_custom: bool = Field(
+        default=False,
+        description=(
+            "True when the name was explicitly set rather than derived. "
+            "Lets the UI show a derived name without making it look like "
+            "a stored value."
+        ),
+    )
+
+
+async def _resolve_chat_project_dirs(
     request: Request,
     chat_id: str,
     mgr: ChatManager,
-) -> ProjectDirResponse:
-    """Build the project-dir view for one chat."""
+) -> ProjectDirsResponse:
+    """Build the project-dirs view for one chat."""
     from ...config.config import load_agent_config
     from ...config.project_dir import (
-        agent_project_dir_from_config,
-        resolve_effective_project_dir,
-        session_project_dir_from_meta,
+        agent_project_dirs_from_config,
+        agent_project_name_from_config,
+        resolve_effective_project_dirs,
+        resolve_project_name,
+        session_project_dirs_from_meta,
+        session_project_name_from_meta,
     )
 
     chat = await mgr.get_chat(chat_id)
@@ -395,91 +462,139 @@ async def _resolve_chat_project_dir(
         )
 
     workspace = await get_workspace(request)
-    agent_project_dir = None
+    agent_entries: list[dict] = []
+    agent_name: Optional[str] = None
     try:
-        agent_project_dir = agent_project_dir_from_config(
-            load_agent_config(workspace.agent_id),
-        )
+        agent_config = load_agent_config(workspace.agent_id)
+        agent_entries = agent_project_dirs_from_config(agent_config)
+        agent_name = agent_project_name_from_config(agent_config)
     except Exception:
         logger.debug("Could not load agent config", exc_info=True)
 
-    resolved = resolve_effective_project_dir(
+    resolved = resolve_effective_project_dirs(
         workspace_dir=workspace.workspace_dir,
-        agent_project_dir=agent_project_dir,
-        session_project_dir=session_project_dir_from_meta(chat.meta),
+        agent_project_dirs=agent_entries,
+        session_project_dirs=session_project_dirs_from_meta(chat.meta),
     )
-    return ProjectDirResponse(
-        project_dir=str(resolved.path),
+    session_name = session_project_name_from_meta(chat.meta)
+    effective_entries = [
+        {"path": str(entry.path), "label": entry.label}
+        for entry in resolved.dirs
+    ]
+    return ProjectDirsResponse(
+        project_dirs=[
+            ProjectDirEntryView(
+                path=str(entry.path),
+                label=entry.label,
+                exists=entry.exists,
+            )
+            for entry in resolved.dirs
+        ],
         source=resolved.source,
-        agent_project_dir=agent_project_dir,
-        exists=resolved.exists,
+        agent_project_dirs=[
+            ProjectDirEntryView(
+                path=entry["path"],
+                label=entry["label"],
+                exists=bool(Path(entry["path"]).expanduser().is_dir()),
+            )
+            for entry in agent_entries
+        ],
+        project_name=resolve_project_name(
+            entries=effective_entries,
+            session_name=session_name,
+            agent_name=agent_name,
+        ),
+        # Only a session override counts as custom here: an agent-level
+        # name is inherited, and the UI shows inheritance separately.
+        project_name_is_custom=bool(session_name),
     )
 
 
-@router.get("/{chat_id}/project-dir", response_model=ProjectDirResponse)
-async def get_chat_project_dir(
+@router.get("/{chat_id}/project-dirs", response_model=ProjectDirsResponse)
+async def get_chat_project_dirs(
     request: Request,
     chat_id: str,
     mgr: ChatManager = Depends(get_chat_manager),
 ):
-    """Return this chat's effective project directory and its provenance."""
-    return await _resolve_chat_project_dir(request, chat_id, mgr)
+    """Return this chat's effective project-directory list, primary first."""
+    return await _resolve_chat_project_dirs(request, chat_id, mgr)
 
 
-@router.put("/{chat_id}/project-dir", response_model=ProjectDirResponse)
-async def set_chat_project_dir(
+@router.put("/{chat_id}/project-dirs", response_model=ProjectDirsResponse)
+async def set_chat_project_dirs(
     request: Request,
     chat_id: str,
-    payload: ProjectDirRequest,
+    payload: ProjectDirsRequest,
     mgr: ChatManager = Depends(get_chat_manager),
 ):
-    """Bind this chat to a project directory.
+    """Bind this chat to an ordered project-directory list.
 
-    The override is persisted server-side, so it survives a page reload or
-    a different browser. It takes effect on the **next** turn — an
-    in-flight turn keeps the directory it started with.
+    The first entry is the primary project directory. The override is
+    persisted server-side, so it survives a page reload or a different
+    browser. It takes effect on the **next** turn — an in-flight turn
+    keeps the directories it started with.
 
-    A path that does not exist is rejected here (rather than stored and
-    flagged) because this endpoint is the point where the user picks it and
-    can still correct the mistake.
+    Paths that do not exist are rejected here (rather than stored and
+    flagged) because this endpoint is the point where the user picks them
+    and can still correct the mistake. Duplicate paths (case-insensitive)
+    are collapsed, keeping the first occurrence.
     """
-    from ...config.project_dir import normalize_project_dir
+    from ...config.project_dir import (
+        MAX_PROJECT_DIRS,
+        normalize_project_dir_list,
+        normalize_project_name,
+    )
 
-    normalized = normalize_project_dir(payload.project_dir)
-    if normalized is None:
+    entries = normalize_project_dir_list(
+        [entry.model_dump() for entry in payload.project_dirs],
+    )
+    if not entries:
         raise HTTPException(
             status_code=422,
-            detail="project_dir must not be blank",
+            detail="project_dirs must contain at least one valid entry",
         )
-    if not normalized.is_dir():
+    if len(entries) > MAX_PROJECT_DIRS:
         raise HTTPException(
             status_code=422,
-            detail=f"Not a directory: {normalized}",
+            detail=f"Too many project dirs (max {MAX_PROJECT_DIRS})",
         )
+    for path, _label in entries:
+        if not path.is_dir():
+            raise HTTPException(
+                status_code=422,
+                detail=f"Not a directory: {path}",
+            )
 
-    updated = await mgr.set_session_project_dir(chat_id, str(normalized))
+    stored = [
+        {"path": str(path), "label": label} for path, label in entries
+    ]
+    updated = await mgr.set_session_project_dirs(
+        chat_id,
+        stored,
+        normalize_project_name(payload.project_name),
+    )
     if updated is None:
         raise HTTPException(
             status_code=404,
             detail=f"Chat not found: {chat_id}",
         )
-    return await _resolve_chat_project_dir(request, chat_id, mgr)
+    return await _resolve_chat_project_dirs(request, chat_id, mgr)
 
 
-@router.delete("/{chat_id}/project-dir", response_model=ProjectDirResponse)
-async def clear_chat_project_dir(
+@router.delete("/{chat_id}/project-dirs", response_model=ProjectDirsResponse)
+async def clear_chat_project_dirs(
     request: Request,
     chat_id: str,
     mgr: ChatManager = Depends(get_chat_manager),
 ):
     """Drop this chat's override so it inherits the agent default again."""
-    updated = await mgr.set_session_project_dir(chat_id, None)
+    updated = await mgr.set_session_project_dirs(chat_id, None)
     if updated is None:
         raise HTTPException(
             status_code=404,
             detail=f"Chat not found: {chat_id}",
         )
-    return await _resolve_chat_project_dir(request, chat_id, mgr)
+    return await _resolve_chat_project_dirs(request, chat_id, mgr)
 
 
 @router.delete("/{chat_id}", response_model=dict)

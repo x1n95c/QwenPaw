@@ -525,59 +525,79 @@ def _read_request_context(request_data: Any) -> Dict[str, Any]:
     return rc if isinstance(rc, dict) else {}
 
 
-async def _persist_pending_project_dir(
+async def _persist_pending_project_dirs(
     workspace: Any,
     chat: Any,
     request_data: Any,
 ) -> None:
-    """Bind a pending project dir sent with a new chat's first message.
+    """Bind pending project dirs sent with a new chat's first message.
 
-    The console can only offer a directory picker *before* a chat exists, so
-    the choice arrives as ``request_context.pending_project_dir``. The path
-    is validated here rather than trusted: it comes from a client, and a
-    bad value would otherwise be written into the chat and silently steer
-    every later turn.
+    The console can only offer a directory picker *before* a chat exists,
+    so the choice arrives as ``request_context.pending_project_dirs``
+    (ordered list, primary first; legacy singular key
+    ``pending_project_dir`` is still honoured). Entries are validated
+    here rather than trusted: they come from a client, and a bad value
+    would otherwise be written into the chat and silently steer every
+    later turn.
 
-    Never overwrites an existing session override — a chat that already has
-    one is not a new chat, and clobbering it would lose the user's setting.
+    Never overwrites an existing session override — a chat that already
+    has one is not a new chat, and clobbering it would lose the user's
+    setting.
     """
-    pending = _read_request_context(request_data).get("pending_project_dir")
-    if not isinstance(pending, str) or not pending.strip():
-        return
+    request_context = _read_request_context(request_data)
+    pending = request_context.get("pending_project_dirs")
+    if not isinstance(pending, list) or not pending:
+        legacy = request_context.get("pending_project_dir")
+        if isinstance(legacy, str) and legacy.strip():
+            pending = [legacy]
+        else:
+            return
     if chat is None:
         return
 
     from ...config.project_dir import (
-        normalize_project_dir,
-        session_project_dir_from_meta,
+        normalize_project_dir_list,
+        normalize_project_name,
+        session_project_dirs_from_meta,
     )
 
-    if session_project_dir_from_meta(getattr(chat, "meta", None)):
+    if session_project_dirs_from_meta(getattr(chat, "meta", None)):
         return
 
-    normalized = normalize_project_dir(pending)
-    if normalized is None or not normalized.is_dir():
-        logger.warning(
-            "Ignoring pending_project_dir that is not a directory: %s",
-            sanitize_log_value(pending),
-        )
+    entries = []
+    for path, label in normalize_project_dir_list(pending):
+        if not path.is_dir():
+            logger.warning(
+                "Ignoring pending project dir that is not a directory: %s",
+                sanitize_log_value(str(path)),
+            )
+            continue
+        entries.append({"path": str(path), "label": label})
+    if not entries:
         return
+
+    # Carried alongside the directories so a name typed before the first
+    # message is not lost when the chat is created.
+    pending_name = normalize_project_name(
+        request_context.get("pending_project_name"),
+    )
 
     try:
-        await workspace.chat_manager.set_session_project_dir(
+        await workspace.chat_manager.set_session_project_dirs(
             chat.id,
-            str(normalized),
+            entries,
+            pending_name,
         )
         logger.info(
-            "Bound new chat %s to project dir %s",
+            "Bound new chat %s to project dirs %s",
             chat.id,
-            sanitize_log_value(str(normalized)),
+            sanitize_log_value([entry["path"] for entry in entries]),
         )
     except Exception:  # pylint: disable=broad-except
         # A failure here must not block the message the user just sent;
         # the turn falls back to the agent default.
         logger.warning(
-            "Could not persist pending_project_dir for chat %s",
+            "Could not persist pending_project_dirs for chat %s",
             chat.id,
             exc_info=True,
         )
@@ -634,7 +654,7 @@ async def post_console_chat_task(  # pylint: disable=too-many-statements
     # It instead sends the pending choice in request_context; persist it
     # here — after the chat exists, before the turn starts — so the very
     # first turn already runs in the directory the user picked.
-    await _persist_pending_project_dir(workspace, chat, request_data)
+    await _persist_pending_project_dirs(workspace, chat, request_data)
 
     task_timeout: Optional[float] = None
     fork_project_dir = ""
